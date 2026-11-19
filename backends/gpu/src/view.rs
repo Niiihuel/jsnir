@@ -134,7 +134,7 @@ impl View {
                     }
                     draws.push(Draw::image(
                         &self.images[&key],
-                        [rect[0], rect[1]],
+                        snap([rect[0], rect[1]], scale),
                         scale,
                         clip,
                     ));
@@ -168,7 +168,7 @@ impl View {
                     }
                     draws.push(Draw::image(
                         &self.images[&key],
-                        [rect[0], rect[1]],
+                        snap([rect[0], rect[1]], scale),
                         scale,
                         clip,
                     ));
@@ -203,7 +203,12 @@ impl View {
                         None => {}
                     }
                     if let Some((_, Some(image))) = &self.editor {
-                        draws.push(Draw::image(image, [rect[0], rect[1]], scale, clip));
+                        draws.push(Draw::image(
+                            image,
+                            snap([rect[0], rect[1]], scale),
+                            scale,
+                            clip,
+                        ));
                     }
                     for span in &frame.composition {
                         draws.push(Draw::fill(
@@ -228,4 +233,9 @@ impl View {
         self.used = used;
         draws
     }
+}
+
+// Bitmaps are drawn 1:1 with device pixels: a fractional origin would blur them through filtering.
+fn snap(point: [f32; 2], scale: f32) -> [f32; 2] {
+    point.map(|v| (v * scale).round() / scale)
 }

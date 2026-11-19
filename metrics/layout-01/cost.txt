@@ -1,0 +1,12 @@
+Rust with 10000 messages · steady: p50 0.220 µs, p99 0.241 µs
+Rust with 10000 messages · resizing: p50 1.142 µs, p99 2.595 µs
+Js with 10000 messages · steady: p50 0.230 µs, p99 0.481 µs
+Js with 10000 messages · resizing: p50 1.173 µs, p99 3.216 µs
+Rust with 10000 messages · steady: p50 0.220 µs, p99 0.241 µs
+Rust with 10000 messages · resizing: p50 1.173 µs, p99 3.536 µs
+Js with 10000 messages · steady: p50 0.231 µs, p99 0.481 µs
+Js with 10000 messages · resizing: p50 1.193 µs, p99 2.645 µs
+Rust with 10000 messages · steady: p50 0.220 µs, p99 0.331 µs
+Rust with 10000 messages · resizing: p50 1.172 µs, p99 3.517 µs
+Js with 10000 messages · steady: p50 0.231 µs, p99 0.391 µs
+Js with 10000 messages · resizing: p50 1.182 µs, p99 2.826 µs

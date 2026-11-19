@@ -1,7 +1,7 @@
 # Stepper comparison: shared spec
 
-The same screen built three ways: the original React Bits component in a browser (reference), GPUI, and JSNIR.
-Every implementation must follow this spec so captures are comparable.
+The React Bits Stepper in Chromium is the reference for the GPUI and JSNIR ports. This spec fixes the
+scene, input states and animation timings for the three implementations. [Runs, captures and results](README.md)
 
 ## Source
 
@@ -14,7 +14,7 @@ Every implementation must follow this spec so captures are comparable.
   - ArrowRight01: `M9.00005 6C9.00005 6 15 10.4189 15 12C15 13.5812 9 18 9 18`
   - Tick02: `M5 14L8.5 17.5L19 6.5`
   - CheckmarkCircle02: circle r=10 at (12,12) + `M8 12.5L10.5 15L16 9`
-- Font: Inter 4.1 Regular (400) and SemiBold (600) from `assets/fonts/` (OFL). No other font anywhere.
+- Use Inter 4.1 Regular (400) and SemiBold (600) for all text. [Bundled fonts](../../assets/fonts)
 
 ## Scene
 
@@ -47,8 +47,9 @@ Every implementation must follow this spec so captures are comparable.
 | s5 | Step 4 with name "Ada" and plan Pro |
 | s6 | Completed with name "Ada" |
 
-Each implementation can reach a state directly (CLI flags or URL params: `step`, `name`, `plan`, `focus`)
-instead of replaying clicks. Captures are PNG, 640 × 560, named `<impl>-<id>.png` in `captures/`.
+Set each state directly with the native command-line flags or Chromium query parameters `step`,
+`name`, `plan` and `focus`. Use `step=5` for the completed state. Save PNGs at 640 × 560 in
+`captures/` with the `react-`, `jsnir-` or `gpui-` prefix and the state ID.
 
 ## Animations (must match the original timings and curves)
 

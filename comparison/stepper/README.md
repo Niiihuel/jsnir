@@ -9,20 +9,25 @@ GPUI port, and a JSNIR port written in TSX. Same font (Inter 4.1), same 640 × 5
 | Source | [React Bits @ fefc5b0](https://github.com/DavidHDev/react-bits/tree/fefc5b05ca34a7475b38a977127441fbfad2f177/src/content/Components/Stepper) (built by [react/build.sh](react/build.sh)) | [app/stepper.tsx](../../app/stepper.tsx) | [gpui/src/main.rs](gpui/src/main.rs) |
 | Language of the screen | JSX + CSS | TSX (runs in QuickJS, off the UI thread) | Rust |
 
-## Run
+## Run the three versions
+
+Run from the repository root. Install the pinned TypeScript compiler before building JSNIR.
 
 ```sh
-# JSNIR (from the repository root)
+npm ci
+
+# JSNIR
 cargo run --release --locked --manifest-path backends/gpu/Cargo.toml --target-dir target -- stepper
 cargo run --release --locked --manifest-path backends/gpu/Cargo.toml --target-dir target -- stepper --step 3 --name Ada --focus
 
 # GPUI
-cargo run --release --manifest-path comparison/stepper/gpui/Cargo.toml -- --step 3 --name Ada --focus
+cargo run --release --locked --manifest-path comparison/stepper/gpui/Cargo.toml -- --step 3 --name Ada --focus
 
-# Reference: comparison/stepper/react/build.sh once, then open react/index.html?step=2 in a browser
+# Chromium reference
+comparison/stepper/react/build.sh
 ```
 
-Both native ports accept `--step N` (5 = completed), `--name`, `--plan pro|starter` and `--focus`.
+Open `comparison/stepper/react/index.html?step=2` in Chromium after building the reference. Both native ports accept `--step N` (5 = completed), `--name`, `--plan pro|starter` and `--focus`. [Chromium build and capture instructions](react/README.md)
 
 ## Visual fidelity
 
@@ -30,16 +35,16 @@ Pixels that differ from the Chromium reference by more than 6 % (`magick compare
 
 | State | What it shows | JSNIR | GPUI |
 | --- | --- | ---: | ---: |
-| s1 | Step 1 | 0.08 % | 0.24 % |
-| s2 | Step 2, Pro selected | 0.13 % | 0.25 % |
-| s3 | Profile, empty field, Continue disabled | 0.10 % | 0.31 % |
-| s4 | Profile, "Ada", field focused | 0.12 % | 0.36 % |
-| s5 | Review | 0.10 % | 0.30 % |
-| s6 | Completed | 0.14 % | 0.18 % |
+| s1 | Step 1 | 0.07 % | 0.24 % |
+| s2 | Step 2, Pro selected | 0.12 % | 0.25 % |
+| s3 | Profile, empty field, Continue disabled | 0.08 % | 0.31 % |
+| s4 | Profile, "Ada", field focused | 0.10 % | 0.36 % |
+| s5 | Review | 0.09 % | 0.30 % |
+| s6 | Completed | 0.08 % | 0.18 % |
 
-What remains in both is glyph antialiasing. The comparison is not fully even: JSNIR captures render
-offscreen at scale 1 ([capture-jsnir.sh](capture-jsnir.sh)), while GPUI has no offscreen path, so its
-captures are screenshots of a 2× window scaled down to 1×, which adds resampling error to its numbers.
+Most remaining differences are at glyph edges. JSNIR renders offscreen at scale 1. The GPUI captures come
+from a 2× window scaled down to 1×, which adds resampling error. Run the capture script with ImageMagick 7
+to regenerate the six JSNIR PNGs in `captures/`. [JSNIR capture script](capture-jsnir.sh)
 
 | State | Reference (Chromium) | JSNIR | GPUI |
 | --- | --- | --- | --- |
@@ -57,7 +62,7 @@ window has drawn for 3 s.
 
 | | JSNIR | GPUI |
 | --- | ---: | ---: |
-| Lines written for the screen | 389 (TSX) | 1,162 (Rust) + 574 adapted text field |
+| Nonblank source lines for the screen | 390 (TSX) | 1,162 (Rust) + 574 adapted text field |
 | Release binary, stripped | 15.0 MB ¹ | 19.6 MB |
 | Peak RSS | 121 MB | 109 MB |
 | Clean release build | 42 s ² | 74 s ² |
@@ -152,11 +157,10 @@ Each `from`/`to`/`generation` triple is updated in the view whenever the hover o
 | Text field with IME | built in | 574 lines adapted from GPUI's example |
 | App logic on its own thread | yes (QuickJS) | no (UI thread) |
 
-## Verified, and not
+## Interaction and animation checks
 
-- Every state above is captured and compared automatically.
+- The comparison reports differences across the six settled states.
 - `src/host.rs` has an end-to-end test that drives the JSNIR stepper through the host as a window would:
   click Continue, pick a plan, type a name (Continue stays disabled while it is empty), complete, and go back
   with a header click, with JS answering from its own thread and the leaving pane removed by its timer.
-- Transitions are unit-tested against the CSS curves (`src/motion.rs`). The animations in a live window
-  have not been checked against the browser frame by frame: watch both side by side to judge them.
+- Transition tests check the easing curves against CSS. A frame-by-frame comparison of the live animations remains on the roadmap. [Transition tests](../../src/motion.rs) · [Roadmap](../../docs/roadmap.md)

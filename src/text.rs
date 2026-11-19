@@ -5,6 +5,9 @@ use cosmic_text::{
 };
 
 pub(crate) const METRICS: Metrics = Metrics::new(14., 19.);
+/// Width added when wrapping text in the width it was measured at, so float rounding never pushes its
+/// last glyph to a new line. Layout and rasterization must use the same slack.
+pub(crate) const WRAP_SLACK: f32 = 0.01;
 /// CSS `line-height: normal` for Inter: (ascender + descender) / units per em.
 pub const NORMAL_LINE_HEIGHT: f32 = 1.21;
 
@@ -182,7 +185,7 @@ impl TextEngine {
             return None;
         }
         let buffer = if wrap {
-            self.shape_styled(text, Some(width), Wrap::WordOrGlyph, style)
+            self.shape_styled(text, Some(width + WRAP_SLACK), Wrap::WordOrGlyph, style)
         } else {
             self.shape_styled(text, None, Wrap::None, style)
         };

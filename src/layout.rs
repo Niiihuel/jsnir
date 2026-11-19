@@ -6,7 +6,7 @@
 //! draws only the visible ones. Per Taffy's benchmark, layout costs ≈ 0.25–0.47 µs per node; 10,000
 //! rows would take more than half a frame at 120 Hz.
 use crate::{
-    text::{TextEngine, TextStyle},
+    text::{TextEngine, TextStyle, WRAP_SLACK},
     tree::{Align, Axis, Justify, Node, Position, Tree},
 };
 use std::collections::HashMap;
@@ -27,8 +27,12 @@ pub struct Layout {
 }
 impl Default for Layout {
     fn default() -> Self {
+        let mut taffy = TaffyTree::new();
+        // Fractional layout, as browsers do: rounding to whole pixels would make a text box narrower
+        // than its measured text and wrap the last glyph. Backends snap bitmaps to device pixels.
+        taffy.disable_rounding();
         Self {
-            taffy: TaffyTree::new(),
+            taffy,
             nodes: Vec::new(),
             root: None,
             viewport: None,
@@ -258,7 +262,7 @@ impl Layout {
                         // A hair of slack, so a line laid out in exactly its measured width never wraps on rounding.
                         let [width, height] = text.measure_styled(
                             value,
-                            width.map(|w| w + 0.01),
+                            width.map(|w| w + WRAP_SLACK),
                             TextStyle::resolve(font),
                         );
                         Size { width, height }

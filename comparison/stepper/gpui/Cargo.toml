@@ -2,6 +2,8 @@
 name = "stepper-gpui"
 version = "0.1.0"
 edition = "2024"
+# The text field in src/input.rs is adapted from GPUI's example and keeps its Apache-2.0 notice.
+license = "MIT AND Apache-2.0"
 publish = false
 
 [dependencies]

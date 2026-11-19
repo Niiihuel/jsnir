@@ -1,0 +1,11 @@
+{
+  "verified_captures": 50,
+  "reference": "egui Rust, first run",
+  "sha256_ppm": {
+    "A": "4059eb343ff5eb56dff5a50a455dac2e9bc24b6a7fbb46bede2a072f5b036729",
+    "B": "70c572d5594a2f416128fbe7bdc0adf67f8532cf1d810caf0957c871433f8c8d",
+    "C": "4059eb343ff5eb56dff5a50a455dac2e9bc24b6a7fbb46bede2a072f5b036729",
+    "D": "f91250910384c2bbe85eea81111fd830dcecc65124f737db2888faee91a9ca73",
+    "E": "d64665057eb3aaa8dde6f89c0440686a6a7af0342512daa5826896319a919ebf"
+  }
+}

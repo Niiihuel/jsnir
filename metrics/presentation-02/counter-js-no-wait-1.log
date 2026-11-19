@@ -1,0 +1,7 @@
+wp_presentation ready, clock 1
+frame 300: 14 events, 297 presented, 0 discarded
+frame 600: 34 events, 597 presented, 0 discarded
+frame 900: 54 events, 897 presented, 0 discarded
+frame 1200: 74 events, 1197 presented, 0 discarded
+frame 1500: 94 events, 1497 presented, 0 discarded
+frame 1800: 114 events, 1797 presented, 0 discarded

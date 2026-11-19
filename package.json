@@ -1,6 +1,7 @@
 {
   "name": "jsnir-app",
   "private": true,
+  "license": "MIT",
   "description": "Type-checks the TypeScript apps against app/jsnir.d.ts, generated from Rust",
   "scripts": {
     "typecheck": "tsc -p app/tsconfig.counter.json && tsc -p app/tsconfig.chat.json && tsc -p app/tsconfig.stepper.json"

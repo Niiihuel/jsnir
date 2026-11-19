@@ -1,0 +1,16 @@
+Reads, ns per value (median of 5 × 1,000,000)
+  BTreeMap  35.19
+  Vec       1.15
+  OrdMap    26.26
+
+Copy-on-write snapshot, µs               p50       p99       max
+  BTreeMap: take snapshot            0.020     0.230     0.531
+  BTreeMap: publish                 21.510    49.332   311.574
+  BTreeMap: drop snapshot           32.251    57.187   501.510
+  OrdMap: take snapshot              0.020     0.031     0.031
+  OrdMap: publish                    0.300     1.513     5.189
+  OrdMap: drop snapshot              0.081     0.140     0.250
+
+Replica, apply to both copies, µs         p50       p99       max
+  BTreeMap                           0.110     0.230    28.874
+  Vec                                0.020     0.031     0.360
