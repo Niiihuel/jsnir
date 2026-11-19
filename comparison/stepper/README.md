@@ -41,11 +41,14 @@ What remains in both is glyph antialiasing. The comparison is not fully even: JS
 offscreen at scale 1 ([capture-jsnir.sh](capture-jsnir.sh)), while GPUI has no offscreen path, so its
 captures are screenshots of a 2× window scaled down to 1×, which adds resampling error to its numbers.
 
-| Reference | JSNIR | GPUI |
-| --- | --- | --- |
-| ![](captures/react-s2.png) | ![](captures/jsnir-s2.png) | ![](captures/gpui-s2.png) |
-| ![](captures/react-s4.png) | ![](captures/jsnir-s4.png) | ![](captures/gpui-s4.png) |
-| ![](captures/react-s6.png) | ![](captures/jsnir-s6.png) | ![](captures/gpui-s6.png) |
+| State | Reference (Chromium) | JSNIR | GPUI |
+| --- | --- | --- | --- |
+| s1 · Welcome | ![](captures/react-s1.png) | ![](captures/jsnir-s1.png) | ![](captures/gpui-s1.png) |
+| s2 · Plan | ![](captures/react-s2.png) | ![](captures/jsnir-s2.png) | ![](captures/gpui-s2.png) |
+| s3 · Profile, empty | ![](captures/react-s3.png) | ![](captures/jsnir-s3.png) | ![](captures/gpui-s3.png) |
+| s4 · Profile, "Ada" | ![](captures/react-s4.png) | ![](captures/jsnir-s4.png) | ![](captures/gpui-s4.png) |
+| s5 · Review | ![](captures/react-s5.png) | ![](captures/jsnir-s5.png) | ![](captures/gpui-s5.png) |
+| s6 · Completed | ![](captures/react-s6.png) | ![](captures/jsnir-s6.png) | ![](captures/gpui-s6.png) |
 
 ## Cost
 
@@ -86,8 +89,52 @@ calling JS:
 ```
 
 GPUI animates an element only from 0 to 1 when an element id first appears, so each change of state keeps
-`from`, `to` and a generation in the view and rebuilds the element under a new id
-([gpui/src/main.rs](gpui/src/main.rs), `next_button`): about 65 lines for this button, without the press scale.
+`from`, `to` and a generation in the view and rebuilds the element under a new id. The same button in
+[gpui/src/main.rs](gpui/src/main.rs) (`next_button`), without the press scale, which GPUI cannot do:
+
+```rust
+fn next_button(&self, cx: &mut Context<Self>) -> AnyElement {
+    let (hover, disabled) = (self.next_hover, self.next_disabled);
+    let last = self.current == TITLES.len();
+    let mut button = div()
+        .id("next")
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap(px(6.))
+        .h(px(38.))
+        .pl(px(14.))
+        .pr(px(11.))
+        .rounded(px(12.))
+        .text_size(px(13.5))
+        .font_weight(SEMIBOLD)
+        .line_height(relative(1.))
+        .shadow(vec![shadow(4., 12., -6., 0.5)]);
+    if !disabled.to && !self.completed.to {
+        button = button
+            .cursor_pointer()
+            .active(|s| s.bg(bright(SOLID, 0.85)))
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                this.next_hovered = *hovered;
+                cx.notify();
+            }))
+            .on_click(cx.listener(|this, _, _, cx| this.go(this.current + 1, cx)));
+    }
+    let button = animate(button, id("next-hover", hover.generation), hover.generation, 200, ease(), move |el, t| {
+        let k = lerp(if hover.from { 0.9 } else { 1. }, if hover.to { 0.9 } else { 1. }, t);
+        el.bg(bright(SOLID, k))
+            .text_color(bright(SOLID_INK, k))
+            .child(if last { "Complete" } else { "Continue" })
+            .child(icon(if last { Icon::Tick } else { Icon::ArrowRight }, 16., 2., bright(SOLID_INK, k), None))
+    });
+    // `justify_between` alone: Taffy shifts an auto margin combined with `gap` by one gap.
+    animate(div().child(button), id("next-disabled", disabled.generation), disabled.generation, 200, ease(), move |el, t| {
+        el.opacity(lerp(if disabled.from { 0.4 } else { 1. }, if disabled.to { 0.4 } else { 1. }, t))
+    })
+}
+```
+
+Each `from`/`to`/`generation` triple is updated in the view whenever the hover or the disabled state changes.
 
 ## What each port needed
 
