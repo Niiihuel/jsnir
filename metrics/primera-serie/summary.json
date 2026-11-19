@@ -1,0 +1,537 @@
+{
+  "os": "Linux-7.3.4-1-cachyos-x86_64-with-glibc2.44",
+  "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+  "cpu": "AMD Ryzen 9 270 w/ Radeon 780M Graphics",
+  "samples_per_run": 1000,
+  "warmup": 100,
+  "runs": [
+    {
+      "backend": "egui",
+      "mode": "rust",
+      "repeat": 1,
+      "driver": "offscreen",
+      "renderer": "GL llvmpipe (LLVM 23.1.4, 256 bits)",
+      "visual": [
+        {
+          "event": 0,
+          "different_pixels": 0,
+          "rgb_sha256": "0c9eb28163d1f47ad0455b4a3d45e3a6bc12ec5a09682f9ab5a44ea5d16ceaf7"
+        },
+        {
+          "event": 1,
+          "different_pixels": 0,
+          "rgb_sha256": "42bbc1684cf1584117ba5e06ab01f5cd7423cfcb71bf3c298fed0e79728d80da"
+        },
+        {
+          "event": 42,
+          "different_pixels": 0,
+          "rgb_sha256": "0e9b35be06fa0d9b07518e0c4e4c213d359149a4300a30afd2c3c6bf62841e04"
+        },
+        {
+          "event": 999,
+          "different_pixels": 0,
+          "rgb_sha256": "a8c71b90b29b757ba2efb1e2fe8cbfcd8993312a959748cf9687cea3a7a175b9"
+        },
+        {
+          "event": 1000,
+          "different_pixels": 0,
+          "rgb_sha256": "0c9eb28163d1f47ad0455b4a3d45e3a6bc12ec5a09682f9ab5a44ea5d16ceaf7"
+        }
+      ],
+      "commit_ns": {
+        "p50": 31,
+        "p95": 70,
+        "p99": 170
+      },
+      "render_ns": {
+        "p50": 115113,
+        "p95": 130951,
+        "p99": 146911
+      }
+    },
+    {
+      "backend": "egui",
+      "mode": "js",
+      "repeat": 1,
+      "driver": "offscreen",
+      "renderer": "GL llvmpipe (LLVM 23.1.4, 256 bits)",
+      "visual": [
+        {
+          "event": 0,
+          "different_pixels": 0,
+          "rgb_sha256": "0c9eb28163d1f47ad0455b4a3d45e3a6bc12ec5a09682f9ab5a44ea5d16ceaf7"
+        },
+        {
+          "event": 1,
+          "different_pixels": 0,
+          "rgb_sha256": "42bbc1684cf1584117ba5e06ab01f5cd7423cfcb71bf3c298fed0e79728d80da"
+        },
+        {
+          "event": 42,
+          "different_pixels": 0,
+          "rgb_sha256": "0e9b35be06fa0d9b07518e0c4e4c213d359149a4300a30afd2c3c6bf62841e04"
+        },
+        {
+          "event": 999,
+          "different_pixels": 0,
+          "rgb_sha256": "a8c71b90b29b757ba2efb1e2fe8cbfcd8993312a959748cf9687cea3a7a175b9"
+        },
+        {
+          "event": 1000,
+          "different_pixels": 0,
+          "rgb_sha256": "0c9eb28163d1f47ad0455b4a3d45e3a6bc12ec5a09682f9ab5a44ea5d16ceaf7"
+        }
+      ],
+      "commit_ns": {
+        "p50": 8896,
+        "p95": 15448,
+        "p99": 19235
+      },
+      "render_ns": {
+        "p50": 115863,
+        "p95": 130341,
+        "p99": 154335
+      }
+    },
+    {
+      "backend": "nativo",
+      "mode": "rust",
+      "repeat": 1,
+      "driver": "dummy",
+      "renderer": "",
+      "visual": [
+        {
+          "event": 0,
+          "different_pixels": 0,
+          "rgb_sha256": "0c9eb28163d1f47ad0455b4a3d45e3a6bc12ec5a09682f9ab5a44ea5d16ceaf7"
+        },
+        {
+          "event": 1,
+          "different_pixels": 0,
+          "rgb_sha256": "42bbc1684cf1584117ba5e06ab01f5cd7423cfcb71bf3c298fed0e79728d80da"
+        },
+        {
+          "event": 42,
+          "different_pixels": 0,
+          "rgb_sha256": "0e9b35be06fa0d9b07518e0c4e4c213d359149a4300a30afd2c3c6bf62841e04"
+        },
+        {
+          "event": 999,
+          "different_pixels": 0,
+          "rgb_sha256": "a8c71b90b29b757ba2efb1e2fe8cbfcd8993312a959748cf9687cea3a7a175b9"
+        },
+        {
+          "event": 1000,
+          "different_pixels": 0,
+          "rgb_sha256": "0c9eb28163d1f47ad0455b4a3d45e3a6bc12ec5a09682f9ab5a44ea5d16ceaf7"
+        }
+      ],
+      "commit_ns": {
+        "p50": 20,
+        "p95": 21,
+        "p99": 40
+      },
+      "render_ns": {
+        "p50": 53418,
+        "p95": 59590,
+        "p99": 80579
+      }
+    },
+    {
+      "backend": "nativo",
+      "mode": "js",
+      "repeat": 1,
+      "driver": "dummy",
+      "renderer": "",
+      "visual": [
+        {
+          "event": 0,
+          "different_pixels": 0,
+          "rgb_sha256": "0c9eb28163d1f47ad0455b4a3d45e3a6bc12ec5a09682f9ab5a44ea5d16ceaf7"
+        },
+        {
+          "event": 1,
+          "different_pixels": 0,
+          "rgb_sha256": "42bbc1684cf1584117ba5e06ab01f5cd7423cfcb71bf3c298fed0e79728d80da"
+        },
+        {
+          "event": 42,
+          "different_pixels": 0,
+          "rgb_sha256": "0e9b35be06fa0d9b07518e0c4e4c213d359149a4300a30afd2c3c6bf62841e04"
+        },
+        {
+          "event": 999,
+          "different_pixels": 0,
+          "rgb_sha256": "a8c71b90b29b757ba2efb1e2fe8cbfcd8993312a959748cf9687cea3a7a175b9"
+        },
+        {
+          "event": 1000,
+          "different_pixels": 0,
+          "rgb_sha256": "0c9eb28163d1f47ad0455b4a3d45e3a6bc12ec5a09682f9ab5a44ea5d16ceaf7"
+        }
+      ],
+      "commit_ns": {
+        "p50": 6732,
+        "p95": 7674,
+        "p99": 36096
+      },
+      "render_ns": {
+        "p50": 52978,
+        "p95": 56264,
+        "p99": 58698
+      }
+    },
+    {
+      "backend": "nativo",
+      "mode": "js",
+      "repeat": 2,
+      "driver": "dummy",
+      "renderer": "",
+      "visual": [
+        {
+          "event": 0,
+          "different_pixels": 0,
+          "rgb_sha256": "0c9eb28163d1f47ad0455b4a3d45e3a6bc12ec5a09682f9ab5a44ea5d16ceaf7"
+        },
+        {
+          "event": 1,
+          "different_pixels": 0,
+          "rgb_sha256": "42bbc1684cf1584117ba5e06ab01f5cd7423cfcb71bf3c298fed0e79728d80da"
+        },
+        {
+          "event": 42,
+          "different_pixels": 0,
+          "rgb_sha256": "0e9b35be06fa0d9b07518e0c4e4c213d359149a4300a30afd2c3c6bf62841e04"
+        },
+        {
+          "event": 999,
+          "different_pixels": 0,
+          "rgb_sha256": "a8c71b90b29b757ba2efb1e2fe8cbfcd8993312a959748cf9687cea3a7a175b9"
+        },
+        {
+          "event": 1000,
+          "different_pixels": 0,
+          "rgb_sha256": "0c9eb28163d1f47ad0455b4a3d45e3a6bc12ec5a09682f9ab5a44ea5d16ceaf7"
+        }
+      ],
+      "commit_ns": {
+        "p50": 6763,
+        "p95": 8526,
+        "p99": 34955
+      },
+      "render_ns": {
+        "p50": 53959,
+        "p95": 57115,
+        "p99": 81921
+      }
+    },
+    {
+      "backend": "nativo",
+      "mode": "rust",
+      "repeat": 2,
+      "driver": "dummy",
+      "renderer": "",
+      "visual": [
+        {
+          "event": 0,
+          "different_pixels": 0,
+          "rgb_sha256": "0c9eb28163d1f47ad0455b4a3d45e3a6bc12ec5a09682f9ab5a44ea5d16ceaf7"
+        },
+        {
+          "event": 1,
+          "different_pixels": 0,
+          "rgb_sha256": "42bbc1684cf1584117ba5e06ab01f5cd7423cfcb71bf3c298fed0e79728d80da"
+        },
+        {
+          "event": 42,
+          "different_pixels": 0,
+          "rgb_sha256": "0e9b35be06fa0d9b07518e0c4e4c213d359149a4300a30afd2c3c6bf62841e04"
+        },
+        {
+          "event": 999,
+          "different_pixels": 0,
+          "rgb_sha256": "a8c71b90b29b757ba2efb1e2fe8cbfcd8993312a959748cf9687cea3a7a175b9"
+        },
+        {
+          "event": 1000,
+          "different_pixels": 0,
+          "rgb_sha256": "0c9eb28163d1f47ad0455b4a3d45e3a6bc12ec5a09682f9ab5a44ea5d16ceaf7"
+        }
+      ],
+      "commit_ns": {
+        "p50": 20,
+        "p95": 20,
+        "p99": 21
+      },
+      "render_ns": {
+        "p50": 53448,
+        "p95": 56193,
+        "p99": 57857
+      }
+    },
+    {
+      "backend": "egui",
+      "mode": "js",
+      "repeat": 2,
+      "driver": "offscreen",
+      "renderer": "GL llvmpipe (LLVM 23.1.4, 256 bits)",
+      "visual": [
+        {
+          "event": 0,
+          "different_pixels": 0,
+          "rgb_sha256": "0c9eb28163d1f47ad0455b4a3d45e3a6bc12ec5a09682f9ab5a44ea5d16ceaf7"
+        },
+        {
+          "event": 1,
+          "different_pixels": 0,
+          "rgb_sha256": "42bbc1684cf1584117ba5e06ab01f5cd7423cfcb71bf3c298fed0e79728d80da"
+        },
+        {
+          "event": 42,
+          "different_pixels": 0,
+          "rgb_sha256": "0e9b35be06fa0d9b07518e0c4e4c213d359149a4300a30afd2c3c6bf62841e04"
+        },
+        {
+          "event": 999,
+          "different_pixels": 0,
+          "rgb_sha256": "a8c71b90b29b757ba2efb1e2fe8cbfcd8993312a959748cf9687cea3a7a175b9"
+        },
+        {
+          "event": 1000,
+          "different_pixels": 0,
+          "rgb_sha256": "0c9eb28163d1f47ad0455b4a3d45e3a6bc12ec5a09682f9ab5a44ea5d16ceaf7"
+        }
+      ],
+      "commit_ns": {
+        "p50": 9297,
+        "p95": 17672,
+        "p99": 23413
+      },
+      "render_ns": {
+        "p50": 117426,
+        "p95": 172268,
+        "p99": 370223
+      }
+    },
+    {
+      "backend": "egui",
+      "mode": "rust",
+      "repeat": 2,
+      "driver": "offscreen",
+      "renderer": "GL llvmpipe (LLVM 23.1.4, 256 bits)",
+      "visual": [
+        {
+          "event": 0,
+          "different_pixels": 0,
+          "rgb_sha256": "0c9eb28163d1f47ad0455b4a3d45e3a6bc12ec5a09682f9ab5a44ea5d16ceaf7"
+        },
+        {
+          "event": 1,
+          "different_pixels": 0,
+          "rgb_sha256": "42bbc1684cf1584117ba5e06ab01f5cd7423cfcb71bf3c298fed0e79728d80da"
+        },
+        {
+          "event": 42,
+          "different_pixels": 0,
+          "rgb_sha256": "0e9b35be06fa0d9b07518e0c4e4c213d359149a4300a30afd2c3c6bf62841e04"
+        },
+        {
+          "event": 999,
+          "different_pixels": 0,
+          "rgb_sha256": "a8c71b90b29b757ba2efb1e2fe8cbfcd8993312a959748cf9687cea3a7a175b9"
+        },
+        {
+          "event": 1000,
+          "different_pixels": 0,
+          "rgb_sha256": "0c9eb28163d1f47ad0455b4a3d45e3a6bc12ec5a09682f9ab5a44ea5d16ceaf7"
+        }
+      ],
+      "commit_ns": {
+        "p50": 30,
+        "p95": 71,
+        "p99": 170
+      },
+      "render_ns": {
+        "p50": 113670,
+        "p95": 128447,
+        "p99": 169452
+      }
+    },
+    {
+      "backend": "egui",
+      "mode": "rust",
+      "repeat": 3,
+      "driver": "offscreen",
+      "renderer": "GL llvmpipe (LLVM 23.1.4, 256 bits)",
+      "visual": [
+        {
+          "event": 0,
+          "different_pixels": 0,
+          "rgb_sha256": "0c9eb28163d1f47ad0455b4a3d45e3a6bc12ec5a09682f9ab5a44ea5d16ceaf7"
+        },
+        {
+          "event": 1,
+          "different_pixels": 0,
+          "rgb_sha256": "42bbc1684cf1584117ba5e06ab01f5cd7423cfcb71bf3c298fed0e79728d80da"
+        },
+        {
+          "event": 42,
+          "different_pixels": 0,
+          "rgb_sha256": "0e9b35be06fa0d9b07518e0c4e4c213d359149a4300a30afd2c3c6bf62841e04"
+        },
+        {
+          "event": 999,
+          "different_pixels": 0,
+          "rgb_sha256": "a8c71b90b29b757ba2efb1e2fe8cbfcd8993312a959748cf9687cea3a7a175b9"
+        },
+        {
+          "event": 1000,
+          "different_pixels": 0,
+          "rgb_sha256": "0c9eb28163d1f47ad0455b4a3d45e3a6bc12ec5a09682f9ab5a44ea5d16ceaf7"
+        }
+      ],
+      "commit_ns": {
+        "p50": 21,
+        "p95": 80,
+        "p99": 180
+      },
+      "render_ns": {
+        "p50": 112878,
+        "p95": 127154,
+        "p99": 144737
+      }
+    },
+    {
+      "backend": "egui",
+      "mode": "js",
+      "repeat": 3,
+      "driver": "offscreen",
+      "renderer": "GL llvmpipe (LLVM 23.1.4, 256 bits)",
+      "visual": [
+        {
+          "event": 0,
+          "different_pixels": 0,
+          "rgb_sha256": "0c9eb28163d1f47ad0455b4a3d45e3a6bc12ec5a09682f9ab5a44ea5d16ceaf7"
+        },
+        {
+          "event": 1,
+          "different_pixels": 0,
+          "rgb_sha256": "42bbc1684cf1584117ba5e06ab01f5cd7423cfcb71bf3c298fed0e79728d80da"
+        },
+        {
+          "event": 42,
+          "different_pixels": 0,
+          "rgb_sha256": "0e9b35be06fa0d9b07518e0c4e4c213d359149a4300a30afd2c3c6bf62841e04"
+        },
+        {
+          "event": 999,
+          "different_pixels": 0,
+          "rgb_sha256": "a8c71b90b29b757ba2efb1e2fe8cbfcd8993312a959748cf9687cea3a7a175b9"
+        },
+        {
+          "event": 1000,
+          "different_pixels": 0,
+          "rgb_sha256": "0c9eb28163d1f47ad0455b4a3d45e3a6bc12ec5a09682f9ab5a44ea5d16ceaf7"
+        }
+      ],
+      "commit_ns": {
+        "p50": 8515,
+        "p95": 14587,
+        "p99": 17953
+      },
+      "render_ns": {
+        "p50": 113128,
+        "p95": 134909,
+        "p99": 297128
+      }
+    },
+    {
+      "backend": "nativo",
+      "mode": "rust",
+      "repeat": 3,
+      "driver": "dummy",
+      "renderer": "",
+      "visual": [
+        {
+          "event": 0,
+          "different_pixels": 0,
+          "rgb_sha256": "0c9eb28163d1f47ad0455b4a3d45e3a6bc12ec5a09682f9ab5a44ea5d16ceaf7"
+        },
+        {
+          "event": 1,
+          "different_pixels": 0,
+          "rgb_sha256": "42bbc1684cf1584117ba5e06ab01f5cd7423cfcb71bf3c298fed0e79728d80da"
+        },
+        {
+          "event": 42,
+          "different_pixels": 0,
+          "rgb_sha256": "0e9b35be06fa0d9b07518e0c4e4c213d359149a4300a30afd2c3c6bf62841e04"
+        },
+        {
+          "event": 999,
+          "different_pixels": 0,
+          "rgb_sha256": "a8c71b90b29b757ba2efb1e2fe8cbfcd8993312a959748cf9687cea3a7a175b9"
+        },
+        {
+          "event": 1000,
+          "different_pixels": 0,
+          "rgb_sha256": "0c9eb28163d1f47ad0455b4a3d45e3a6bc12ec5a09682f9ab5a44ea5d16ceaf7"
+        }
+      ],
+      "commit_ns": {
+        "p50": 20,
+        "p95": 21,
+        "p99": 40
+      },
+      "render_ns": {
+        "p50": 53228,
+        "p95": 57666,
+        "p99": 71191
+      }
+    },
+    {
+      "backend": "nativo",
+      "mode": "js",
+      "repeat": 3,
+      "driver": "dummy",
+      "renderer": "",
+      "visual": [
+        {
+          "event": 0,
+          "different_pixels": 0,
+          "rgb_sha256": "0c9eb28163d1f47ad0455b4a3d45e3a6bc12ec5a09682f9ab5a44ea5d16ceaf7"
+        },
+        {
+          "event": 1,
+          "different_pixels": 0,
+          "rgb_sha256": "42bbc1684cf1584117ba5e06ab01f5cd7423cfcb71bf3c298fed0e79728d80da"
+        },
+        {
+          "event": 42,
+          "different_pixels": 0,
+          "rgb_sha256": "0e9b35be06fa0d9b07518e0c4e4c213d359149a4300a30afd2c3c6bf62841e04"
+        },
+        {
+          "event": 999,
+          "different_pixels": 0,
+          "rgb_sha256": "a8c71b90b29b757ba2efb1e2fe8cbfcd8993312a959748cf9687cea3a7a175b9"
+        },
+        {
+          "event": 1000,
+          "different_pixels": 0,
+          "rgb_sha256": "0c9eb28163d1f47ad0455b4a3d45e3a6bc12ec5a09682f9ab5a44ea5d16ceaf7"
+        }
+      ],
+      "commit_ns": {
+        "p50": 7153,
+        "p95": 8045,
+        "p99": 13545
+      },
+      "render_ns": {
+        "p50": 54060,
+        "p95": 57907,
+        "p99": 82893
+      }
+    }
+  ]
+}

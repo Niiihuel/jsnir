@@ -1,0 +1,4 @@
+
+thread 'main' (6168) panicked at ~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/winit-0.30.13/src/platform_impl/linux/x11/window.rs:1200:14:
+called `Result::unwrap()` on an `Err` value: X11(X11Error { error_kind: Window, error_code: 3, sequence: 492, bad_value: 6291459, minor_opcode: 0, major_opcode: 40, extension_name: None, request_name: Some("TranslateCoordinates") })
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

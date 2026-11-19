@@ -1,0 +1,16 @@
+Lectura, ns por valor (mediana de 5 × 1.000.000)
+  BTreeMap  37.37
+  Vec       1.14
+  OrdMap    26.86
+
+Foto con copia al escribir, µs           p50       p99       máx
+  BTreeMap: tomar foto               0.020     0.270     0.521
+  BTreeMap: publicar                20.498    28.383   153.889
+  BTreeMap: soltar foto             31.609    43.812    65.563
+  OrdMap: tomar foto                 0.020     0.030     0.050
+  OrdMap: publicar                   0.310     1.443     5.490
+  OrdMap: soltar foto                0.080     0.161     3.797
+
+Réplica, aplicar en las dos copias, µs    p50       p99       máx
+  BTreeMap                           0.121     0.471     1.313
+  Vec                                0.020     0.190     0.350

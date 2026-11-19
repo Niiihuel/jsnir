@@ -1,0 +1,10 @@
+target/
+__pycache__/
+node_modules/
+metrics/local*/
+# Raw research captures stay local; summaries, CSVs and traces are committed.
+metrics/**/*.ppm
+metrics/**/*.png
+# React Bits code is downloaded by comparison/stepper/react/build.sh, never committed (see its license).
+comparison/stepper/react/original/
+comparison/stepper/react/dist/

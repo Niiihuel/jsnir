@@ -1,0 +1,11 @@
+[package]
+name = "stepper-gpui"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+gpui = "=0.2.2"
+# Same lyon gpui uses; only for round line caps in icon strokes, which gpui does not re-export.
+lyon = "1.0"
+unicode-segmentation = "1"

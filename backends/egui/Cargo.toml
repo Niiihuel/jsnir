@@ -1,0 +1,18 @@
+[package]
+name = "jsnir-egui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+jsnir = { path = "../.." }
+eframe = { version = "=0.36.2", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+egui_glow = "=0.36.2"
+glow = "0.17"
+# Real presentation measurement: the same versions and features winit already pulls in.
+raw-window-handle = "=0.6.2"
+wayland-client = "=0.31.15"
+wayland-backend = { version = "=0.3.17", features = ["client_system", "dlopen"] }
+wayland-protocols = { version = "=0.32.13", features = ["client"] }
+
+[build-dependencies]
+cc = "1"

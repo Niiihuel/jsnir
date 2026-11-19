@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Stepper reference</title>
+<style>
+  @font-face { font-family: Inter; font-weight: 400; src: url(../../../assets/fonts/Inter-Regular.ttf); }
+  @font-face { font-family: Inter; font-weight: 600; src: url(../../../assets/fonts/Inter-SemiBold.ttf); }
+  html, body { margin: 0; width: 640px; height: 560px; overflow: hidden; background: #0b0b0f; }
+  body { font-family: Inter; }
+  #root { position: absolute; left: 100px; top: 48px; width: 440px; }
+  /* Captures show settled states: no caret, transitions end immediately. */
+  .capture *, .capture *::before, .capture *::after { caret-color: transparent; transition: none !important; }
+</style>
+<link rel="stylesheet" href="dist/app.css">
+</head>
+<body>
+<div id="root"></div>
+<script>
+  // Capture mode: Web Animations (pane slide, check stroke) jump to their end, as after settling.
+  if (new URLSearchParams(location.search).has('capture')) {
+    const animate = Element.prototype.animate;
+    Element.prototype.animate = function (...args) {
+      const animation = animate.apply(this, args);
+      animation.finish();
+      return animation;
+    };
+  }
+</script>
+<script src="dist/app.js"></script>
+</body>
+</html>
