@@ -59,6 +59,8 @@ pub mod apps {
     pub const OVERLAY: &str = include_str!(concat!(env!("OUT_DIR"), "/overlay.js"));
     /// Test app for flex sizing: a grow row with a scroll column above a footer, with and without `minHeight: 0` (SDK + app).
     pub const FILL: &str = include_str!(concat!(env!("OUT_DIR"), "/fill.js"));
+    /// Test app for containers: a Column's background, a For's scrollbar and a tooltip's text paint and width (SDK + app).
+    pub const CONTAINERS: &str = include_str!(concat!(env!("OUT_DIR"), "/containers.js"));
 }
 
 use contract::Columns;
@@ -272,12 +274,19 @@ fn rust_mount() -> Batch {
     Batch {
         base: 0,
         ops: vec![
+            // The SDK's `Column` is a box that lays out its children in a column.
             create(
                 1,
                 None,
-                Node::Column {
+                Node::Box {
                     children: vec![],
                     style: Default::default(),
+                    paint: Default::default(),
+                    press: 0,
+                    disabled: false,
+                    hover: 0,
+                    contextmenu: 0,
+                    dismiss: 0,
                 },
             ),
             create(2, Some(1), Node::Label { value: 0 }),

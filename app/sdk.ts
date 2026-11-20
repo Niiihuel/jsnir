@@ -344,8 +344,9 @@ function Box(props: {
         },
     };
 }
+type BoxProps = Parameters<typeof Box>[0];
 /** A `Box` that lays out its children in a row. */
-function Row(props: Parameters<typeof Box>[0]): Element {
+function Row(props: BoxProps): Element {
     var style = props.style;
     return Box({
         ...props,
@@ -354,14 +355,15 @@ function Row(props: Parameters<typeof Box>[0]): Element {
         },
     });
 }
-function Column(props: { style?: Style; children?: Children }): Element {
-    return {
-        mount(parent, ops) {
-            var id = newId();
-            ops.push({ op: "create", id: id, parent: parent, node: { kind: "column", style: props.style } });
-            mountChildren(props.children, id, ops);
+/** A `Box` that lays out its children in a column. */
+function Column(props: BoxProps): Element {
+    var style = props.style;
+    return Box({
+        ...props,
+        style: function () {
+            return { ...read(style ?? {}), direction: "column" as Axis };
         },
-    };
+    });
 }
 /** Scrolling list. `children` builds each item; new items arrive with `items.push`. */
 function List<T>(props: { items: ListSignal<T>; style?: Style; children: (item: T) => Element }): Element {
@@ -535,10 +537,14 @@ function TextInput(props: {
     };
 }
 
-/** Mounts `children(value)` and mounts it again, in place of the old one, whenever `value` changes. */
-function Dynamic<T>(props: { value: Source<T>; style?: Style; children: (value: T) => Element }): Element {
+/** Mounts `render(value)` and mounts it again, in place of the old one, whenever `value` changes. Takes the props of a `Box`. */
+function Dynamic<T>({
+    value: source,
+    children: render,
+    ...box
+}: Omit<BoxProps, "children" | "ref"> & { value: Source<T>; children: (value: T) => Element }): Element {
     return Box({
-        style: props.style,
+        ...box,
         ref: function (id) {
             var current: Mounted | null = null;
             var first = true;
@@ -547,18 +553,18 @@ function Dynamic<T>(props: { value: Source<T>; style?: Style; children: (value: 
             var swap = function (value: T) {
                 inScope(scope, function () {
                     if (current !== null) current.remove();
-                    current = mountInto(id, props.children(value));
+                    current = mountInto(id, render(value));
                 });
             };
             effect(function () {
-                var value = read(props.value);
+                var next = read(source);
                 // The first child waits until the batch that creates the container has been sent.
                 if (first) {
                     first = false;
                     mountLater.push(function () {
-                        swap(value);
+                        swap(next);
                     });
-                } else swap(value);
+                } else swap(next);
             });
         },
     });
@@ -579,15 +585,19 @@ interface KeyedRow<T> {
 function placeAt(order: number[], before: number | undefined): number {
     return before === undefined ? order.length : order.indexOf(before);
 }
-/** Mounts one child per item, keyed by `key`. Adding, removing or reordering items creates, removes or moves only those children. A child reads its item through `item()`, which changes when an item with the same key is replaced. */
-function For<T>(props: {
+/** Mounts one child per item, keyed by `key`. Adding, removing or reordering items creates, removes or moves only those children. A child reads its item through `item()`, which changes when an item with the same key is replaced. Takes the props of a `Box`. */
+function For<T>({
+    each,
+    key,
+    children,
+    ...box
+}: Omit<BoxProps, "children" | "ref"> & {
     each: Source<T[]>;
     key: (item: T) => string | number;
-    style?: Style;
     children: (item: () => T) => Element;
 }): Element {
     return Box({
-        style: props.style,
+        ...box,
         ref: function (id) {
             // Children belong to the scope that mounted this list, so removing it removes them too.
             var scope = currentScope;
@@ -599,7 +609,7 @@ function For<T>(props: {
                 var rowScope: Scope = { effects: [], callbacks: [], children: [] };
                 currentScope.children.push(rowScope);
                 var mounted = inScope(rowScope, function () {
-                    return mountInto(id, props.children(function () {
+                    return mountInto(id, children(function () {
                         return s.value;
                     }), before);
                 });
@@ -608,16 +618,16 @@ function For<T>(props: {
             };
             var sync = function (items: T[]) {
                 inScope(scope, function () {
-                    var keys = items.map(props.key);
+                    var keys = items.map(key);
                     var fresh = new Set(keys);
                     if (fresh.size !== keys.length) throw new Error("For: duplicate key");
-                    rows.forEach(function (row, key) {
-                        if (fresh.has(key)) return;
+                    rows.forEach(function (row, rowKey) {
+                        if (fresh.has(rowKey)) return;
                         dispose(row.scope);
                         scope.children.splice(scope.children.indexOf(row.scope), 1);
                         row.mounted.remove();
                         order.splice(order.indexOf(row.mounted.id), 1);
-                        rows.delete(key);
+                        rows.delete(rowKey);
                     });
                     // From the last item back, each child goes before the one placed after it: a kept child
                     // moves only when it is not already there.
@@ -641,7 +651,7 @@ function For<T>(props: {
             };
             var first = true;
             effect(function () {
-                var items = read(props.each);
+                var items = read(each);
                 // The first children wait until the batch that creates the list has been sent.
                 if (first) {
                     first = false;
@@ -705,12 +715,15 @@ function Popover(props: {
         },
     };
 }
-/** Shows `text` beside its child while the pointer is over the child, after `delay` ms: a `Popover` on layer 1000. */
+/** Shows `text` beside its child while the pointer is over the child, after `delay` ms: a `Popover` on layer 1000.
+ *  `font` and `textPaint` (its color, for one) style the text; `maxWidth` wraps it. */
 function Tooltip(props: {
     text: Source<string>;
     side?: Side;
     delay?: number;
     font?: Font;
+    textPaint?: Source<Paint>;
+    maxWidth?: number;
     style?: Style;
     paint?: Source<Paint>;
     children: Element;
@@ -746,7 +759,12 @@ function Tooltip(props: {
                 layer: 1000,
                 style: props.style,
                 paint: props.paint,
-                children: Text({ font: props.font, children: props.text }),
+                children: Text({
+                    font: props.font,
+                    paint: props.textPaint,
+                    style: props.maxWidth === undefined ? undefined : { maxWidth: props.maxWidth },
+                    children: props.text,
+                }),
             }),
         ],
     });

@@ -519,7 +519,9 @@ impl Pusher {
     }
 }
 /// Waits until the app has answered and every transition has settled, then captures a frame of `size` logical
-/// pixels at `scale` device pixels per logical pixel, into a new PPM file at `path`.
+/// pixels at `scale` device pixels per logical pixel, into a new PPM file at `path`. Keyframe animations do not
+/// run in a capture: each shows its value `host.keyframes_at` ms after its own start (0 unless the program set
+/// it), so infinite animations settle too.
 pub fn capture_at(
     mut host: Host,
     size: [u32; 2],
@@ -541,6 +543,7 @@ pub fn capture_at(
     }
     let [width, height] = size.map(|side| side as f32);
     host.hide_caret = true;
+    host.keyframes_at.get_or_insert(0.);
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut focused = false;
     let mut settled = 0;
@@ -585,6 +588,66 @@ mod tests {
         shared.set_scale(1.5);
         assert_eq!(shared.scale(), 1.5);
         assert_eq!(*seen.lock().unwrap(), [1.5]);
+    }
+
+    // A 20 by 20 logical box that pulses forever: the capture settles, and shows the pulse at its first keyframe.
+    #[test]
+    fn an_infinite_animation_is_captured_at_its_first_keyframe() {
+        let script = r#"function jsnirMount() { jsnir.batch(JSON.stringify({ ops: [
+            { op: 'create', id: 1, node: { kind: 'column' } },
+            { op: 'create', id: 2, parent: 1, node: { kind: 'box', style: { width: 20, height: 20 },
+                paint: { background: 4294967295, animations: [{ property: 'opacity', easing: 'easeInOut', duration: 3000,
+                    keyframes: [{ offset: 0, value: 0.25 }, { offset: 0.5, value: 1 }, { offset: 1, value: 0.25 }] }] } } },
+        ] })); }"#;
+        let host = Host::new(script.into(), "{}".into(), TextEngine::default());
+        let path = std::env::temp_dir().join(format!("jsnir-pulse-{}.ppm", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        capture_at(host, [20, 20], 1., false, &path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        // White at opacity 0.25 over the black target.
+        let pixel = &bytes[bytes.len() - 20 * 20 * 3..][..3];
+        assert!(pixel.iter().all(|&c| c.abs_diff(64) <= 1), "{pixel:?}");
+    }
+
+    // A 40 by 40 device-pixel image at logical x 10.3 (device 20.6) is drawn at device 21, and its alpha mask, which
+    // alternates columns, must move with it: each column of the image is red exactly where the mask is opaque.
+    #[test]
+    fn a_masked_image_drawn_1_to_1_is_snapped_with_its_mask() {
+        let script = r#"function jsnirMount() { jsnir.batch(JSON.stringify({ ops: [
+            { op: 'create', id: 1, node: { kind: 'column' } },
+            { op: 'create', id: 2, parent: 1, node: { kind: 'image', source: 'red',
+                style: { position: 'absolute', left: 10.3, top: 10.3, width: 20, height: 20 }, paint: { mask: 'columns' } } },
+        ] })); }"#;
+        let mut host = Host::new(script.into(), "{}".into(), TextEngine::default());
+        let red: Vec<u8> = [255, 0, 0, 255].repeat(40 * 40);
+        host.set_image("red".into(), red, [40, 40]);
+        let columns: Vec<u8> = (0..40 * 40)
+            .flat_map(|i| [255, 255, 255, if (i % 40) % 2 == 0 { 255 } else { 0 }])
+            .collect();
+        host.set_image("columns".into(), columns, [40, 40]);
+        let path = std::env::temp_dir().join(format!("jsnir-mask-{}.ppm", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        capture_at(host, [40, 40], 2., false, &path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(bytes.starts_with(
+            b"P6
+80 80
+255
+"
+        ));
+        let body = &bytes[bytes.len() - 80 * 80 * 3..];
+        for (i, pixel) in body.as_chunks::<3>().0.iter().enumerate() {
+            let (x, y) = (i % 80, i / 80);
+            let inside = (21..61).contains(&x) && (21..61).contains(&y);
+            let expected = if inside && (x - 21) % 2 == 0 {
+                [255, 0, 0]
+            } else {
+                [0, 0, 0]
+            };
+            assert_eq!(pixel, &expected, "device pixel {x} {y}");
+        }
     }
 
     // A 20 by 20 logical image at scale 2 covers the 40 by 40 checkerboard exactly, so every device pixel is its source pixel.

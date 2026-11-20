@@ -1,7 +1,7 @@
 // One instanced quad per drawing item. Positions inside the quad are in physical pixels.
 // Modes: 0 fill (texture × vertical gradient, rounded), 1 inner shadow without blur, 2 blurred outer shadow.
 // Every mode is multiplied by the mask's alpha (group 1; white when the quad has no mask) and by the
-// rounded clip, which is the rectangle `round_clip` with corners of `clip_radius` (0: no rounding).
+// rounded clip, which is the rectangle `round_clip` with corner radii `clip_radii` (all 0: no rounding).
 // The rectangular clip is the scissor, so it is not repeated here.
 struct Vertex {
     @builtin(position) position: vec4f,
@@ -13,7 +13,8 @@ struct Vertex {
     @location(5) @interpolate(flat) params2: vec4f,
     @location(6) @interpolate(flat) round_clip: vec4f,
     @location(7) @interpolate(flat) mask_rect: vec4f,
-    @location(8) @interpolate(flat) clip_radius: f32,
+    @location(8) @interpolate(flat) clip_radii: vec4f,
+    @location(9) @interpolate(flat) radii: vec4f,
 }
 
 @group(0) @binding(0) var image: texture_2d<f32>;
@@ -33,21 +34,30 @@ struct Vertex {
     @location(6) params2: vec4f,
     @location(7) round_clip: vec4f,
     @location(8) mask_rect: vec4f,
-    @location(9) clip_radius: f32,
+    @location(9) clip_radii: vec4f,
+    @location(10) radii: vec4f,
 ) -> Vertex {
     let uv = vec2f(f32(index & 1u), f32(index >> 1u));
     return Vertex(
         vec4f(mix(edges.xy, edges.zw, uv), 0.0, 1.0),
         mix(texcoords.xy, texcoords.zw, uv), mix(color, end_color, uv.y), uv, shape, params, params2,
-        round_clip, mask_rect, clip_radius,
+        round_clip, mask_rect, clip_radii, radii,
     );
 }
 
-// Signed distance from `p` to a rounded rectangle at `origin` with `size` and corner `radius`.
-fn rounded(p: vec2f, origin: vec2f, size: vec2f, radius: f32) -> f32 {
+// Signed distance from `p` to a rounded rectangle at `origin` with `size` and corner `radii` (top-left,
+// top-right, bottom-right, bottom-left, as CSS). The corner is picked by the quadrant of `p`; a radius is
+// clamped to half the shorter side, where CSS would scale all radii of the rectangle instead.
+fn rounded(p: vec2f, origin: vec2f, size: vec2f, radii: vec4f) -> f32 {
     let half_size = size * 0.5;
-    let r = clamp(radius, 0.0, min(half_size.x, half_size.y));
-    let offset = abs(p - origin - half_size) - (half_size - r);
+    let local = p - origin - half_size;
+    let corner = select(
+        select(radii.x, radii.w, local.y > 0.0),
+        select(radii.y, radii.z, local.y > 0.0),
+        local.x > 0.0,
+    );
+    let r = clamp(corner, 0.0, min(half_size.x, half_size.y));
+    let offset = abs(local) - (half_size - r);
     return length(max(offset, vec2f(0.0))) + min(max(offset.x, offset.y), 0.0) - r;
 }
 
@@ -66,11 +76,11 @@ fn erf(x: f32) -> f32 {
 
 fn sample_quad(input: Vertex) -> vec4f {
     let size = input.shape.xy;
-    let radius = input.shape.z;
+    let radii = input.radii;
     let mode = input.shape.w;
     let p = input.point * size;
     if mode < 0.5 {
-        let edge = select(1.0, coverage(rounded(p, vec2f(0.0), size, radius)), radius > 0.0);
+        let edge = select(1.0, coverage(rounded(p, vec2f(0.0), size, radii)), any(radii > vec4f(0.0)));
         // Level 0 explicitly: there are no mipmaps, and the sample sits in non-uniform control flow.
         return textureSampleLevel(image, image_sampler, input.uv, 0.0) * input.color * edge;
     }
@@ -78,8 +88,8 @@ fn sample_quad(input: Vertex) -> vec4f {
         // Inside the shape, outside the shape moved by `offset` and shrunk by `spread`.
         let spread = input.params.x;
         let offset = input.params.yz;
-        let outer = coverage(rounded(p, vec2f(0.0), size, radius));
-        let inner = coverage(rounded(p - offset, vec2f(spread), size - 2.0 * spread, max(radius - spread, 0.0)));
+        let outer = coverage(rounded(p, vec2f(0.0), size, radii));
+        let inner = coverage(rounded(p - offset, vec2f(spread), size - 2.0 * spread, max(radii - spread, vec4f(0.0))));
         return input.color * outer * (1.0 - inner);
     }
     // Gaussian falloff of the element grown by `spread` and moved down by `y`, minus the element itself.
@@ -89,10 +99,10 @@ fn sample_quad(input: Vertex) -> vec4f {
     let y = input.params2.z;
     let element_radius = input.params2.w;
     let grown = rounded(
-        p - vec2f(0.0, y), element.xy - vec2f(spread), element.zw + 2.0 * spread, max(element_radius + spread, 0.0),
+        p - vec2f(0.0, y), element.xy - vec2f(spread), element.zw + 2.0 * spread, vec4f(max(element_radius + spread, 0.0)),
     );
     let shadow = 0.5 - 0.5 * erf(grown / (sigma * 1.41421356));
-    let under = coverage(rounded(p, element.xy, element.zw, element_radius));
+    let under = coverage(rounded(p, element.xy, element.zw, vec4f(element_radius)));
     return input.color * shadow * (1.0 - under);
 }
 
@@ -102,8 +112,8 @@ fn sample_quad(input: Vertex) -> vec4f {
     let inside = all(mask_uv >= vec2f(0.0)) && all(mask_uv <= vec2f(1.0));
     let mask_alpha = select(0.0, textureSampleLevel(mask_image, mask_sampler, mask_uv, 0.0).a, inside);
     let clip = select(
-        1.0, coverage(rounded(input.position.xy, input.round_clip.xy, input.round_clip.zw, input.clip_radius)),
-        input.clip_radius > 0.0,
+        1.0, coverage(rounded(input.position.xy, input.round_clip.xy, input.round_clip.zw, input.clip_radii)),
+        any(input.clip_radii > vec4f(0.0)),
     );
     return sample_quad(input) * mask_alpha * clip;
 }

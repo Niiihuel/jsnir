@@ -2,7 +2,7 @@
 //! and opacity layers. It renders in the target's encoded color space, as browsers blend, so
 //! semi-transparent colors look the same as in CSS.
 use bytemuck::{Pod, Zeroable};
-use jsnir::text::TextBitmap;
+use jsnir::{host::Corners, text::TextBitmap};
 use std::{io::Write, path::Path, sync::mpsc};
 
 pub type Rect = [f32; 4];
@@ -22,12 +22,12 @@ pub struct Shape {
     rect: Rect,
     // Cuts the quad to this rectangle, axis-aligned, with the scissor.
     clip: Rect,
-    // Rounded rectangle and corner radius of an ancestor clip, anti-aliased; None for none.
-    round_clip: Option<(Rect, f32)>,
+    // Rounded rectangle and corner radii of an ancestor clip, anti-aliased; None for none.
+    round_clip: Option<(Rect, Corners)>,
     color: Color,
     end_color: Color,
     uv: [f32; 4],
-    radius: f32,
+    radius: Corners,
     image: Option<Image>,
     // The mask's alpha, stretched to the rectangle it is paired with.
     mask: Option<(Image, Rect)>,
@@ -53,6 +53,8 @@ enum Mode {
 }
 
 /// A drawing command. Layers composite everything between `PushLayer` and `PopLayer` with an opacity.
+// Shapes are built once per frame and copied into the instances: boxing them would allocate for each one.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 pub enum Draw {
     Shape(Shape),
@@ -62,15 +64,15 @@ pub enum Draw {
 
 impl Draw {
     pub fn fill(rect: Rect, clip: Rect, color: Color) -> Self {
-        Self::gradient(rect, clip, 0., color, color)
+        Self::gradient(rect, clip, [0.; 4], color, color)
     }
 
     pub fn rounded(rect: Rect, clip: Rect, radius: f32, color: Color) -> Self {
-        Self::gradient(rect, clip, radius, color, color)
+        Self::gradient(rect, clip, [radius; 4], color, color)
     }
 
     /// Rounded rectangle with a vertical gradient from `top` to `bottom`.
-    pub fn gradient(rect: Rect, clip: Rect, radius: f32, top: Color, bottom: Color) -> Self {
+    pub fn gradient(rect: Rect, clip: Rect, radius: Corners, top: Color, bottom: Color) -> Self {
         Draw::Shape(Shape {
             rect,
             clip,
@@ -85,8 +87,8 @@ impl Draw {
         })
     }
 
-    /// Cuts the shape to the rounded rectangle `round` (rectangle and corner radius, logical pixels), anti-aliased.
-    pub fn rounded_clip(mut self, round: Option<(Rect, f32)>) -> Self {
+    /// Cuts the shape to the rounded rectangle `round` (rectangle and corner radii, logical pixels), anti-aliased.
+    pub fn rounded_clip(mut self, round: Option<(Rect, Corners)>) -> Self {
         if let Draw::Shape(shape) = &mut self {
             shape.round_clip = round;
         }
@@ -104,11 +106,11 @@ impl Draw {
     /// An image at its natural size, `scale` device pixels per logical pixel.
     pub fn image(image: &Image, [x, y]: [f32; 2], scale: f32, clip: Rect) -> Self {
         let [w, h] = image.size.map(|side| side as f32 / scale);
-        Self::image_in(image, [x, y, w, h], 0., clip, WHITE)
+        Self::image_in(image, [x, y, w, h], [0.; 4], clip, WHITE)
     }
 
     /// An image stretched to `rect`, with corners rounded by `radius`, multiplied by `tint` (straight RGBA).
-    pub fn image_in(image: &Image, rect: Rect, radius: f32, clip: Rect, tint: Color) -> Self {
+    pub fn image_in(image: &Image, rect: Rect, radius: Corners, clip: Rect, tint: Color) -> Self {
         Draw::Shape(Shape {
             rect,
             clip,
@@ -128,7 +130,7 @@ impl Draw {
     pub fn inset(
         rect: Rect,
         clip: Rect,
-        radius: f32,
+        radius: Corners,
         spread: f32,
         offset: [f32; 2],
         color: Color,
@@ -172,7 +174,7 @@ impl Draw {
             color,
             end_color: color,
             uv: [0., 0., 1., 1.],
-            radius: 0.,
+            radius: [0.; 4],
             image: None,
             mask: None,
             mode: Mode::Shadow {
@@ -199,7 +201,8 @@ struct Quad {
     // The rounded clip's rectangle: the scissor cuts the rectangle clip, so this slot needs no other.
     round_clip: [f32; 4],
     mask: [f32; 4],
-    clip_radius: f32,
+    clip_radii: [f32; 4],
+    radii: [f32; 4],
 }
 
 // Offscreen texture for one nesting level of layers.
@@ -272,7 +275,7 @@ impl Renderer {
                     attributes: &wgpu::vertex_attr_array![
                         0 => Float32x4, 1 => Float32x4, 2 => Float32x4, 3 => Float32x4,
                         4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 7 => Float32x4,
-                        8 => Float32x4, 9 => Float32
+                        8 => Float32x4, 9 => Float32x4, 10 => Float32x4
                     ],
                 })],
                 compilation_options: Default::default(),
@@ -503,14 +506,17 @@ impl Renderer {
                 color: premultiply(shape.color),
                 end_color: premultiply(shape.end_color),
                 uv: shape.uv,
-                shape: [w * scale, h * scale, shape.radius * scale, mode],
+                shape: [w * scale, h * scale, 0., mode],
                 params,
                 params2,
                 round_clip: shape
                     .round_clip
                     .map_or([0.; 4], |(rect, _)| rect.map(|v| v * scale)),
                 mask,
-                clip_radius: shape.round_clip.map_or(0., |(_, radius)| radius * scale),
+                clip_radii: shape
+                    .round_clip
+                    .map_or([0.; 4], |(_, radii)| radii.map(|r| r * scale)),
+                radii: shape.radius.map(|r| r * scale),
             }
         };
         // Commands in order; each shape keeps its instance index and scissor.
@@ -555,7 +561,7 @@ impl Renderer {
                         color: tint,
                         end_color: tint,
                         uv: [0., 0., 1., 1.],
-                        radius: 0.,
+                        radius: [0.; 4],
                         image: None,
                         mask: None,
                         mode: Mode::Fill,
@@ -794,10 +800,33 @@ mod tests {
             .collect();
         let mask = renderer.rgba_image(&rgba, [40, 40]);
         let rect = [0., 0., 40., 40.];
-        let draws = [Draw::gradient(rect, rect, 0., RED, RED).masked(Some((mask, rect)))];
+        let draws = [Draw::gradient(rect, rect, [0.; 4], RED, RED).masked(Some((mask, rect)))];
         let frame = renderer.read([40, 40], 1., &draws).unwrap();
         assert_close(pixel(&frame, 30, 30), BLACK);
         assert_close(pixel(&frame, 20, 20), RED);
+    }
+
+    // Radii are top-left, top-right, bottom-right, bottom-left: the top-right and bottom-left corners are round.
+    #[test]
+    fn per_corner_radii_round_only_the_corners_they_name() {
+        let mut renderer = renderer();
+        let rect = [0., 0., 40., 40.];
+        let corners = [0., 20., 0., 20.];
+        let draws = [Draw::gradient(rect, rect, corners, RED, RED)];
+        let frame = renderer.read([40, 40], 1., &draws).unwrap();
+        assert_close(pixel(&frame, 1, 1), RED);
+        assert_close(pixel(&frame, 38, 1), BLACK);
+        assert_close(pixel(&frame, 1, 38), BLACK);
+        assert_close(pixel(&frame, 38, 38), RED);
+
+        // The same corners cut a square child of a clip.
+        let draws =
+            [Draw::gradient(rect, rect, [0.; 4], RED, RED).rounded_clip(Some((rect, corners)))];
+        let frame = renderer.read([40, 40], 1., &draws).unwrap();
+        assert_close(pixel(&frame, 1, 1), RED);
+        assert_close(pixel(&frame, 38, 1), BLACK);
+        assert_close(pixel(&frame, 1, 38), BLACK);
+        assert_close(pixel(&frame, 38, 38), RED);
     }
 
     #[test]
@@ -805,7 +834,8 @@ mod tests {
         let mut renderer = renderer();
         let rect = [0., 0., 40., 40.];
         // A 40 px red child in a clip of the same rectangle rounded by 20 px.
-        let draws = [Draw::gradient(rect, rect, 0., RED, RED).rounded_clip(Some((rect, 20.)))];
+        let draws =
+            [Draw::gradient(rect, rect, [0.; 4], RED, RED).rounded_clip(Some((rect, [20.; 4])))];
         let frame = renderer.read([40, 40], 1., &draws).unwrap();
         assert_close(pixel(&frame, 1, 1), BLACK);
         assert_close(pixel(&frame, 20, 20), RED);
@@ -818,7 +848,9 @@ mod tests {
         // not rounded: only the parent's rounded box cuts it.
         let parent = [0., 0., 60., 60.];
         let child = [20., 20., 30., 30.];
-        let draws = [Draw::gradient(child, child, 0., RED, RED).rounded_clip(Some((parent, 20.)))];
+        let draws =
+            [Draw::gradient(child, child, [0.; 4], RED, RED)
+                .rounded_clip(Some((parent, [20.; 4])))];
         let frame = renderer.read([60, 60], 1., &draws).unwrap();
         assert_close(pixel(&frame, 21, 21), RED);
         assert_close(pixel(&frame, 1, 1), BLACK);

@@ -27,6 +27,7 @@ fn main() {
             "scrollbar",
             "overlay",
             "fill",
+            "containers",
         ]);
     }
     if apps.is_empty() {

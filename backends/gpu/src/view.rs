@@ -258,10 +258,19 @@ impl View {
                     mask,
                 } => {
                     let texture = self.image(renderer, &image, &mut used);
+                    // The mask is snapped with the image, so it keeps the same pixels as the image it masks.
+                    let fitted = one_to_one(rect, image.size, scale);
+                    let mask = mask.map(|(pixels, mask_rect)| {
+                        let mask_rect = if fitted.is_some() {
+                            snap_rect(mask_rect, scale)
+                        } else {
+                            mask_rect
+                        };
+                        (pixels, mask_rect)
+                    });
                     let mask = self.mask(renderer, mask, &mut used);
-                    let rect = one_to_one(rect, image.size, scale);
                     draws.push(
-                        Draw::image_in(&texture, rect, radius, clip, tint)
+                        Draw::image_in(&texture, fitted.unwrap_or(rect), radius, clip, tint)
                             .rounded_clip(round_clip)
                             .masked(mask),
                     );
@@ -337,16 +346,20 @@ fn snap(point: [f32; 2], scale: f32) -> [f32; 2] {
     point.map(|v| (v * scale).round() / scale)
 }
 
-// An app image whose pixels exactly fill its rectangle is drawn 1:1, snapped like a bitmap; otherwise it is stretched.
-fn one_to_one(rect: Rect, size: [u32; 2], scale: f32) -> Rect {
+fn snap_rect(rect: Rect, scale: f32) -> Rect {
+    rect.map(|v| (v * scale).round() / scale)
+}
+
+// An app image whose pixels exactly fill its rectangle is drawn 1:1, snapped like a bitmap; None: it is stretched.
+fn one_to_one(rect: Rect, size: [u32; 2], scale: f32) -> Option<Rect> {
     let [x, y, w, h] = rect;
     let fits = [w, h]
         .iter()
         .zip(size)
         .all(|(&side, pixels)| (side * scale).round() == pixels as f32);
     if !fits {
-        return rect;
+        return None;
     }
     let [x, y] = snap([x, y], scale);
-    [x, y, size[0] as f32 / scale, size[1] as f32 / scale]
+    Some([x, y, size[0] as f32 / scale, size[1] as f32 / scale])
 }

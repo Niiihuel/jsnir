@@ -233,12 +233,14 @@ impl Motion {
         self.running.values().any(|a| a.at(now).is_some())
     }
     /// Runs a node's keyframe animations at `now`. A list that differs from the last one restarts them. With
-    /// `reduced` (reduced motion), infinite animations do not run.
+    /// `reduced` (reduced motion), infinite animations do not run. With `frozen` (a capture), each animation shows
+    /// its value `frozen` ms after its own start, and none counts as running.
     pub fn keyframes(
         &mut self,
         id: u16,
         animations: &[tree::Animation],
         reduced: bool,
+        frozen: Option<f32>,
         now: f64,
     ) -> Keyed {
         if animations.is_empty() {
@@ -261,6 +263,12 @@ impl Motion {
         let mut keyed = Keyed::default();
         for animation in animations {
             if reduced && animation.iterations.is_none() {
+                continue;
+            }
+            if let Some(at) = frozen {
+                if let Some(value) = sample(animation, at) {
+                    keyed.values.push((animation.property, value));
+                }
                 continue;
             }
             // Time since the animation's own start, which is after its delay.
@@ -373,7 +381,7 @@ mod tests {
         let mut motion = Motion::default();
         let mut at = |now: f64| {
             motion
-                .keyframes(1, std::slice::from_ref(&pulse), false, now)
+                .keyframes(1, std::slice::from_ref(&pulse), false, None, now)
                 .values[0]
                 .1
                 .number()
@@ -387,7 +395,7 @@ mod tests {
             duration: 6000.,
             ..pulse
         };
-        let restarted = motion.keyframes(1, &[slower], false, 4500.);
+        let restarted = motion.keyframes(1, &[slower], false, None, 4500.);
         assert_eq!(restarted.values[0].1.number(), 1.);
         assert!(restarted.running);
     }
@@ -405,7 +413,7 @@ mod tests {
         let mut motion = Motion::default();
         let mut at = |now: f64| {
             motion
-                .keyframes(1, std::slice::from_ref(&breathe), false, now)
+                .keyframes(1, std::slice::from_ref(&breathe), false, None, now)
                 .values[0]
                 .1
                 .number()
@@ -437,7 +445,7 @@ mod tests {
         let mut motion = Motion::default();
         let mut at = |now: f64| {
             motion
-                .keyframes(1, std::slice::from_ref(&pulse), false, now)
+                .keyframes(1, std::slice::from_ref(&pulse), false, None, now)
                 .values[0]
                 .1
                 .rgba()

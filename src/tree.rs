@@ -1,6 +1,7 @@
 //! Tree of nodes with stable identity. A batch is validated whole before it touches the tree.
 //! Two writers own separate nodes: the app (JS) and the UI. Their batches never touch the same
 //! nodes, so they commute: they apply in any order, without locks or rebasing.
+use crate::contract::Ts;
 use serde::Deserialize;
 use std::{
     collections::{HashMap, VecDeque},
@@ -296,13 +297,40 @@ contract_struct! {
         auto_hide: bool,
     }
 }
+/// Corner radius: one value for every corner, or `[topLeft, topRight, bottomRight, bottomLeft]` as in CSS.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(untagged)]
+pub enum Radius {
+    All(f32),
+    Corners([f32; 4]),
+}
+impl Default for Radius {
+    fn default() -> Self {
+        Radius::All(0.)
+    }
+}
+impl Radius {
+    /// The radius of each corner: top-left, top-right, bottom-right, bottom-left.
+    pub fn corners(&self) -> [f32; 4] {
+        match *self {
+            Radius::All(r) => [r; 4],
+            Radius::Corners(corners) => corners,
+        }
+    }
+}
+impl Ts for Radius {
+    fn ts() -> String {
+        format!("{} | {}", f32::ts(), <[f32; 4]>::ts())
+    }
+}
 contract_struct! {
     /// How a node looks. Colors are `0xRRGGBBAA`. Changes animate with the matching `transitions`.
     pub struct Paint as "Paint" {
         background: Option<u32>,
         /// Vertical gradient, top to bottom (overrides `background`).
         gradient: Option<[u32; 2]>,
-        radius: f32,
+        /// Corner radius; a list gives each corner in CSS order.
+        radius: Radius,
         /// Names an image set with `Host::set_image`; its alpha, stretched to the node's rectangle, multiplies what this node draws (fill, gradient, edge, highlight, image). Not its children or shadows. While the mask is missing, those draw nothing.
         mask: Option<String>,
         /// Inner ring (CSS `inset 0 0 0 <edgeWidth> <edge>`).
@@ -342,8 +370,11 @@ impl Paint {
         let variants = [&self.hover, &self.active, &self.focus]
             .into_iter()
             .flatten();
-        let numbers = [self.radius, self.x, self.y]
+        let numbers = self
+            .radius
+            .corners()
             .into_iter()
+            .chain([self.x, self.y])
             .chain(self.edge_width)
             .chain(self.edge_sides.into_iter().flatten())
             .chain(
@@ -1621,6 +1652,20 @@ mod tests {
             assert_eq!(rejected, before);
         }
     }
+    #[test]
+    fn a_radius_is_one_number_or_four_corners() {
+        let paint = |json: &str| {
+            serde_json::from_str::<Paint>(json)
+                .unwrap()
+                .radius
+                .corners()
+        };
+        assert_eq!(paint(r#"{"radius": 8}"#), [8.; 4]);
+        assert_eq!(paint(r#"{"radius": [0, 20, 0, 20]}"#), [0., 20., 0., 20.]);
+        assert_eq!(paint("{}").iter().sum::<f32>(), 0.);
+        assert!(serde_json::from_str::<Paint>(r#"{"radius": [1, 2, 3]}"#).is_err());
+    }
+
     #[test]
     fn variant_sizes_must_not_be_negative() {
         let box_with = |variant: &str| {

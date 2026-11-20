@@ -26,6 +26,8 @@ use std::{
 pub type Rect = [f32; 4];
 /// Straight (not premultiplied) RGBA.
 pub type Rgba = [u8; 4];
+/// Corner radii of a rectangle in logical pixels: top-left, top-right, bottom-right, bottom-left (CSS order).
+pub type Corners = [f32; 4];
 
 /// `rect`, which is in a text's logical pixels, placed at `origin` in device pixels scaled by `zoom`.
 fn scaled(origin: Rect, rect: Rect, zoom: f32) -> Rect {
@@ -47,35 +49,36 @@ pub enum Item {
         opacity: f32,
     },
     PopLayer,
-    /// Outer shadow of a rounded rectangle; it is not drawn under the rectangle itself. Not masked.
+    /// Outer shadow of a rounded rectangle; it is not drawn under the rectangle itself. Not masked. Its blur uses
+    /// the largest corner radius: a shadow of unequal corners is approximated.
     Shadow {
         rect: Rect,
         radius: f32,
         shadow: ShadowSpec,
         clip: Rect,
-        round_clip: Option<(Rect, f32)>,
+        round_clip: Option<(Rect, Corners)>,
     },
     /// Rounded rectangle filled with a vertical gradient (`top` = `bottom` for a solid color).
     /// `mask` is the image and the rectangle it is stretched to.
     Fill {
         rect: Rect,
-        radius: f32,
+        radius: Corners,
         top: Rgba,
         bottom: Rgba,
         clip: Rect,
-        round_clip: Option<(Rect, f32)>,
+        round_clip: Option<(Rect, Corners)>,
         mask: Option<(ImageData, Rect)>,
     },
     /// Inner shadow without blur: the part of the shape not covered by itself inset by `spread` and
     /// moved by `offset` (a ring with spread, a top highlight with offset).
     Inset {
         rect: Rect,
-        radius: f32,
+        radius: Corners,
         spread: f32,
         offset: [f32; 2],
         color: Rgba,
         clip: Rect,
-        round_clip: Option<(Rect, f32)>,
+        round_clip: Option<(Rect, Corners)>,
         mask: Option<(ImageData, Rect)>,
     },
     /// Text laid out in `rect` at `zoom` times the device scale. `spans` are the rich text's runs, already
@@ -88,7 +91,7 @@ pub enum Item {
         wrap: bool,
         zoom: f32,
         clip: Rect,
-        round_clip: Option<(Rect, f32)>,
+        round_clip: Option<(Rect, Corners)>,
     },
     Icon {
         rect: Rect,
@@ -98,16 +101,16 @@ pub enum Item {
         color: Rgba,
         zoom: f32,
         clip: Rect,
-        round_clip: Option<(Rect, f32)>,
+        round_clip: Option<(Rect, Corners)>,
     },
     /// An image the app named, stretched to `rect`, rounded by `radius` and multiplied by `tint`.
     Image {
         rect: Rect,
-        radius: f32,
+        radius: Corners,
         image: ImageData,
         tint: Rgba,
         clip: Rect,
-        round_clip: Option<(Rect, f32)>,
+        round_clip: Option<(Rect, Corners)>,
         mask: Option<(ImageData, Rect)>,
     },
     /// The focused field's text, selection and caret.
@@ -118,7 +121,7 @@ pub enum Item {
         selection: Rgba,
         caret_color: Rgba,
         clip: Rect,
-        round_clip: Option<(Rect, f32)>,
+        round_clip: Option<(Rect, Corners)>,
     },
 }
 
@@ -240,6 +243,9 @@ pub struct Host {
     font_epoch: u64,
     /// Hides the caret, for reproducible captures.
     pub hide_caret: bool,
+    /// Captures only: keyframe animations show their value this many ms after their own start, and none keeps
+    /// running. None: they run live.
+    pub keyframes_at: Option<f32>,
     // Reduced motion: infinite keyframe animations do not run, and their nodes show their base values.
     reduced_motion: bool,
 }
@@ -326,6 +332,7 @@ impl Host {
             image_generation: 0,
             font_epoch: 0,
             hide_caret: false,
+            keyframes_at: None,
             reduced_motion: false,
         };
         host.receive(mount);
@@ -1225,9 +1232,13 @@ impl Host {
                     .get(&id)
                     .and_then(Node::paint)
                     .and_then(|p| p.animations.as_deref());
-                let keyed =
-                    self.motion
-                        .keyframes(id, animations.unwrap_or(&[]), self.reduced_motion, now);
+                let keyed = self.motion.keyframes(
+                    id,
+                    animations.unwrap_or(&[]),
+                    self.reduced_motion,
+                    self.keyframes_at,
+                    now,
+                );
                 if let Some((_, height)) = keyed.values.iter().find(|(p, _)| *p == Property::Height)
                 {
                     shown = height.number();
@@ -1370,7 +1381,7 @@ struct Context {
     brightness: f32,
     clip: Rect,
     // Rounded rectangle and corner radius of the innermost rounded clip; None for none.
-    round_clip: Option<(Rect, f32)>,
+    round_clip: Option<(Rect, Corners)>,
 }
 impl Context {
     fn rect(&self, [x, y, w, h]: Rect) -> Rect {
@@ -1485,7 +1496,14 @@ impl Walker<'_> {
             }
         }
         // Keyframe values override the base values while their animations run.
-        let keyed = motion.keyframes(id, paint.animations.as_deref().unwrap_or(&[]), reduced, now);
+        let frozen = host.keyframes_at;
+        let keyed = motion.keyframes(
+            id,
+            paint.animations.as_deref().unwrap_or(&[]),
+            reduced,
+            frozen,
+            now,
+        );
         let overridden = |property: Property| {
             keyed
                 .values
@@ -1660,7 +1678,8 @@ impl Walker<'_> {
                 layer: self.layer,
             });
         }
-        let radius = paint.radius * inner.k;
+        let radius = paint.radius.corners().map(|r| r * inner.k);
+        let shadow_radius = radius.into_iter().fold(0., f32::max);
         // A mask names an image: while that image is missing, the node draws none of its own paint.
         let mask = paint
             .mask
@@ -1684,7 +1703,7 @@ impl Walker<'_> {
                 };
                 self.items.push(Item::Shadow {
                     rect: screen,
-                    radius,
+                    radius: shadow_radius,
                     shadow,
                     clip,
                     round_clip,
@@ -1732,7 +1751,7 @@ impl Walker<'_> {
                         if width <= 0. || strip[2] <= 0. || strip[3] <= 0. {
                             continue;
                         }
-                        if radius > 0. {
+                        if radius.iter().any(|&r| r > 0.) {
                             self.items.push(Item::Inset {
                                 rect: screen,
                                 radius,
@@ -1746,7 +1765,7 @@ impl Walker<'_> {
                         } else {
                             self.items.push(Item::Fill {
                                 rect: strip,
-                                radius: 0.,
+                                radius: [0.; 4],
                                 top: color,
                                 bottom: color,
                                 clip,
@@ -1829,7 +1848,7 @@ impl Walker<'_> {
                             };
                             self.items.push(Item::Image {
                                 rect: scaled(screen, rect, zoom),
-                                radius: 0.,
+                                radius: [0.; 4],
                                 image: image.clone(),
                                 tint: [255; 4],
                                 clip,
@@ -1844,7 +1863,7 @@ impl Walker<'_> {
                             let color = inner.color(color);
                             self.items.push(Item::Fill {
                                 rect: scaled(screen, rect, zoom),
-                                radius: 0.,
+                                radius: [0.; 4],
                                 top: color,
                                 bottom: color,
                                 clip,
@@ -1990,7 +2009,7 @@ impl Walker<'_> {
         if node.style().is_some_and(|s| s.clip || s.scroll) {
             child.clip = intersect(clip, screen);
             // shortcut: a rounded clip inside another rounded clip replaces it, so the outer corners are lost.
-            if radius > 0. {
+            if radius.iter().any(|&r| r > 0.) {
                 child.round_clip = Some((screen, radius));
             }
         }
@@ -2060,7 +2079,7 @@ impl Walker<'_> {
                 color[3] = (f32::from(color[3]) * alpha).round() as u8;
                 color
             };
-            let radius = scrollbar.radius * inner.k;
+            let radius = [scrollbar.radius * inner.k; 4];
             if let Some(track_color) = scrollbar.track {
                 let color = shade(track_color);
                 self.items.push(Item::Fill {
@@ -2096,7 +2115,7 @@ impl Walker<'_> {
         font: &crate::tree::Font,
         ctx: &Context,
         line: Rect,
-        (clip, round_clip): (Rect, Option<(Rect, f32)>),
+        (clip, round_clip): (Rect, Option<(Rect, Corners)>),
     ) {
         if text.is_empty() {
             return;
@@ -2268,7 +2287,7 @@ mod tests {
             panic!("expected one image item")
         };
         assert_eq!((rect[2], rect[3]), (40., 40.));
-        assert_eq!(*radius, 20.);
+        assert_eq!(*radius, [20.; 4]);
         assert_eq!(*tint, [255, 0, 0, 255]);
         let generation = image.generation;
         host.set_image("a".into(), vec![0; 4 * 2 * 2], [2, 2]);
@@ -2544,6 +2563,53 @@ mod tests {
         })
     }
 
+    // Containers take the props of a Box: a Column paints its background, a For shows a thumb, and a tooltip's text
+    // takes its color and wraps at its maximum width.
+    #[test]
+    fn containers_take_the_props_of_a_box() {
+        let mut host = Host::new(
+            crate::apps::CONTAINERS.into(),
+            "{}".into(),
+            TextEngine::default(),
+        );
+        settle(&mut host);
+        let frame = frame_of(&mut host);
+        let background = frame
+            .items
+            .iter()
+            .find_map(|item| match item {
+                Item::Fill { rect, top, .. } if *top == [0x30, 0x60, 0xc0, 0xff] => Some(*rect),
+                _ => None,
+            })
+            .expect("the column's background");
+        assert_eq!((background[2], background[3]), (60., 60.));
+        let thumb = thumbs(&frame);
+        assert_eq!(thumb.len(), 1, "{thumb:?}");
+        assert!(thumb[0].0[0] > background[0] + background[2]);
+
+        let target = find(&host, |n| {
+            n.style()
+                .is_some_and(|s| s.width == Some(20.) && s.height == Some(20.))
+        });
+        host.pointer_move(Some(centre(host.screen_rect(target).unwrap())));
+        settle(&mut host);
+        let (rect, color) = frame_of(&mut host)
+            .items
+            .iter()
+            .find_map(|item| match item {
+                Item::Text {
+                    rect, text, style, ..
+                } if text == "A tooltip that wraps onto several lines" => {
+                    Some((*rect, style.color))
+                }
+                _ => None,
+            })
+            .expect("the tooltip's text");
+        assert_eq!(color, [255, 128, 0, 255]);
+        assert!(rect[2] <= 60. + 0.01, "{rect:?}");
+        assert!(rect[3] > 30., "the text wraps onto several lines: {rect:?}");
+    }
+
     #[test]
     fn a_scrollbar_thumb_is_its_share_of_the_track_and_follows_the_offset() {
         let mut host = Host::new(
@@ -2812,7 +2878,7 @@ mod tests {
     }
 
     // The fill of one color in the frame: its rectangle, its mask and its rounded clip.
-    type Fill = (Rect, Option<(ImageData, Rect)>, Option<(Rect, f32)>);
+    type Fill = (Rect, Option<(ImageData, Rect)>, Option<(Rect, Corners)>);
     fn fill_of(frame: &Frame, color: Rgba) -> Option<Fill> {
         frame.items.iter().find_map(|item| match item {
             Item::Fill {
@@ -2864,7 +2930,7 @@ mod tests {
         let (child, mask, round) = fill_of(&frame, GREEN).expect("the clipped child");
         assert!(mask.is_none());
         // The child fills its clip, so the clip's rounded box is the child's rectangle.
-        assert_eq!(round, Some((child, 16.)), "the clip's own rounded box");
+        assert_eq!(round, Some((child, [16.; 4])), "the clip's own rounded box");
         assert_eq!(fill_of(&frame, RED).unwrap().2, None);
 
         // A missing mask hides the node's own fill, and only that.
