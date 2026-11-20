@@ -125,6 +125,11 @@ impl AppWindow {
     fn redraw(&mut self, events: &ActiveEventLoop) {
         self.wake = None;
         self.host.poll();
+        for result in std::iter::from_fn(|| self.host.take_reload_result()) {
+            if let Err(error) = result {
+                eprintln!("jsnir: reload failed: {error}");
+            }
+        }
         let Some(surface) = &mut self.surface else {
             return;
         };
@@ -366,6 +371,13 @@ impl ApplicationHandler for AppWindow {
                 Message::Font(bytes) => self.host.add_font(bytes),
                 Message::DefaultFamily(family) => self.host.set_default_family(family),
                 Message::ReducedMotion(on) => self.host.set_reduced_motion(on),
+                Message::Reload(script) => {
+                    if !self.host.reload(script) {
+                        eprintln!(
+                            "jsnir: reload failed: the app's event queue is full, send it again"
+                        );
+                    }
+                }
             }
         }
         self.request_redraw();
@@ -445,6 +457,7 @@ enum Message {
     Font(Vec<u8>),
     DefaultFamily(String),
     ReducedMotion(bool),
+    Reload(String),
 }
 type ScaleCallback = Box<dyn Fn(f32) + Send>;
 /// The window's scale factor and its `on_scale` callback, shared between the window and its `Pusher`s.
@@ -513,6 +526,11 @@ impl Pusher {
     }
     pub fn default_family(&self, family: String) -> bool {
         self.send(Message::DefaultFamily(family))
+    }
+    /// Replaces the app's code with `script` (SDK + app), keeping its state where it can (`Host::reload`). If the
+    /// new code fails, the window prints `jsnir: reload failed` and the previous app keeps running.
+    pub fn reload(&self, script: String) -> bool {
+        self.send(Message::Reload(script))
     }
     fn send(&self, message: Message) -> bool {
         self.tx.send(message).is_ok() && self.proxy.send_event(()).is_ok()
