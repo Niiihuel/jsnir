@@ -76,6 +76,8 @@ Use `rust` in place of `js` to run the Rust reference app. Set `JSNIR_LIVE=1` in
 
 The Rust↔TypeScript contract is declared once in `src/contract.rs`, and `app/jsnir.d.ts` is generated from it. Apps are type-checked against that file, so using something Rust does not offer fails to compile. Regenerate it with `JSNIR_UPDATE=1 cargo test contract`. The VM is QuickJS-ng 0.16.2, bundled and statically linked through the `rquickjs` crate.
 
+Keyframe animations (`paint.animations`) run on the UI thread next to the transitions, and a loop stops drawing the window once it leaves the screen. Reduced motion stops the infinite ones (`Host::set_reduced_motion`, `Pusher::reduced_motion`). The GPU backend does not read the OS preference yet, so the program has to pass it in.
+
 ## Tests
 
 ```sh

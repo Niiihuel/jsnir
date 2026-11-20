@@ -151,9 +151,18 @@ contract_strings! {
         Opacity, X, Y, Scale, Brightness, Background, Edge, Color, Draw, Left, Width, Height
     }
 }
+impl Property {
+    /// Whether the property takes a color (`0xRRGGBBAA`) rather than a number.
+    pub fn is_color(self) -> bool {
+        matches!(
+            self,
+            Property::Background | Property::Edge | Property::Color
+        )
+    }
+}
 contract_strings! {
     /// Named timing curves. `spring` is the React Bits `linear()` spring; `bezier` uses `Transition.bezier`.
-    pub enum Easing as "Easing" { Linear, Ease, EaseOut, Spring, Bezier }
+    pub enum Easing as "Easing" { Linear, Ease, EaseOut, EaseInOut, Spring, Bezier }
 }
 contract_struct! {
     /// Animates changes of one property, as a CSS transition. Durations in milliseconds.
@@ -166,6 +175,68 @@ contract_struct! {
         bezier: Option<[f32; 4]>,
         /// Fraction of the eased progress during which the value holds its start (a keyframe at that offset).
         hold: f32,
+    }
+}
+contract_struct! {
+    /// One keyframe of an animation: `offset` is the fraction of an iteration, from 0 to 1. A numeric property takes
+    /// `value`; a color property takes `color` (`0xRRGGBBAA`).
+    pub struct Keyframe as "Keyframe" {
+        offset: f32,
+        value: Option<f32>,
+        color: Option<u32>,
+    }
+}
+contract_struct! {
+    /// Animates a property through keyframes, as CSS `@keyframes` with `animation`. Durations in milliseconds.
+    /// The easing applies to each segment between two keyframes. No `iterations` means forever; with `alternate`,
+    /// every other iteration plays backwards. When the iterations end, the property shows its paint again.
+    pub struct Animation as "Animation" {
+        property: Property,
+        keyframes: Vec<Keyframe>,
+        duration: f32,
+        delay: f32,
+        easing: Easing,
+        /// Control points for `easing: "bezier"`, as in CSS `cubic-bezier(x1, y1, x2, y2)`.
+        bezier: Option<[f32; 4]>,
+        iterations: Option<f32>,
+        alternate: bool,
+    }
+}
+impl Animation {
+    fn valid(&self) -> bool {
+        let finite = [self.duration, self.delay]
+            .into_iter()
+            .chain(self.iterations)
+            .chain(self.bezier.into_iter().flatten())
+            .chain(
+                self.keyframes
+                    .iter()
+                    .flat_map(|k| [Some(k.offset), k.value])
+                    .flatten(),
+            )
+            .all(f32::is_finite);
+        let ordered = self
+            .keyframes
+            .iter()
+            .all(|k| (0. ..=1.).contains(&k.offset))
+            && self
+                .keyframes
+                .windows(2)
+                .all(|w| w[0].offset <= w[1].offset);
+        let typed = self.keyframes.iter().all(|k| {
+            if self.property.is_color() {
+                k.color.is_some()
+            } else {
+                k.value.is_some()
+            }
+        });
+        finite
+            && self.duration > 0.
+            && self.delay >= 0.
+            && self.iterations.is_none_or(|n| n > 0.)
+            && !self.keyframes.is_empty()
+            && ordered
+            && typed
     }
 }
 contract_struct! {
@@ -255,6 +326,8 @@ contract_struct! {
         /// Drawn fraction of an icon's strokes (1 by default).
         draw: Option<f32>,
         transitions: Vec<Transition>,
+        /// Keyframe animations that run while the node is on screen. A change of the list restarts them.
+        animations: Option<Vec<Animation>>,
         starting: Option<Starting>,
         hover: Option<Variant>,
         active: Option<Variant>,
@@ -319,6 +392,7 @@ impl Paint {
                 .transitions
                 .iter()
                 .all(|t| t.duration >= 0. && t.delay >= 0.)
+            && self.animations.iter().flatten().all(Animation::valid)
     }
 }
 contract_struct! {
@@ -475,6 +549,8 @@ pub(crate) fn ts_decls() -> String {
         Property::ts_decl(),
         Easing::ts_decl(),
         Transition::ts_decl(),
+        Keyframe::ts_decl(),
+        Animation::ts_decl(),
         Shadow::ts_decl(),
         Variant::ts_decl(),
         Starting::ts_decl(),
@@ -1619,5 +1695,33 @@ mod tests {
             "a fixed node cannot leave the fixed position"
         );
         assert_eq!(t.apply(batch(2, vec![restyle("fixed")])), Ok(()));
+    }
+    #[test]
+    fn animations_are_validated_with_their_paint() {
+        let with = |animation: &str| {
+            let op = format!(
+                r#"{{"op":"create","id":1,"node":{{"kind":"box","paint":{{"animations":[{animation}]}}}}}}"#
+            );
+            Tree::default().apply(Batch {
+                base: 0,
+                ops: vec![serde_json::from_str(&op).unwrap()],
+            })
+        };
+        assert!(
+            with(
+                r#"{"property":"opacity","keyframes":[{"offset":0,"value":1},{"offset":1,"value":0.5}],"duration":1000,"iterations":2,"alternate":true}"#
+            )
+            .is_ok()
+        );
+        for bad in [
+            r#"{"property":"opacity","keyframes":[{"offset":0,"value":1}]}"#,
+            r#"{"property":"opacity","keyframes":[{"offset":0,"value":1}],"duration":1000,"iterations":0}"#,
+            r#"{"property":"opacity","keyframes":[{"offset":0.5,"value":1},{"offset":0,"value":0.5}],"duration":1000}"#,
+            r#"{"property":"opacity","keyframes":[{"offset":0,"color":1}],"duration":1000}"#,
+            r#"{"property":"background","keyframes":[{"offset":0,"value":1}],"duration":1000}"#,
+            r#"{"property":"opacity","keyframes":[],"duration":1000}"#,
+        ] {
+            assert_eq!(with(bad), Err("invalid_paint"), "{bad}");
+        }
     }
 }

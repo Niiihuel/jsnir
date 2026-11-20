@@ -1,7 +1,7 @@
 //! Transitions run on the UI thread: JS declares them once in a node's paint, and Rust animates every
 //! frame without calling JS. A property animates from what is on screen to its new target, as a CSS
 //! transition does, so a change in the middle of an animation turns around smoothly.
-use crate::tree::{Easing, Property, Transition};
+use crate::tree::{self, Easing, Keyframe, Property, Transition};
 use std::collections::HashMap;
 
 /// The React Bits stepper spring: CSS `linear()` with 29 evenly spaced samples.
@@ -47,23 +47,29 @@ impl Value {
 
 /// Eased progress for a time fraction `t` in 0–1.
 pub fn ease(transition: &Transition, t: f32) -> f32 {
-    let t = t.clamp(0., 1.);
-    let eased = match transition.easing {
-        Easing::Linear => t,
-        Easing::Ease => bezier([0.25, 0.1, 0.25, 1.], t),
-        Easing::EaseOut => bezier([0., 0., 0.58, 1.], t),
-        Easing::Bezier => bezier(transition.bezier.unwrap_or([0., 0., 1., 1.]), t),
-        Easing::Spring => {
-            let at = t * (SPRING.len() - 1) as f32;
-            let i = (at as usize).min(SPRING.len() - 2);
-            SPRING[i] + (SPRING[i + 1] - SPRING[i]) * (at - i as f32)
-        }
-    };
+    let eased = timing(transition.easing, transition.bezier, t);
     // A keyframe at `hold`: the value stays at its start until the eased progress reaches it.
     if transition.hold > 0. && transition.hold < 1. {
         ((eased - transition.hold) / (1. - transition.hold)).max(0.)
     } else {
         eased
+    }
+}
+
+/// The timing curve `easing` at a time fraction `t` in 0–1; `points` are for `Easing::Bezier`.
+fn timing(easing: Easing, points: Option<[f32; 4]>, t: f32) -> f32 {
+    let t = t.clamp(0., 1.);
+    match easing {
+        Easing::Linear => t,
+        Easing::Ease => bezier([0.25, 0.1, 0.25, 1.], t),
+        Easing::EaseOut => bezier([0., 0., 0.58, 1.], t),
+        Easing::EaseInOut => bezier([0.42, 0., 0.58, 1.], t),
+        Easing::Bezier => bezier(points.unwrap_or([0., 0., 1., 1.]), t),
+        Easing::Spring => {
+            let at = t * (SPRING.len() - 1) as f32;
+            let i = (at as usize).min(SPRING.len() - 2);
+            SPRING[i] + (SPRING[i + 1] - SPRING[i]) * (at - i as f32)
+        }
     }
 }
 
@@ -121,11 +127,26 @@ impl From<Property> for Channel {
     }
 }
 
+/// Keyframe animations of a node: the list they run, and when that list started.
+struct Loop {
+    animations: Vec<tree::Animation>,
+    start: f64,
+}
+
+/// What a node's keyframe animations show now, and whether any of them is still running.
+#[derive(Default)]
+pub struct Keyed {
+    /// Values that override the base values of their properties.
+    pub values: Vec<(Property, Value)>,
+    pub running: bool,
+}
+
 /// What each animated channel shows, per node. Times are milliseconds on any monotonic clock.
 #[derive(Default)]
 pub struct Motion {
     targets: HashMap<(u16, Channel), Value>,
     running: HashMap<(u16, Channel), Animation>,
+    loops: HashMap<u16, Loop>,
 }
 impl Motion {
     /// Sets the value a channel should reach and returns what to show now. With a transition and a
@@ -211,11 +232,94 @@ impl Motion {
     pub fn animating(&self, now: f64) -> bool {
         self.running.values().any(|a| a.at(now).is_some())
     }
+    /// Runs a node's keyframe animations at `now`. A list that differs from the last one restarts them. With
+    /// `reduced` (reduced motion), infinite animations do not run.
+    pub fn keyframes(
+        &mut self,
+        id: u16,
+        animations: &[tree::Animation],
+        reduced: bool,
+        now: f64,
+    ) -> Keyed {
+        if animations.is_empty() {
+            self.loops.remove(&id);
+            return Keyed::default();
+        }
+        let start = match self.loops.get(&id) {
+            Some(known) if known.animations == animations => known.start,
+            _ => {
+                self.loops.insert(
+                    id,
+                    Loop {
+                        animations: animations.to_vec(),
+                        start: now,
+                    },
+                );
+                now
+            }
+        };
+        let mut keyed = Keyed::default();
+        for animation in animations {
+            if reduced && animation.iterations.is_none() {
+                continue;
+            }
+            // Time since the animation's own start, which is after its delay.
+            let since = (now - start) as f32 - animation.delay;
+            let total = animation
+                .iterations
+                .map_or(f32::INFINITY, |n| n * animation.duration);
+            keyed.running |= since < total;
+            if since >= 0.
+                && let Some(value) = sample(animation, since)
+            {
+                keyed.values.push((animation.property, value));
+            }
+        }
+        keyed
+    }
     /// Drops everything about removed nodes, so a reused id starts fresh.
     pub fn forget(&mut self, ids: &[u16]) {
         self.targets.retain(|(id, _), _| !ids.contains(id));
         self.running.retain(|(id, _), _| !ids.contains(id));
+        self.loops.retain(|id, _| !ids.contains(id));
     }
+}
+
+/// The value of a keyframe animation `since` ms after its own start, or None once its iterations are over.
+fn sample(animation: &tree::Animation, since: f32) -> Option<Value> {
+    let turns = since / animation.duration;
+    if animation.iterations.is_some_and(|n| turns >= n) {
+        return None;
+    }
+    let iteration = turns.floor();
+    let mut t = turns - iteration;
+    if animation.alternate && iteration % 2. == 1. {
+        t = 1. - t;
+    }
+    let property = animation.property;
+    let value = |k: &Keyframe| {
+        if property.is_color() {
+            Value::color(k.color.unwrap_or(0))
+        } else {
+            Value::Number(k.value.unwrap_or(0.))
+        }
+    };
+    let frames = &animation.keyframes;
+    // The last keyframe at or before `t` starts the segment that `t` is in.
+    let Some(i) = frames.iter().rposition(|k| k.offset <= t) else {
+        return Some(value(&frames[0]));
+    };
+    Some(match frames.get(i + 1) {
+        None => value(&frames[i]),
+        Some(next) => {
+            let from = &frames[i];
+            let local = (t - from.offset) / (next.offset - from.offset);
+            value(from).mix(
+                value(next),
+                timing(animation.easing, animation.bezier, local),
+            )
+        }
+    })
 }
 
 #[cfg(test)]
@@ -247,6 +351,101 @@ mod tests {
         held.hold = 0.25;
         assert_eq!(ease(&held, 0.05), 0.);
         assert_eq!(ease(&held, 1.), 1.);
+    }
+
+    fn keyframe(offset: f32, value: f32) -> Keyframe {
+        Keyframe {
+            offset,
+            value: Some(value),
+            color: None,
+        }
+    }
+
+    #[test]
+    fn an_infinite_loop_eases_through_its_keyframes() {
+        let pulse = tree::Animation {
+            property: Property::Opacity,
+            keyframes: vec![keyframe(0., 1.), keyframe(0.5, 0.5), keyframe(1., 1.)],
+            duration: 3000.,
+            easing: Easing::EaseInOut,
+            ..Default::default()
+        };
+        let mut motion = Motion::default();
+        let mut at = |now: f64| {
+            motion
+                .keyframes(1, std::slice::from_ref(&pulse), false, now)
+                .values[0]
+                .1
+                .number()
+        };
+        let shown = [0., 750., 1500., 3000., 4500.].map(&mut at);
+        for (got, want) in shown.iter().zip([1., 0.75, 0.5, 1., 0.5]) {
+            assert!((got - want).abs() < 1e-4, "{shown:?}");
+        }
+        // A changed list restarts the loop at the time of the change.
+        let slower = tree::Animation {
+            duration: 6000.,
+            ..pulse
+        };
+        let restarted = motion.keyframes(1, &[slower], false, 4500.);
+        assert_eq!(restarted.values[0].1.number(), 1.);
+        assert!(restarted.running);
+    }
+
+    #[test]
+    fn alternate_plays_every_other_iteration_backwards() {
+        let breathe = tree::Animation {
+            property: Property::Opacity,
+            keyframes: vec![keyframe(0., 0.7), keyframe(1., 1.)],
+            duration: 5000.,
+            easing: Easing::EaseInOut,
+            alternate: true,
+            ..Default::default()
+        };
+        let mut motion = Motion::default();
+        let mut at = |now: f64| {
+            motion
+                .keyframes(1, std::slice::from_ref(&breathe), false, now)
+                .values[0]
+                .1
+                .number()
+        };
+        assert_eq!(at(0.), 0.7);
+        assert!((at(5000.) - 1.).abs() < 1e-4);
+        assert!((at(7500.) - 0.85).abs() < 1e-4);
+        assert!((at(10000.) - 0.7).abs() < 1e-4);
+    }
+
+    #[test]
+    fn colors_interpolate_straight_rgba_including_alpha() {
+        let color = |offset, color| tree::Keyframe {
+            offset,
+            value: None,
+            color: Some(color),
+        };
+        let pulse = tree::Animation {
+            property: Property::Background,
+            keyframes: vec![
+                color(0., 0x9696a00f),
+                color(0.5, 0x9696a01f),
+                color(1., 0x9696a00f),
+            ],
+            duration: 1600.,
+            easing: Easing::EaseInOut,
+            ..Default::default()
+        };
+        let mut motion = Motion::default();
+        let mut at = |now: f64| {
+            motion
+                .keyframes(1, std::slice::from_ref(&pulse), false, now)
+                .values[0]
+                .1
+                .rgba()
+        };
+        assert_eq!(at(0.), [150., 150., 160., 15.]);
+        // Halfway through the first segment the alpha is halfway between 15 and 31; the RGB never changes.
+        assert_eq!(at(400.), [150., 150., 160., 23.]);
+        assert_eq!(at(800.), [150., 150., 160., 31.]);
     }
 
     #[test]

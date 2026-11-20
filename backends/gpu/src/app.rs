@@ -365,6 +365,7 @@ impl ApplicationHandler for AppWindow {
                 Message::RemoveImage(source) => self.host.remove_image(&source),
                 Message::Font(bytes) => self.host.add_font(bytes),
                 Message::DefaultFamily(family) => self.host.set_default_family(family),
+                Message::ReducedMotion(on) => self.host.set_reduced_motion(on),
             }
         }
         self.request_redraw();
@@ -443,6 +444,7 @@ enum Message {
     RemoveImage(String),
     Font(Vec<u8>),
     DefaultFamily(String),
+    ReducedMotion(bool),
 }
 type ScaleCallback = Box<dyn Fn(f32) + Send>;
 /// The window's scale factor and its `on_scale` callback, shared between the window and its `Pusher`s.
@@ -503,6 +505,12 @@ impl Pusher {
         self.send(Message::Font(bytes))
     }
     /// Sets the family of text without one (`Host::set_default_family`).
+    /// Turns reduced motion on or off: infinite keyframe animations do not run and their nodes show their base values.
+    // shortcut: the window does not read the OS reduced-motion preference, so the program passes it here; query the
+    // preference in the window on each platform once that is needed.
+    pub fn reduced_motion(&self, on: bool) -> bool {
+        self.send(Message::ReducedMotion(on))
+    }
     pub fn default_family(&self, family: String) -> bool {
         self.send(Message::DefaultFamily(family))
     }

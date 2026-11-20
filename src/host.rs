@@ -151,7 +151,7 @@ pub enum Cursor {
 
 pub struct Frame {
     pub items: Vec<Item>,
-    /// Keep drawing: a transition is running.
+    /// Keep drawing: a transition, or a keyframe animation on screen, is running.
     pub animating: bool,
     /// Caret of the focused field, for the platform's input method window.
     pub ime_area: Option<Rect>,
@@ -240,6 +240,8 @@ pub struct Host {
     font_epoch: u64,
     /// Hides the caret, for reproducible captures.
     pub hide_caret: bool,
+    // Reduced motion: infinite keyframe animations do not run, and their nodes show their base values.
+    reduced_motion: bool,
 }
 
 const HEIGHT_TRANSITION: Property = Property::Height;
@@ -324,6 +326,7 @@ impl Host {
             image_generation: 0,
             font_epoch: 0,
             hide_caret: false,
+            reduced_motion: false,
         };
         host.receive(mount);
         if host.tree.root.is_none() {
@@ -359,6 +362,11 @@ impl Host {
             callback: HOST_CALLBACK,
             text,
         });
+    }
+
+    /// Turns reduced motion on or off. While it is on, infinite keyframe animations do not run.
+    pub fn set_reduced_motion(&mut self, reduced: bool) {
+        self.reduced_motion = reduced;
     }
 
     /// Sets the pixels that a `Node::Image` with this `source` draws. `rgba` is straight RGBA8, `size` in pixels.
@@ -977,6 +985,7 @@ impl Host {
         let mut dismissers = std::mem::take(&mut self.dismiss_rects);
         dismissers.clear();
         let mut ime_area = None;
+        let mut looping = false;
         self.screen.clear();
         self.screen.resize(self.tree.nodes.end(), None);
         if let Some(root) = self.tree.root {
@@ -1003,9 +1012,11 @@ impl Host {
                 layer_root: None,
                 deferred: Vec::new(),
                 queued: 0,
+                looping: false,
             };
             walker.node(self, root, base, scale, max_side);
             walker.draw_deferred(self, scale, max_side);
+            looping = walker.looping;
         }
         self.hits = hits;
         self.scrolls = scrolls;
@@ -1014,7 +1025,7 @@ impl Host {
         self.dismiss_rects = dismissers;
         Frame {
             items,
-            animating: self.motion.animating(now),
+            animating: self.motion.animating(now) || looping,
             ime_area,
         }
     }
@@ -1158,7 +1169,8 @@ impl Host {
     // Taffy layout with animated heights: a node with a `height` transition animates from its height on
     // screen to its new natural height, and pinning that height each frame moves what follows it.
     fn lay_out(&mut self, width: f32, height: f32, now: f64) {
-        // Nodes with a height transition or a height in a variant: their heights are pinned while they change.
+        // Nodes with a height transition, a height in a variant or a height keyframe: their heights are pinned while
+        // they change.
         let sized: Vec<(u16, Option<Transition>)> = self
             .tree
             .nodes
@@ -1170,7 +1182,12 @@ impl Host {
                     .into_iter()
                     .flatten()
                     .any(|v| v.height.is_some());
-                (transition.is_some() || variant).then_some((id, transition))
+                let keyed = paint
+                    .animations
+                    .iter()
+                    .flatten()
+                    .any(|a| a.property == Property::Height);
+                (transition.is_some() || variant || keyed).then_some((id, transition))
             })
             .collect();
         let mut changed = if sized.is_empty() {
@@ -1192,7 +1209,7 @@ impl Host {
                 let id = *id;
                 let rest = natural_height(id);
                 let target = self.height_variant(id).unwrap_or(rest);
-                let shown = self
+                let mut shown = self
                     .motion
                     .show(
                         id,
@@ -1202,6 +1219,19 @@ impl Host {
                         now,
                     )
                     .number();
+                let animations = self
+                    .tree
+                    .nodes
+                    .get(&id)
+                    .and_then(Node::paint)
+                    .and_then(|p| p.animations.as_deref());
+                let keyed =
+                    self.motion
+                        .keyframes(id, animations.unwrap_or(&[]), self.reduced_motion, now);
+                if let Some((_, height)) = keyed.values.iter().find(|(p, _)| *p == Property::Height)
+                {
+                    shown = height.number();
+                }
                 if (shown - rest).abs() > 0.01 {
                     pins.insert(id, shown);
                 }
@@ -1380,6 +1410,8 @@ struct Walker<'a> {
     // Layered nodes waiting for their turn, and how many were ever queued: their order within a layer.
     deferred: Vec<Deferred>,
     queued: usize,
+    // Set when a drawn node runs a keyframe animation: the window keeps drawing.
+    looping: bool,
 }
 
 // A node drawn after the layers below it. A fixed node is placed when it is drawn; any other keeps the context of
@@ -1405,6 +1437,7 @@ struct Shown {
     draw: f32,
     left: f32,
     width: f32,
+    looping: bool,
 }
 
 impl Walker<'_> {
@@ -1425,6 +1458,7 @@ impl Walker<'_> {
         let (x, y) = (v.x.unwrap_or(paint.x), v.y.unwrap_or(paint.y));
         let text_color = v.color.or(paint.color);
         let now = self.now;
+        let reduced = host.reduced_motion;
         let motion = &mut host.motion;
         // First time on screen: properties with a starting value animate from it.
         if motion.target(id, Property::Opacity).is_none()
@@ -1450,8 +1484,17 @@ impl Walker<'_> {
                 }
             }
         }
+        // Keyframe values override the base values while their animations run.
+        let keyed = motion.keyframes(id, paint.animations.as_deref().unwrap_or(&[]), reduced, now);
+        let overridden = |property: Property| {
+            keyed
+                .values
+                .iter()
+                .find(|(p, _)| *p == property)
+                .map(|(_, v)| *v)
+        };
         let mut number = |property, value: f32| {
-            motion
+            let shown = motion
                 .show(
                     id,
                     property,
@@ -1459,7 +1502,8 @@ impl Walker<'_> {
                     transition(paint, property),
                     now,
                 )
-                .number()
+                .number();
+            overridden(property).map_or(shown, Value::number)
         };
         let opacity = number(Property::Opacity, opacity);
         let x = number(Property::X, x);
@@ -1475,9 +1519,19 @@ impl Walker<'_> {
             let shown = motion
                 .show(id, property, target, transition(paint, property), now)
                 .rgba();
-            (value.is_some() || shown[3] > 0.).then_some(shown)
+            match overridden(property) {
+                Some(v) => Some(v.rgba()),
+                None => (value.is_some() || shown[3] > 0.).then_some(shown),
+            }
         };
+        // A fade keeps running while the node is at 0, so the window keeps drawing until the fade moves on.
+        let fades = paint
+            .animations
+            .iter()
+            .flatten()
+            .any(|a| a.property == Property::Opacity);
         Shown {
+            looping: keyed.running && (fades || opacity > 0.001),
             opacity,
             x,
             y,
@@ -1582,6 +1636,11 @@ impl Walker<'_> {
         let screen = inner.rect(rect);
         host.screen[id as usize] = Some(screen);
         let empty = (screen[2] <= 0. || screen[3] <= 0.) && host.tree.children(id).is_empty();
+        // A walked node has visible ancestors, so a loop that is on screen keeps the window drawing.
+        let on_screen = intersect(screen, ctx.clip);
+        if shown.looping && on_screen[2] > 0. && on_screen[3] > 0. {
+            self.looping = true;
+        }
         if shown.opacity <= 0.001 || empty {
             return;
         }
@@ -3379,5 +3438,103 @@ mod tests {
         // CSS: the row's automatic minimum is its content, 50 rows of 30 px, so the footer is pushed below the window.
         assert!((footer[1] - 1500.).abs() < 0.01, "{footer:?}");
         assert!((column[3] - 1500.).abs() < 0.01, "{column:?}");
+    }
+
+    // A host whose app mounts a root column (id 1); tests add nodes with batches.
+    fn column_host(reduced_motion: bool) -> Host {
+        let mut host = Host::new(
+            "function jsnirMount() { jsnir.batch(JSON.stringify({ ops: [{ op: 'create', id: 1, node: { kind: 'column' } }] })); }".into(),
+            "{}".into(),
+            TextEngine::default(),
+        );
+        host.set_reduced_motion(reduced_motion);
+        host
+    }
+    fn add(host: &mut Host, ops: &str) {
+        let base = host.tree.app_seq;
+        let ops = serde_json::from_str(ops).unwrap();
+        host.receive(Batch { base, ops });
+    }
+    fn render_at(host: &mut Host, now: f64) -> Frame {
+        host.render(640., 560., 1., 4096, now)
+    }
+    fn layers(frame: &Frame) -> Vec<f32> {
+        frame
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::PushLayer { opacity } => Some(*opacity),
+                _ => None,
+            })
+            .collect()
+    }
+    // A 100 × 20 box that pulses its opacity between 1 and 0.5 every 3 s, as the skeletons do.
+    const PULSE: &str = r#"{"kind":"box","style":{"width":100,"height":20},"paint":{"animations":[{"property":"opacity","keyframes":[{"offset":0,"value":1},{"offset":0.5,"value":0.5},{"offset":1,"value":1}],"duration":3000,"easing":"easeInOut"}]}}"#;
+
+    #[test]
+    fn a_loop_keeps_the_window_drawing_only_while_it_is_visible() {
+        let mut shown = column_host(false);
+        add(
+            &mut shown,
+            &format!(r#"[{{"op":"create","id":2,"parent":1,"node":{PULSE}}}]"#),
+        );
+        assert!(render_at(&mut shown, 0.).animating);
+
+        // Under an opacity-0 ancestor the loop is not walked, so nothing asks for frames.
+        let mut hidden = column_host(false);
+        add(
+            &mut hidden,
+            &format!(
+                r#"[{{"op":"create","id":2,"parent":1,"node":{{"kind":"box","paint":{{"opacity":0}}}}}},
+                    {{"op":"create","id":3,"parent":2,"node":{PULSE}}}]"#
+            ),
+        );
+        assert!(!render_at(&mut hidden, 0.).animating);
+
+        // A removed node is not walked either.
+        add(&mut shown, r#"[{"op":"remove","id":2}]"#);
+        assert!(!render_at(&mut shown, 0.).animating);
+    }
+
+    #[test]
+    fn reduced_motion_shows_the_base_value_and_stops_the_loop() {
+        let mut calm = column_host(true);
+        add(
+            &mut calm,
+            &format!(r#"[{{"op":"create","id":2,"parent":1,"node":{PULSE}}}]"#),
+        );
+        render_at(&mut calm, 0.);
+        // Halfway through the pulse the base opacity is 1: no layer, and nothing keeps drawing.
+        let frame = render_at(&mut calm, 750.);
+        assert!(layers(&frame).is_empty());
+        assert!(!frame.animating);
+
+        let mut moving = column_host(false);
+        add(
+            &mut moving,
+            &format!(r#"[{{"op":"create","id":2,"parent":1,"node":{PULSE}}}]"#),
+        );
+        render_at(&mut moving, 0.);
+        let frame = render_at(&mut moving, 750.);
+        assert!((layers(&frame)[0] - 0.75).abs() < 1e-3);
+        assert!(frame.animating);
+    }
+
+    #[test]
+    fn a_finite_animation_ends_on_the_base_value() {
+        let mut host = column_host(false);
+        add(
+            &mut host,
+            r#"[{"op":"create","id":2,"parent":1,"node":{"kind":"box","style":{"width":100,"height":20},
+                "paint":{"animations":[{"property":"opacity","keyframes":[{"offset":0,"value":0.5},{"offset":1,"value":1}],
+                "duration":1000,"easing":"linear","iterations":1}]}}}]"#,
+        );
+        render_at(&mut host, 0.);
+        let frame = render_at(&mut host, 500.);
+        assert!((layers(&frame)[0] - 0.75).abs() < 1e-3);
+        assert!(frame.animating);
+        let frame = render_at(&mut host, 1000.);
+        assert!(layers(&frame).is_empty(), "the base opacity 1 is back");
+        assert!(!frame.animating);
     }
 }
