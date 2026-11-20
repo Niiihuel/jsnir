@@ -284,19 +284,10 @@ impl View {
                     clip,
                     round_clip,
                 } => {
-                    for span in &frame.selection {
+                    for [x, y, w, h] in &frame.selection {
                         draws.push(
-                            Draw::fill(
-                                [
-                                    rect[0] + span.start,
-                                    rect[1],
-                                    span.end - span.start,
-                                    rect[3],
-                                ],
-                                clip,
-                                selection,
-                            )
-                            .rounded_clip(round_clip),
+                            Draw::fill([rect[0] + x, rect[1] + y, *w, *h], clip, selection)
+                                .rounded_clip(round_clip),
                         );
                     }
                     let key = frame.bitmap_key;
@@ -313,19 +304,10 @@ impl View {
                                 .rounded_clip(round_clip),
                         );
                     }
-                    for span in &frame.composition {
+                    for [x, y, w, h] in &frame.composition {
                         draws.push(
-                            Draw::fill(
-                                [
-                                    rect[0] + span.start,
-                                    rect[1] + rect[3] - 1.,
-                                    span.end - span.start,
-                                    1.,
-                                ],
-                                clip,
-                                caret_color,
-                            )
-                            .rounded_clip(round_clip),
+                            Draw::fill([rect[0] + x, rect[1] + y, *w, *h], clip, caret_color)
+                                .rounded_clip(round_clip),
                         );
                     }
                     if let Some(caret) = caret {

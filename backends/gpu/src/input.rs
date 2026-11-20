@@ -49,6 +49,12 @@ pub fn editor_key(key: &KeyEvent, mods: ModifiersState) -> Option<KeyInput> {
                 NamedKey::ArrowRight if word => Some(Direction::WordRight),
                 NamedKey::ArrowLeft => Some(Direction::Left),
                 NamedKey::ArrowRight => Some(Direction::Right),
+                NamedKey::ArrowUp => Some(Direction::Up),
+                NamedKey::ArrowDown => Some(Direction::Down),
+                NamedKey::PageUp => Some(Direction::PageUp),
+                NamedKey::PageDown => Some(Direction::PageDown),
+                NamedKey::Home if command => Some(Direction::TextStart),
+                NamedKey::End if command => Some(Direction::TextEnd),
                 NamedKey::Home => Some(Direction::Start),
                 NamedKey::End => Some(Direction::End),
                 _ => None,
@@ -65,6 +71,9 @@ pub fn editor_key(key: &KeyEvent, mods: ModifiersState) -> Option<KeyInput> {
                     word,
                 }),
                 NamedKey::Enter if !key.repeat && mods.is_empty() => edit(EditorEvent::Enter),
+                NamedKey::Enter if !key.repeat && mods.shift_key() && !command => {
+                    edit(EditorEvent::LineBreak)
+                }
                 NamedKey::Escape => edit(EditorEvent::Cancel),
                 NamedKey::Space => text(),
                 _ => None,

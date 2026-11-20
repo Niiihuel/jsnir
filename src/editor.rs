@@ -1,5 +1,6 @@
-//! Single-line editor shared by the backends. Internal indices are UTF-8 byte offsets.
-use crate::text::{TextBitmap, TextEngine, TextStyle, attrs, metrics};
+//! Line editor shared by the backends: one line, or several lines wrapped at the field's width. Internal indices
+//! are UTF-8 byte offsets; in a text with several lines each line break counts as one byte, `\n`.
+use crate::text::{TextBitmap, TextEngine, TextStyle, WRAP_SLACK, attrs, metrics};
 use cosmic_text::{
     Action, Affinity, AttrsList, Buffer, BufferLine, BufferRef, Change, Cursor, Edit, Editor,
     FontSystem, LayoutGlyph, LayoutRun, LineEnding, Motion, Selection, Shaping,
@@ -18,8 +19,10 @@ pub enum EditorEvent {
         backward: bool,
         word: bool,
     },
+    /// A press or drag at `x` and `y`, where `y` is counted from the top of the text (its scroll included).
     Point {
         x: f32,
+        y: f32,
         select: PointSelection,
     },
     SelectAll,
@@ -37,7 +40,10 @@ pub enum EditorEvent {
         after: usize,
     },
     Cancel,
+    /// Enter: the host submits a field with it, or breaks the line of a multi-line field that does not submit.
     Enter,
+    /// Shift+Enter: breaks the line of a multi-line field. Nothing in a single-line one.
+    LineBreak,
 }
 
 impl EditorEvent {
@@ -55,8 +61,17 @@ pub enum Direction {
     Right,
     WordLeft,
     WordRight,
+    /// The start and the end of the visual line (Home and End).
     Start,
     End,
+    /// The start and the end of the text (Ctrl+Home and Ctrl+End).
+    TextStart,
+    TextEnd,
+    Up,
+    Down,
+    /// Up or down by the height of the field.
+    PageUp,
+    PageDown,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -80,6 +95,7 @@ pub struct EditorBitmapKey {
     scale: f32,
     max_side: usize,
     scroll_x: f32,
+    scroll_y: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -87,10 +103,18 @@ pub struct EditorFrame {
     pub bitmap_key: EditorBitmapKey,
     pub bitmap: Option<TextBitmap>,
     pub caret_x: f32,
+    /// Top of the caret's line, below the scroll.
+    pub caret_y: f32,
     pub caret_visible: bool,
     pub line_height: f32,
-    pub selection: Vec<Range<f32>>,
-    pub composition: Vec<Range<f32>>,
+    /// Selected rectangles `[x, y, width, height]`, below the scroll.
+    pub selection: Vec<[f32; 4]>,
+    /// Preedit underlines `[x, y, width, 1]`, below the scroll.
+    pub composition: Vec<[f32; 4]>,
+    /// The vertical scroll the frame shows: the one asked for, kept within the text and with the caret in view.
+    pub scroll_y: f32,
+    /// Height of the whole text laid out at the field's width.
+    pub content_height: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -114,11 +138,18 @@ pub struct LineEditor {
     inner: Editor<'static>,
     // Style the text is shaped in: the field's font.
     style: TextStyle,
+    multiline: bool,
+    // Height of the visible text, which Page Up and Page Down move by.
+    page: f32,
+    // Set by each event: the next frame keeps the caret in view.
+    follow: bool,
     preedit: Option<Preedit>,
     preview: Option<Buffer>,
     undo: Vec<EditRecord>,
     redo: Vec<EditRecord>,
     scroll_x: f32,
+    // Vertical scroll of a multi-line field, as the field asks for it: the next frame may move it to keep the caret in view.
+    scroll_y: f32,
     revision: u64,
 }
 
@@ -127,11 +158,15 @@ impl Default for LineEditor {
         Self {
             inner: empty_editor("", &TextStyle::default()),
             style: TextStyle::default(),
+            multiline: false,
+            page: 0.,
+            follow: false,
             preedit: None,
             preview: None,
             undo: Vec::new(),
             redo: Vec::new(),
             scroll_x: 0.,
+            scroll_y: 0.,
             revision: 0,
         }
     }
@@ -172,8 +207,32 @@ impl LineEditor {
         self.fonts_changed();
     }
 
-    pub fn text(&self) -> &str {
-        self.buffer().lines[0].text()
+    /// Wraps the text at `width`, or leaves it on one line (None). The field sets it before it handles events, so
+    /// motions see the lines the field shows.
+    pub fn set_width(&mut self, engine: &mut TextEngine, width: Option<f32>) {
+        self.set_wrap(engine.fonts(), width);
+    }
+
+    // Wraps the text at `width`, or leaves it on one line when None. A change lays the text out again.
+    fn set_wrap(&mut self, fonts: &mut FontSystem, width: Option<f32>) {
+        if self.buffer().size().0 != width {
+            self.buffer_mut().set_size(fonts, width, None);
+            self.invalidate();
+        }
+    }
+
+    /// The text, its lines joined by `\n`.
+    pub fn text(&self) -> Cow<'_, str> {
+        match self.buffer().lines.as_slice() {
+            [line] => Cow::Borrowed(line.text()),
+            lines => Cow::Owned(
+                lines
+                    .iter()
+                    .map(|line| line.text())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+        }
     }
 
     pub fn selection(&self) -> [u32; 2] {
@@ -183,17 +242,20 @@ impl LineEditor {
         [start as u32, (start + text[range].chars().count()) as u32]
     }
 
-    pub fn reset(&mut self, text: &str, [anchor, head]: [u32; 2]) {
-        let text = single_line(text);
+    /// Replaces the text and selects `[anchor, head]` (in characters). A multi-line field keeps the line breaks.
+    pub fn reset(&mut self, text: &str, [anchor, head]: [u32; 2], multiline: bool) {
+        self.multiline = multiline;
+        let text = clean(text, multiline);
         self.inner = empty_editor(&text, &self.style);
-        let anchor = Cursor::new(0, byte_at(&text, anchor as usize));
-        let head = Cursor::new(0, byte_at(&text, head as usize));
+        let anchor = cursor_at(self.buffer(), byte_at(&text, anchor as usize));
+        let head = cursor_at(self.buffer(), byte_at(&text, head as usize));
         self.inner.set_cursor(head);
         if anchor != head {
             self.inner.set_selection(Selection::Normal(anchor));
         }
         self.preedit = None;
         self.scroll_x = 0.;
+        self.follow = true;
         self.undo.clear();
         self.redo.clear();
         self.invalidate();
@@ -204,12 +266,13 @@ impl LineEditor {
     }
 
     fn selected_bytes(&self) -> Range<usize> {
+        let buffer = self.buffer();
         self.inner.selection_bounds().map_or_else(
             || {
-                let i = self.inner.cursor().index;
+                let i = offset_of(buffer, self.inner.cursor());
                 i..i
             },
-            |(a, b)| a.index..b.index,
+            |(a, b)| offset_of(buffer, a)..offset_of(buffer, b),
         )
     }
 
@@ -273,27 +336,47 @@ impl LineEditor {
     }
 
     fn insert(&mut self, text: &str) {
-        let text = single_line(text);
+        let text = clean(text, self.multiline);
         if !text.is_empty() {
             self.change(|editor| {
                 editor.insert_string(&text, None);
                 let cursor = editor.cursor();
                 let index = editor.with_buffer(|buffer| {
-                    grapheme_edge(buffer.lines[0].text(), cursor.index, true)
+                    grapheme_edge(buffer.lines[cursor.line].text(), cursor.index, true)
                 });
-                editor.set_cursor(Cursor::new_with_affinity(0, index, Affinity::Before));
+                editor.set_cursor(Cursor::new_with_affinity(
+                    cursor.line,
+                    index,
+                    Affinity::Before,
+                ));
             });
         }
     }
 
     fn move_cursor(&mut self, engine: &mut TextEngine, direction: Direction, extend: bool) {
+        // A single-line field has no other line to move to.
+        if !self.multiline
+            && matches!(
+                direction,
+                Direction::Up | Direction::Down | Direction::PageUp | Direction::PageDown
+            )
+        {
+            return;
+        }
+        let page = self.page as i32;
         let motion = match direction {
             Direction::Left => Motion::Left,
             Direction::Right => Motion::Right,
             Direction::WordLeft => Motion::LeftWord,
             Direction::WordRight => Motion::RightWord,
-            Direction::Start => Motion::ParagraphStart,
-            Direction::End => Motion::ParagraphEnd,
+            Direction::Start => Motion::Home,
+            Direction::End => Motion::End,
+            Direction::TextStart => Motion::BufferStart,
+            Direction::TextEnd => Motion::BufferEnd,
+            Direction::Up => Motion::Up,
+            Direction::Down => Motion::Down,
+            Direction::PageUp => Motion::Vertical(-page),
+            Direction::PageDown => Motion::Vertical(page),
         };
 
         if extend && self.inner.selection() == Selection::None {
@@ -301,14 +384,19 @@ impl LineEditor {
                 .set_selection(Selection::Normal(self.inner.cursor()));
         }
         if !extend {
-            let range = self.selected_bytes();
+            let bounds = self.inner.selection_bounds();
             self.inner.set_selection(Selection::None);
-            if !range.is_empty() && matches!(direction, Direction::Left | Direction::Right) {
+            if let Some((a, b)) = bounds
+                .filter(|(a, b)| a != b && matches!(direction, Direction::Left | Direction::Right))
+            {
                 self.inner.shape_as_needed(engine.fonts(), false);
-                let start = Cursor::new_with_affinity(0, range.start, Affinity::After);
-                let end = Cursor::new_with_affinity(0, range.end, Affinity::Before);
+                let start = Cursor::new_with_affinity(a.line, a.index, Affinity::After);
+                let end = Cursor::new_with_affinity(b.line, b.index, Affinity::Before);
                 let toward_left = matches!(direction, Direction::Left);
-                let start_on_left = caret_x(self.buffer(), start) <= caret_x(self.buffer(), end);
+                let (start_at, end_at) =
+                    (caret_at(self.buffer(), start), caret_at(self.buffer(), end));
+                let start_on_left =
+                    start_at.1 < end_at.1 || (start_at.1 == end_at.1 && start_at.0 <= end_at.0);
                 self.inner.set_cursor(if toward_left == start_on_left {
                     start
                 } else {
@@ -319,16 +407,19 @@ impl LineEditor {
         }
         if matches!(direction, Direction::Left | Direction::Right) {
             self.inner.shape_as_needed(engine.fonts(), false);
-            if let Some(run) = self.buffer().layout_runs().next()
+            let cursor = self.inner.cursor();
+            if let Some(run) = self
+                .buffer()
+                .layout_runs()
+                .find(|run| run.line_i == cursor.line && caret_in_run(run, cursor).is_some())
                 && run
                     .glyphs
                     .iter()
                     .any(|glyph| glyph.level.is_rtl() != run.rtl)
             {
                 let left = matches!(direction, Direction::Left);
-                if let Some(cursor) =
-                    visual_neighbor(&run, caret_x(self.buffer(), self.inner.cursor()), left)
-                {
+                let x = caret_at(self.buffer(), cursor).0;
+                if let Some(cursor) = visual_neighbor(&run, x, left) {
                     self.inner.set_cursor(cursor);
                 }
                 return;
@@ -344,7 +435,7 @@ impl LineEditor {
             });
             return;
         }
-        let index = self.inner.cursor().index;
+        let index = offset_of(self.buffer(), self.inner.cursor());
         let text = self.text();
         let boundary = match (backward, word) {
             (true, true) => text
@@ -368,8 +459,8 @@ impl LineEditor {
                 .find(|&end| end > index)
                 .unwrap_or(text.len()),
         };
-        let start = grapheme_edge(text, index.min(boundary), false);
-        let end = grapheme_edge(text, index.max(boundary), true);
+        let start = grapheme_edge(&text, index.min(boundary), false);
+        let end = grapheme_edge(&text, index.max(boundary), true);
         self.replace_with_empty(start..end);
     }
 
@@ -377,9 +468,10 @@ impl LineEditor {
         if bytes.is_empty() {
             return;
         }
+        let buffer = self.buffer();
+        let (start, end) = (cursor_at(buffer, bytes.start), cursor_at(buffer, bytes.end));
         self.change(|editor| {
-            let start = Cursor::new(0, bytes.start);
-            editor.delete_range(start, Cursor::new(0, bytes.end));
+            editor.delete_range(start, end);
             editor.set_cursor(start);
             editor.set_selection(Selection::None);
         });
@@ -402,24 +494,33 @@ impl LineEditor {
         }
 
         let caret = self.caret();
+        let buffer = self.buffer();
         let backwards = match caret.selection {
             Selection::Normal(anchor) | Selection::Line(anchor) | Selection::Word(anchor) => {
-                caret.cursor.index < anchor.index
+                offset_of(buffer, caret.cursor) < offset_of(buffer, anchor)
             }
             Selection::None => false,
         };
-        let mut head = Cursor::new(0, selected.end - removed_before);
-        let mut anchor = Cursor::new(0, start);
+        // Offsets after the deletion: the head is where the selection's end was, less what was cut before it.
+        let (mut head, mut anchor) = (selected.end - removed_before, start);
         if backwards {
             std::mem::swap(&mut head, &mut anchor);
         }
+        let cut = (
+            cursor_at(buffer, selected.end),
+            cursor_at(buffer, end),
+            cursor_at(buffer, start),
+            cursor_at(buffer, selected.start),
+        );
         self.change(|editor| {
             if selected.end < end {
-                editor.delete_range(Cursor::new(0, selected.end), Cursor::new(0, end));
+                editor.delete_range(cut.0, cut.1);
             }
             if start < selected.start {
-                editor.delete_range(Cursor::new(0, start), Cursor::new(0, selected.start));
+                editor.delete_range(cut.2, cut.3);
             }
+            let (head, anchor) =
+                editor.with_buffer(|buffer| (cursor_at(buffer, head), cursor_at(buffer, anchor)));
             editor.set_cursor(head);
             editor.set_selection(if head == anchor {
                 Selection::None
@@ -431,9 +532,10 @@ impl LineEditor {
 
     pub fn handle(&mut self, engine: &mut TextEngine, event: &EditorEvent) -> EditorOutput {
         let mut output = EditorOutput::default();
+        self.follow = true;
         match event {
             EditorEvent::Preedit { text, active } => {
-                let text = single_line(text);
+                let text = clean(text, self.multiline);
                 self.preedit = (!text.is_empty()).then(|| Preedit {
                     text: text.into_owned(),
                     active: active.clone(),
@@ -454,12 +556,18 @@ impl LineEditor {
                     self.invalidate();
                     output.interrupt_ime = true;
                 }
-                if let EditorEvent::Point { x, select } = *event {
+                if let EditorEvent::Point { x, y, select } = *event {
                     self.inner.shape_as_needed(engine.fonts(), false);
                     let x = x + self.scroll_x;
-                    if let Some(mut cursor) = self.buffer().hit(x, self.style.line_height / 2.) {
+                    // A single-line field takes the middle of its line, whatever the height of the press.
+                    let y = if self.multiline {
+                        y
+                    } else {
+                        self.style.line_height / 2.
+                    };
+                    if let Some(mut cursor) = self.buffer().hit(x, y) {
                         cursor.index = grapheme_edge(
-                            self.text(),
+                            self.buffer().lines[cursor.line].text(),
                             cursor.index,
                             cursor.affinity == Affinity::Before,
                         );
@@ -488,7 +596,9 @@ impl LineEditor {
             EditorEvent::SelectAll => {
                 self.inner
                     .set_selection(Selection::Normal(Cursor::new(0, 0)));
-                self.inner.set_cursor(Cursor::new(0, self.text().len()));
+                let last = self.buffer().lines.len() - 1;
+                let end = Cursor::new(last, self.buffer().lines[last].text().len());
+                self.inner.set_cursor(end);
             }
             EditorEvent::Copy | EditorEvent::Cut => {
                 let range = self.selected_bytes();
@@ -501,11 +611,22 @@ impl LineEditor {
             }
             EditorEvent::Undo => self.restore(false),
             EditorEvent::Redo => self.restore(true),
+            EditorEvent::LineBreak => {
+                if self.multiline {
+                    self.insert("\n");
+                }
+            }
             EditorEvent::Enter => {}
         }
         output
     }
 
+    /// Asks a multi-line field to show the text from `y` down. The next frame clamps it.
+    pub fn scroll_to(&mut self, y: f32) {
+        self.scroll_y = y;
+    }
+
+    /// Draws the field in a box of `size` (width and visible height).
     pub fn frame(
         &mut self,
         engine: &mut TextEngine,
@@ -529,14 +650,19 @@ impl LineEditor {
             self.set_style(engine.fonts(), style);
         }
         let width = size[0].max(0.);
+        // A multi-line field wraps where the layout measures it; a single line never wraps.
+        let wrap = self.multiline.then_some(width + WRAP_SLACK);
+        self.set_wrap(engine.fonts(), wrap);
+        self.page = size[1];
+        let follow = std::mem::take(&mut self.follow);
         let (cursor, selected, composition) = if let Some(preedit) = &self.preedit {
             let replace = self.selected_bytes();
             let start = replace.start;
             let end = start + preedit.text.len();
             if self.preview.is_none() {
-                let mut display = self.text().to_owned();
+                let mut display = self.text().into_owned();
                 display.replace_range(replace, &preedit.text);
-                self.preview = Some(engine.shape(&display, &self.style));
+                self.preview = Some(engine.shape(&display, &self.style, wrap));
             }
             let selected = preedit
                 .active
@@ -546,69 +672,130 @@ impl LineEditor {
                         ..start + byte_at(&preedit.text, range.end)
                 })
                 .unwrap_or(end..end);
+            let preview = self.preview.as_ref().expect("the preview is shaped");
+            let at = cursor_at(preview, end);
             (
-                Cursor::new_with_affinity(0, selected.end, Affinity::Before),
+                Cursor::new_with_affinity(at.line, at.index, Affinity::Before),
                 selected,
                 start..end,
             )
         } else {
-            if !self.text().is_empty() {
+            if self.multiline {
+                self.buffer_mut().shape_until_scroll(engine.fonts(), false);
+            } else if !self.text().is_empty() {
                 self.inner.shape_as_needed(engine.fonts(), false);
             }
             (self.inner.cursor(), self.selected_bytes(), 0..0)
         };
         let buffer = self.preview.as_ref().unwrap_or_else(|| self.buffer());
-        let caret = caret_x(buffer, cursor);
-        let run = buffer.layout_runs().next();
-        let line_width = run.as_ref().map_or(0., |run| run.line_w);
-        let max_scroll = (line_width + 2. - width).max(0.);
-        let left = self.scroll_x.clamp(0., max_scroll);
-        let scroll_x = left.min(caret).max(caret + 2. - width).max(0.);
+        let (caret, caret_top) = caret_at(buffer, cursor);
+        let line_height = self.style.line_height;
+        let content_height = buffer
+            .layout_runs()
+            .fold(0_f32, |height, run| {
+                height.max(run.line_top + run.line_height)
+            })
+            .max(line_height);
+        let view = size[1].max(0.);
+        let top = if self.multiline {
+            let max = (content_height - view).max(0.);
+            let mut top = self.scroll_y.clamp(0., max);
+            if follow {
+                top = if caret_top < top {
+                    caret_top
+                } else {
+                    top.max(caret_top + line_height - view)
+                };
+                top = top.clamp(0., max);
+            }
+            top
+        } else {
+            0.
+        };
+        let scroll_x = if self.multiline {
+            0.
+        } else {
+            let line_width = buffer.layout_runs().next().map_or(0., |run| run.line_w);
+            let max_scroll = (line_width + 2. - width).max(0.);
+            let left = self.scroll_x.clamp(0., max_scroll);
+            left.min(caret).max(caret + 2. - width).max(0.)
+        };
         let bitmap_key = EditorBitmapKey {
             revision: self.revision,
             size,
             scale,
             max_side,
             scroll_x,
+            scroll_y: top,
         };
-        let bitmap = if Some(bitmap_key) != cached
-            && run.as_ref().is_some_and(|run| !run.glyphs.is_empty())
-        {
-            engine.rasterize_buffer(buffer, size, scale, max_side, scroll_x, 1)
+        let has_glyphs = buffer.layout_runs().any(|run| !run.glyphs.is_empty());
+        let bitmap = if Some(bitmap_key) != cached && has_glyphs {
+            let lines = if self.multiline { usize::MAX } else { 1 };
+            engine.rasterize_buffer(buffer, size, scale, max_side, [scroll_x, top], lines)
         } else {
             None
         };
-        let selection = run
-            .as_ref()
-            .map_or_else(Vec::new, |run| spans(run, selected, scroll_x, width));
-        let composition = run
-            .as_ref()
-            .map_or_else(Vec::new, |run| spans(run, composition, scroll_x, width));
+        let selection = rows(buffer, selected, [scroll_x, top], width);
+        let composition = rows(buffer, composition, [scroll_x, top], width)
+            .into_iter()
+            .map(|[x, y, w, h]| [x, y + h - 1., w, 1.])
+            .collect();
         self.scroll_x = scroll_x;
+        self.scroll_y = top;
         EditorFrame {
             bitmap_key,
             bitmap,
             caret_x: caret - scroll_x,
+            caret_y: caret_top - top,
             caret_visible: self
                 .preedit
                 .as_ref()
                 .is_none_or(|preedit| preedit.active.is_some()),
-            line_height: self.style.line_height,
+            line_height,
             selection,
             composition,
+            scroll_y: top,
+            content_height,
         }
     }
 }
 
 fn empty_editor(text: &str, style: &TextStyle) -> Editor<'static> {
     let mut buffer = Buffer::new_empty(metrics(style));
-    buffer.lines.push(BufferLine::new(
-        text,
-        LineEnding::None,
-        AttrsList::new(&attrs(style)),
-        Shaping::Advanced,
-    ));
+    let last = text.matches('\n').count();
+    for (i, line) in text.split('\n').enumerate() {
+        let ending = if i < last {
+            LineEnding::Lf
+        } else {
+            LineEnding::None
+        };
+        buffer.lines.push(BufferLine::new(
+            line,
+            ending,
+            AttrsList::new(&attrs(style)),
+            Shaping::Advanced,
+        ));
+    }
     Editor::new(buffer)
+}
+
+// The text an editor holds: one line, or lines broken at `\n` in a multi-line field.
+fn clean(text: &str, multiline: bool) -> Cow<'_, str> {
+    if !multiline {
+        return single_line(text);
+    }
+    Cow::Owned(
+        text.replace("\r\n", "\n")
+            .replace('\r', "\n")
+            .chars()
+            .filter_map(|c| match c {
+                '\n' => Some('\n'),
+                '\t' | '\u{000B}' | '\u{000C}' | '\u{0085}' | '\u{2028}' | '\u{2029}' => Some(' '),
+                c if c.is_control() => None,
+                c => Some(c),
+            })
+            .collect(),
+    )
 }
 
 fn single_line(text: &str) -> Cow<'_, str> {
@@ -635,6 +822,29 @@ fn byte_at(text: &str, index: usize) -> usize {
     text.char_indices()
         .nth(index)
         .map_or(text.len(), |(offset, _)| offset)
+}
+
+/// Byte offset of `cursor` in the text of `buffer`, whose lines are joined by one `\n` each.
+fn offset_of(buffer: &Buffer, cursor: Cursor) -> usize {
+    buffer.lines[..cursor.line]
+        .iter()
+        .map(|line| line.text().len() + 1)
+        .sum::<usize>()
+        + cursor.index
+}
+
+/// The cursor at byte `offset` of the text of `buffer`. An offset at a line break is the end of the line before it.
+fn cursor_at(buffer: &Buffer, offset: usize) -> Cursor {
+    let last = buffer.lines.len() - 1;
+    let mut start = 0;
+    for (line, text) in buffer.lines.iter().map(|line| line.text()).enumerate() {
+        let end = start + text.len();
+        if offset <= end || line == last {
+            return Cursor::new(line, offset.saturating_sub(start).min(text.len()));
+        }
+        start = end + 1;
+    }
+    Cursor::new(last, 0)
 }
 
 fn grapheme_edge(text: &str, index: usize, forward: bool) -> usize {
@@ -675,7 +885,10 @@ fn visual_neighbor(run: &LayoutRun<'_>, x: f32, left: bool) -> Option<Cursor> {
                 } else {
                     Affinity::After
                 };
-                nearest = Some((distance, Cursor::new_with_affinity(0, index, affinity)));
+                nearest = Some((
+                    distance,
+                    Cursor::new_with_affinity(run.line_i, index, affinity),
+                ));
             }
         }
     }
@@ -693,11 +906,26 @@ fn cluster_x(text: &str, glyph: &LayoutGlyph, byte: usize) -> f32 {
     glyph.x + glyph.w * if glyph.level.is_rtl() { 1. - t } else { t }
 }
 
-fn caret_x(buffer: &Buffer, cursor: Cursor) -> f32 {
-    let Some(run) = buffer.layout_runs().next() else {
-        return 0.;
-    };
-    let mut alternative = 0.;
+// Where `cursor` is drawn in `buffer`: its x and the top of its line.
+fn caret_at(buffer: &Buffer, cursor: Cursor) -> (f32, f32) {
+    let mut fallback = None;
+    for run in buffer.layout_runs().filter(|run| run.line_i == cursor.line) {
+        match caret_in_run(&run, cursor) {
+            Some((x, true)) => return (x, run.line_top),
+            Some((x, false)) => fallback = Some((x, run.line_top)),
+            None => {}
+        }
+    }
+    fallback.unwrap_or((0., 0.))
+}
+
+// The x of `cursor` in `run`, if the cursor is in it. The flag says whether the cursor's affinity picks this run's
+// edge, which matters at a wrap: the cursor sits at the end of the line it ends, or the start of the next.
+fn caret_in_run(run: &LayoutRun<'_>, cursor: Cursor) -> Option<(f32, bool)> {
+    if run.glyphs.is_empty() {
+        return (cursor.index == 0).then_some((0., true));
+    }
+    let mut alternative = None;
     for glyph in run.glyphs {
         if cursor.index < glyph.start || cursor.index > glyph.end {
             continue;
@@ -707,11 +935,41 @@ fn caret_x(buffer: &Buffer, cursor: Cursor) -> f32 {
             || (cursor.index == glyph.start && cursor.affinity == Affinity::After)
             || (cursor.index == glyph.end && cursor.affinity == Affinity::Before)
         {
-            return x;
+            return Some((x, true));
         }
-        alternative = x;
+        alternative = Some(x);
     }
-    alternative
+    alternative.map(|x| (x, false))
+}
+
+// The rectangles `[x, y, width, height]` of the text in the byte range `bytes` (of the whole text), below `scroll`.
+fn rows(
+    buffer: &Buffer,
+    bytes: Range<usize>,
+    [scroll_x, scroll_y]: [f32; 2],
+    width: f32,
+) -> Vec<[f32; 4]> {
+    let mut out = Vec::new();
+    let mut line_start = 0;
+    for (line, text) in buffer.lines.iter().map(|line| line.text()).enumerate() {
+        let end = line_start + text.len();
+        let (from, to) = (bytes.start.max(line_start), bytes.end.min(end));
+        if from < to {
+            let local = from - line_start..to - line_start;
+            for run in buffer.layout_runs().filter(|run| run.line_i == line) {
+                for span in spans(&run, local.clone(), scroll_x, width) {
+                    out.push([
+                        span.start,
+                        run.line_top - scroll_y,
+                        span.end - span.start,
+                        run.line_height,
+                    ]);
+                }
+            }
+        }
+        line_start = end + 1;
+    }
+    out
 }
 
 fn spans(run: &LayoutRun<'_>, bytes: Range<usize>, scroll_x: f32, width: f32) -> Vec<Range<f32>> {

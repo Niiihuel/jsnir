@@ -488,6 +488,10 @@ function TextInput(props: {
     value?: string;
     placeholder?: string;
     placeholderColor?: number;
+    /** Several lines: the text wraps, the field grows to its max height and then scrolls. */
+    multiline?: boolean;
+    /** In a multi-line field, Enter submits and Shift+Enter breaks the line, instead of Enter breaking it. */
+    submitOnEnter?: boolean;
     onSubmit?: (submit: TextSubmit) => void;
     /** Receives the text after each edit, as a DOM `input` event. */
     onChange?: (text: string) => void;
@@ -528,6 +532,8 @@ function TextInput(props: {
                     change: change,
                     placeholder: props.placeholder,
                     placeholderColor: props.placeholderColor,
+                    multiline: props.multiline,
+                    submitOnEnter: props.submitOnEnter,
                     style: props.style,
                     font: props.font,
                     paint: paint,

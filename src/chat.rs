@@ -10,6 +10,7 @@ use crate::{
     tree::{Batch, Edges, Font, Node, Op, Replica, Style, Tree},
 };
 use std::{
+    borrow::Cow,
     cell::RefCell,
     rc::Rc,
     sync::mpsc::{Receiver, TryRecvError},
@@ -97,6 +98,8 @@ impl App for ChatRust {
                     change: 0,
                     placeholder: String::new(),
                     placeholder_color: None,
+                    multiline: false,
+                    submit_on_enter: false,
                     style: style(0., 0., 0., Some(34.)),
                     font: Font::default(),
                     paint: Box::default(),
@@ -333,7 +336,7 @@ impl Chat {
     ) -> Option<TextBitmap> {
         self.text.rasterize(text, size, scale, wrap, max_side)
     }
-    pub fn draft(&self) -> &str {
+    pub fn draft(&self) -> Cow<'_, str> {
         self.editor.text()
     }
     /// Ordered selection in characters, as the tree and the SDK see it.
@@ -342,7 +345,7 @@ impl Chat {
     }
     /// Replaces the document and resets the edit history.
     pub fn set_draft(&mut self, text: &str, selection: [u32; 2]) {
-        self.editor.reset(text, selection);
+        self.editor.reset(text, selection, false);
     }
     pub fn composing(&self) -> bool {
         self.editor.composing()
@@ -397,10 +400,10 @@ impl Chat {
     /// If the draft or selection changed, applies them to the tree and appends them to the replica's log.
     pub fn publish_input(&mut self) {
         let selection = self.selection();
-        if (self.draft(), selection) == (self.published.0.as_str(), self.published.1) {
+        if (self.draft().as_ref(), selection) == (self.published.0.as_str(), self.published.1) {
             return;
         }
-        let draft = self.draft().to_owned();
+        let draft = self.draft().into_owned();
         let op = Op::SetInput {
             id: self.input,
             text: draft.clone(),
@@ -419,7 +422,7 @@ impl Chat {
         if self.composing() || self.draft().trim().is_empty() || self.pending == MAX_PENDING {
             return false;
         }
-        let text = self.draft().to_owned();
+        let text = self.draft().into_owned();
         self.set_draft("", [0, 0]);
         // The cleared field enters the log before the event: the app never sees already-sent text as a draft.
         self.publish_input();
@@ -547,7 +550,7 @@ mod tests {
         assert_eq!((chat.history_len(), chat.message(1)), (2, "two"));
         assert_eq!(
             (chat.tree.text(chat.input), chat.draft()),
-            (Some("editing…"), "editing…")
+            (Some("editing…"), Cow::from("editing…"))
         );
         assert_eq!(
             chat.input_rect(),
@@ -777,7 +780,7 @@ mod tests {
             start
                 .selection
                 .iter()
-                .all(|span| 0. <= span.start && span.end <= 100.)
+                .all(|[x, _, w, _]| 0. <= *x && x + w <= 100.)
         );
     }
     #[test]

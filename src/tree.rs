@@ -505,6 +505,11 @@ contract_enum! {
             (default) change: u16,
             (default) placeholder: String,
             (default) placeholder_color: Option<u32>,
+            /// Several lines: the text wraps at the field's width and the field grows with it, up to its max height,
+            /// then scrolls. Enter inserts a line break unless `submit_on_enter` is set.
+            (default) multiline: bool,
+            /// In a multi-line field, Enter submits and Shift+Enter breaks the line.
+            (default) submit_on_enter: bool,
             (default) style: Style,
             (default) font: Font,
             (default) paint: Box<Paint>,
