@@ -61,6 +61,8 @@ pub mod apps {
     pub const FILL: &str = include_str!(concat!(env!("OUT_DIR"), "/fill.js"));
     /// Test app for containers: a Column's background, a For's scrollbar and a tooltip's text paint and width (SDK + app).
     pub const CONTAINERS: &str = include_str!(concat!(env!("OUT_DIR"), "/containers.js"));
+    /// Test app for a multi-line `TextInput`: wrapping, growing to its max height, Enter and Shift+Enter (SDK + app).
+    pub const COMPOSER: &str = include_str!(concat!(env!("OUT_DIR"), "/composer.js"));
 }
 
 use contract::Columns;
@@ -761,6 +763,7 @@ mod tests {
                 "scrollbar",
                 "overlay",
                 "fill",
+                "composer",
             ]);
         }
         for app in apps {

@@ -164,7 +164,14 @@ impl Layout {
             },
         };
         let style = taffy_style(node, in_scroll(tree, id));
-        let t = if matches!(node, Node::Text { .. }) {
+        let t = if matches!(
+            node,
+            Node::Text { .. }
+                | Node::Input {
+                    multiline: true,
+                    ..
+                }
+        ) {
             self.taffy.new_leaf_with_context(style, id)
         } else {
             self.taffy.new_leaf(style)
@@ -350,6 +357,32 @@ impl Layout {
                         style,
                         |_, _| 0.,
                         |known, available| {
+                            // A multi-line field: its text wrapped at the width of its content box, at least one line.
+                            if let Some(Node::Input {
+                                text: value,
+                                font,
+                                multiline: true,
+                                ..
+                            }) = id.as_ref().and_then(|id| tree.nodes.get(id))
+                            {
+                                let width = match available.width {
+                                    AvailableSpace::Definite(width) => Some(width),
+                                    AvailableSpace::MinContent => Some(1.),
+                                    AvailableSpace::MaxContent => None,
+                                };
+                                // The style the field is drawn with: its height is its lines' height.
+                                let style = TextStyle::of(font, [255; 4]);
+                                let runs = node_spans(value, None);
+                                let [_, height] = text.measure_styled(
+                                    &runs,
+                                    width.map(|w| w + WRAP_SLACK),
+                                    &style,
+                                );
+                                return Size {
+                                    width: 0.,
+                                    height: height.max(style.line_height),
+                                };
+                            }
                             let Some(Node::Text {
                                 text: value,
                                 font,

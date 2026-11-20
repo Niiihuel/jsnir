@@ -28,6 +28,7 @@ fn main() {
             "overlay",
             "fill",
             "containers",
+            "composer",
         ]);
     }
     if apps.is_empty() {

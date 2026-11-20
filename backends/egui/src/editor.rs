@@ -104,12 +104,9 @@ impl EditorView {
 
         let origin = Pos2::new(content.min.x, content.center().y - frame.line_height / 2.);
         let painter = painter.with_clip_rect(content);
-        for span in frame.selection {
+        for [x, y, w, h] in frame.selection {
             painter.rect_filled(
-                Rect::from_min_max(
-                    origin + Vec2::new(span.start, 0.),
-                    origin + Vec2::new(span.end, frame.line_height),
-                ),
+                Rect::from_min_size(origin + Vec2::new(x, y), Vec2::new(w, h)),
                 0.,
                 Color32::from_rgb(36, 77, 104),
             );
@@ -123,10 +120,10 @@ impl EditorView {
                 Color32::WHITE,
             );
         }
-        for span in frame.composition {
+        for [x, y, w, _] in frame.composition {
             painter.hline(
-                origin.x + span.start..=origin.x + span.end,
-                origin.y + frame.line_height - 1.,
+                origin.x + x..=origin.x + x + w,
+                origin.y + y,
                 egui::Stroke::new(1., border),
             );
         }
@@ -168,6 +165,7 @@ impl EditorView {
 fn pointer_events(ui: &Ui, response: &Response, content: Rect, events: &mut Vec<EditorEvent>) {
     let point = |pos: Pos2, select| EditorEvent::Point {
         x: pos.x - content.min.x,
+        y: pos.y - content.min.y,
         select,
     };
     let primary = PointerButton::Primary;

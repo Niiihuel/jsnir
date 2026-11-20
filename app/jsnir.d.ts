@@ -53,7 +53,7 @@ type Node =
     | { kind: "label"; value: number }
     | { kind: "button"; callback: number }
     | { kind: "text"; text: string; style?: Style; font?: Font; paint?: Paint; lines?: number | undefined; align?: TextAlign; spans?: Span[] | undefined }
-    | { kind: "input"; text?: string; selection?: [number, number]; submit?: number; change?: number; placeholder?: string; placeholderColor?: number | undefined; style?: Style; font?: Font; paint?: Paint }
+    | { kind: "input"; text?: string; selection?: [number, number]; submit?: number; change?: number; placeholder?: string; placeholderColor?: number | undefined; multiline?: boolean; submitOnEnter?: boolean; style?: Style; font?: Font; paint?: Paint }
     | { kind: "box"; style?: Style; paint?: Paint; press?: number; disabled?: boolean; hover?: number; contextmenu?: number; dismiss?: number }
     | { kind: "icon"; icon: IconName; size: number; stroke: number; style?: Style; paint?: Paint }
     | { kind: "image"; source: string; style?: Style; paint?: Paint };

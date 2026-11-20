@@ -223,6 +223,7 @@ impl App {
         match self.drag {
             Drag::Editor => self.events.push(EditorEvent::Point {
                 x: point[0] - editor_content(editor)[0],
+                y: point[1] - editor_content(editor)[1],
                 select: PointSelection::Extend,
             }),
             Drag::Scrollbar => self.scene.chat.scroll_history(ScrollEvent::Drag(point[1])),
@@ -250,6 +251,7 @@ impl App {
                 let select = self.clicks.select(point, self.modifiers.shift_key());
                 self.events.push(EditorEvent::Point {
                     x: point[0] - editor_content(editor)[0],
+                    y: point[1] - editor_content(editor)[1],
                     select,
                 });
             } else if contains(send, point) {

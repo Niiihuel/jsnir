@@ -175,9 +175,9 @@ impl Scene {
             content[0],
             content[1] + (content[3] - frame.line_height) / 2.,
         ];
-        for span in frame.selection {
+        for [dx, dy, w, h] in frame.selection {
             draws.push(Draw::fill(
-                [x + span.start, y, span.end - span.start, frame.line_height],
+                [x + dx, y + dy, w, h],
                 content,
                 rgb(36, 77, 104),
             ));
@@ -185,17 +185,8 @@ impl Scene {
         if let Some(image) = &self.editor {
             draws.push(Draw::image(image, [x, y], scale, content));
         }
-        for span in frame.composition {
-            draws.push(Draw::fill(
-                [
-                    x + span.start,
-                    y + frame.line_height - 1.,
-                    span.end - span.start,
-                    1.,
-                ],
-                content,
-                border,
-            ));
+        for [dx, dy, w, h] in frame.composition {
+            draws.push(Draw::fill([x + dx, y + dy, w, h], content, border));
         }
         let cursor = [x + frame.caret_x, y, 1., frame.line_height];
         if focused && frame.caret_visible {

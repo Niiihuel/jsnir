@@ -278,9 +278,14 @@ impl TextEngine {
         Color::rgb(r, g, b)
     }
 
-    /// `text` on one line in `style`, for the line editor's preedit.
-    pub(crate) fn shape(&mut self, text: &str, style: &TextStyle) -> Buffer {
-        self.shape_styled(&node_spans(text, None), None, Wrap::None, style)
+    /// `text` in `style` for the line editor's preedit: one line, or wrapped at `width` in a multi-line field.
+    pub(crate) fn shape(&mut self, text: &str, style: &TextStyle, width: Option<f32>) -> Buffer {
+        let wrap = if width.is_some() {
+            Wrap::WordOrGlyph
+        } else {
+            Wrap::None
+        };
+        self.shape_styled(&node_spans(text, None), width, wrap, style)
     }
 
     /// Width of `text` on one line in `style`: the advance of the placeholder of an image.
@@ -570,31 +575,24 @@ impl TextEngine {
             [width, height],
             scale,
             max_side,
-            0.,
+            [0.; 2],
             if wrap { usize::MAX } else { 1 },
             Color::rgba(r, g, b, a),
         )
     }
 
+    /// Draws `buffer` from `scroll` (logical pixels: left, top) into a bitmap of `size`, at most `lines` runs.
     pub(crate) fn rasterize_buffer(
         &mut self,
         buffer: &Buffer,
         [width, height]: [f32; 2],
         scale: f32,
         max_side: usize,
-        scroll_x: f32,
+        scroll: [f32; 2],
         lines: usize,
     ) -> Option<TextBitmap> {
         let ink = self.ink();
-        self.rasterize_buffer_colored(
-            buffer,
-            [width, height],
-            scale,
-            max_side,
-            scroll_x,
-            lines,
-            ink,
-        )
+        self.rasterize_buffer_colored(buffer, [width, height], scale, max_side, scroll, lines, ink)
     }
 
     fn rasterize_buffer_colored(
@@ -603,7 +601,7 @@ impl TextEngine {
         [width, height]: [f32; 2],
         scale: f32,
         max_side: usize,
-        scroll_x: f32,
+        [scroll_x, scroll_y]: [f32; 2],
         lines: usize,
         color: Color,
     ) -> Option<TextBitmap> {
@@ -617,7 +615,8 @@ impl TextEngine {
         let mut rgba = vec![0; width.checked_mul(height)?.checked_mul(4)?];
         for run in buffer
             .layout_runs()
-            .take_while(|run| run.line_top * scale < height as f32)
+            .filter(|run| run.line_top + run.line_height > scroll_y)
+            .take_while(|run| (run.line_top - scroll_y) * scale < height as f32)
             .take(lines)
         {
             for glyph in run.glyphs {
@@ -629,7 +628,8 @@ impl TextEngine {
                 let color = glyph.color_opt.unwrap_or(color);
                 // swash reports only the glyph's coverage in alpha: apply the color's own alpha here.
                 let base_alpha = u16::from(color.a());
-                let glyph = glyph.physical((-scroll_x * scale, run.line_y * scale), scale);
+                let glyph =
+                    glyph.physical((-scroll_x * scale, (run.line_y - scroll_y) * scale), scale);
                 glyphs.with_pixels(fonts, glyph.cache_key, color, |x, y, color| {
                     let (x, y) = ((glyph.x + x) as usize, (glyph.y + y) as usize);
                     let alpha = (u16::from(color.a()) * base_alpha + 127) / 255;

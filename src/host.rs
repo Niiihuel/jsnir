@@ -7,7 +7,7 @@ use crate::{
     layout::Layout,
     motion::{Channel, Motion, Value},
     or_log, spawn_app,
-    text::{Mark, TextBitmap, TextEngine, TextStyle, node_spans, plain_text},
+    text::{Mark, TextBitmap, TextEngine, TextStyle, WRAP_SLACK, node_spans, plain_text},
     tree::{
         Anchor, AnchorAlign, Batch, Easing, Icon, Node, Op, Paint, Position, Property, Replica,
         Scrollbar, Shadow, Side, Span, Transition, Tree, Variant,
@@ -693,9 +693,10 @@ impl Host {
             && self.pressed.is_none()
             && self.editor_dragging
         {
-            let x = p[0] - self.input_content(id)[0];
+            let (x, y) = self.field_point(id, p);
             self.edit(&[EditorEvent::Point {
                 x,
+                y,
                 select: PointSelection::Extend,
             }]);
         }
@@ -720,8 +721,8 @@ impl Host {
             Some(Node::Input { .. }) => {
                 let id = hit.unwrap();
                 self.focus(Some(id));
-                let x = point[0] - self.input_content(id)[0];
-                self.edit(&[EditorEvent::Point { x, select }]);
+                let (x, y) = self.field_point(id, point);
+                self.edit(&[EditorEvent::Point { x, y, select }]);
                 self.editor_dragging = true;
             }
             _ => {
@@ -858,11 +859,14 @@ impl Host {
         }
         self.focused = id;
         if let Some(Node::Input {
-            text, selection, ..
+            text,
+            selection,
+            multiline,
+            ..
         }) = id.and_then(|id| self.tree.nodes.get(&id))
         {
-            let (text, selection) = (text.clone(), *selection);
-            self.editor.reset(&text, selection);
+            let (text, selection, multiline) = (text.clone(), *selection, *multiline);
+            self.editor.reset(&text, selection, multiline);
             self.published = (text, selection);
             self.editor_key = None;
         }
@@ -894,17 +898,48 @@ impl Host {
                 EditorEvent::Preedit { text, .. } => !text.is_empty(),
                 _ => false,
             });
+        // Motions wrap where the field is laid out, which may be before the next frame draws it.
+        if let Some(Node::Input {
+            multiline: true, ..
+        }) = self.tree.nodes.get(&id)
+        {
+            let width = self.input_content(id)[2];
+            if width > 0. {
+                self.editor
+                    .set_width(&mut self.text, Some(width + WRAP_SLACK));
+            }
+        }
         for event in events {
             if output.interrupt_ime && event.involves_ime() {
                 continue;
             }
-            if matches!(event, EditorEvent::Enter) {
-                if !composing
-                    && let Some(Node::Input { submit, .. }) = self.tree.nodes.get(&id)
-                    && *submit != 0
-                {
-                    let (callback, text) = (*submit, self.editor.text().to_owned());
-                    self.send(Event { callback, text });
+            if matches!(event, EditorEvent::Enter | EditorEvent::LineBreak) {
+                let Some(Node::Input {
+                    submit,
+                    multiline,
+                    submit_on_enter,
+                    ..
+                }) = self.tree.nodes.get(&id)
+                else {
+                    continue;
+                };
+                let (submit, multiline, submit_on_enter) = (*submit, *multiline, *submit_on_enter);
+                if composing {
+                    continue;
+                }
+                if matches!(event, EditorEvent::LineBreak) || (multiline && !submit_on_enter) {
+                    self.editor.handle(&mut self.text, &EditorEvent::LineBreak);
+                } else if submit != 0 {
+                    let text = self.editor.text().into_owned();
+                    if multiline {
+                        // A multi-line field clears itself as it submits, as the chat does: the app hears of the cleared field first.
+                        self.editor.reset("", [0, 0], true);
+                        self.publish(id);
+                    }
+                    self.send(Event {
+                        callback: submit,
+                        text,
+                    });
                 }
                 continue;
             }
@@ -920,11 +955,15 @@ impl Host {
 
     // Writes the field's text and selection to the tree, and tells the app if the text changed.
     fn publish(&mut self, id: u16) {
-        let state = (self.editor.text().to_owned(), self.editor.selection());
+        let state = (self.editor.text().into_owned(), self.editor.selection());
         if state == self.published {
             return;
         }
         let changed = state.0 != self.published.0;
+        if changed {
+            // A multi-line field's height follows its text.
+            self.layout.text_changed(id);
+        }
         let batch = Batch {
             base: 0,
             ops: vec![Op::SetInput {
@@ -946,6 +985,14 @@ impl Host {
             });
         }
         self.published = state;
+    }
+
+    // A window point as the field's editor counts it: x from the content's left, y from the top of the text, which
+    // the field's scroll moves.
+    fn field_point(&self, id: u16, point: [f32; 2]) -> (f32, f32) {
+        let content = self.input_content(id);
+        let scroll = self.scroll.get(&id).copied().unwrap_or(0.);
+        (point[0] - content[0], point[1] - content[1] + scroll)
     }
 
     // The field's text area: its rectangle minus its padding.
@@ -1972,6 +2019,7 @@ impl Walker<'_> {
                 font,
                 placeholder,
                 placeholder_color,
+                multiline,
                 ..
             } => {
                 self.hits.push(Hit {
@@ -1981,22 +2029,55 @@ impl Walker<'_> {
                 });
                 let content = inner.rect(host.input_content(id));
                 let style = TextStyle::of(font, inner.color(color));
+                // A line sits in the middle of a single-line field, and at the top of a multi-line one.
                 let line = [
                     content[0],
-                    content[1] + (content[3] - style.line_height * inner.k) / 2.,
+                    if *multiline {
+                        content[1]
+                    } else {
+                        content[1] + (content[3] - style.line_height * inner.k) / 2.
+                    },
                     content[2],
                     style.line_height * inner.k,
                 ];
+                // The visible text's height, in logical pixels: a multi-line field scrolls when its text is taller.
+                let view = if *multiline {
+                    content[3] / inner.k
+                } else {
+                    line[3] / inner.k
+                };
+                let width = content[2] / inner.k;
                 if host.focused == Some(id) {
+                    let requested = if *multiline {
+                        host.scroll_offset(id, f32::MAX, self.now)
+                    } else {
+                        0.
+                    };
+                    host.editor.scroll_to(requested);
                     let frame = host.editor.frame(
                         &mut host.text,
                         &style,
-                        [content[2] / inner.k, line[3] / inner.k],
+                        [width, view],
                         scale * inner.k,
                         max_side,
                         host.editor_key,
                     );
                     host.editor_key = Some(frame.bitmap_key);
+                    if *multiline {
+                        if frame.scroll_y != requested {
+                            host.motion.release(id, Channel::Scroll);
+                        }
+                        host.scroll.insert(id, frame.scroll_y);
+                        self.scrolls.push(Scroll {
+                            id,
+                            layer: self.layer,
+                            rect: intersect(content, clip),
+                            k: inner.k,
+                            max: (frame.content_height - view).max(0.),
+                            view,
+                            bar: None,
+                        });
+                    }
                     if text.is_empty() && !host.editor.composing() {
                         self.placeholder(
                             placeholder,
@@ -2007,11 +2088,16 @@ impl Walker<'_> {
                             (clip, round_clip),
                         );
                     }
-                    let caret = [line[0] + frame.caret_x * inner.k, line[1], inner.k, line[3]];
+                    let caret = [
+                        line[0] + frame.caret_x * inner.k,
+                        line[1] + frame.caret_y * inner.k,
+                        inner.k,
+                        line[3],
+                    ];
                     *self.ime_area = Some(caret);
                     let caret = (frame.caret_visible && !host.hide_caret).then_some(caret);
                     self.items.push(Item::Editor {
-                        rect: line,
+                        rect: if *multiline { content } else { line },
                         frame: Box::new(frame),
                         caret,
                         selection: [70, 120, 220, 110],
@@ -2028,6 +2114,40 @@ impl Walker<'_> {
                         line,
                         (clip, round_clip),
                     );
+                } else if *multiline {
+                    // Unfocused, the wrapped text is drawn whole and shifted up by the scroll; the clip shows the visible part.
+                    let height = host.text.measure_styled(
+                        &node_spans(text, None),
+                        Some(width + WRAP_SLACK),
+                        &style,
+                    )[1]
+                    .max(style.line_height);
+                    let max = (height - view).max(0.);
+                    let offset = host.scroll_offset(id, max, self.now);
+                    self.scrolls.push(Scroll {
+                        id,
+                        layer: self.layer,
+                        rect: intersect(content, clip),
+                        k: inner.k,
+                        max,
+                        view,
+                        bar: None,
+                    });
+                    self.items.push(Item::Text {
+                        rect: [
+                            content[0],
+                            content[1] - offset * inner.k,
+                            content[2],
+                            height * inner.k,
+                        ],
+                        text: text.clone(),
+                        spans: None,
+                        style,
+                        wrap: true,
+                        zoom: inner.k,
+                        clip: intersect(content, clip),
+                        round_clip,
+                    });
                 } else {
                     self.items.push(Item::Text {
                         rect: line,
@@ -2194,7 +2314,7 @@ impl Walker<'_> {
 #[cfg(all(test, feature = "stepper"))]
 mod tests {
     use super::*;
-    use crate::editor::EditorEvent;
+    use crate::editor::{Direction, EditorEvent, EditorFrame};
     use crate::text::{NORMAL_LINE_HEIGHT, WRAP_SLACK};
     use crate::tree::TextAlign;
 
@@ -3175,7 +3295,7 @@ mod tests {
 
         // The focused field is shaped in its family at the size it is given: its caret sits at the width of
         // the text at that size.
-        host.editor.reset(text, [19, 19]);
+        host.editor.reset(text, [19, 19], false);
         let style = |family: Option<&str>| TextStyle {
             size: 14.,
             family: family.map(str::to_owned),
@@ -3361,6 +3481,210 @@ mod tests {
     }
 
     // The overlay app: its panels are the fixed nodes anchored to a node, found by that anchor.
+    // A focused multi-line field 200 px wide, with 20 px lines, no padding and room for four lines (`apps::COMPOSER`).
+    fn composer() -> (Host, u16) {
+        let mut host = Host::new(
+            crate::apps::COMPOSER.into(),
+            "{}".into(),
+            TextEngine::with_fonts(&[INTER], [255; 3]),
+        );
+        settle(&mut host);
+        host.focus_first_input();
+        let id = find(&host, |n| matches!(n, Node::Input { .. }));
+        (host, id)
+    }
+
+    // The text and the selection of a field, as the tree holds them.
+    fn value(host: &Host, id: u16) -> (String, [u32; 2]) {
+        match host.tree.nodes.get(&id) {
+            Some(Node::Input {
+                text, selection, ..
+            }) => (text.clone(), *selection),
+            _ => panic!("no field {id}"),
+        }
+    }
+
+    // Draws the frame and returns the focused field's editor frame and caret.
+    fn field_frame(host: &mut Host) -> (EditorFrame, Option<Rect>) {
+        let frame = host.frame(640., 560., 1., 4096);
+        frame
+            .items
+            .iter()
+            .find_map(|item| match item {
+                Item::Editor { frame, caret, .. } => Some((frame.as_ref().clone(), *caret)),
+                _ => None,
+            })
+            .expect("the focused field")
+    }
+
+    #[test]
+    fn a_multi_line_field_wraps_grows_by_lines_and_then_scrolls_to_keep_the_caret() {
+        let (mut host, id) = composer();
+        let mut heights = Vec::new();
+        for _ in 0..8 {
+            host.edit(&[EditorEvent::Insert(
+                "The quick brown fox jumps over the lazy dog. ".into(),
+            )]);
+            host.frame(640., 560., 1., 4096);
+            heights.push(host.tree.rect(id)[3]);
+        }
+        assert!(heights[0] > 20., "the first sentence wraps: {heights:?}");
+        assert!(heights.windows(2).all(|w| w[0] <= w[1]), "{heights:?}");
+        assert!(
+            heights
+                .iter()
+                .all(|h| (h / 20. - (h / 20.).round()).abs() < 0.01),
+            "whole lines: {heights:?}"
+        );
+        assert_eq!(
+            heights.last(),
+            Some(&80.),
+            "four lines at most: {heights:?}"
+        );
+        let (frame, caret) = field_frame(&mut host);
+        assert!(frame.content_height > 80., "{frame:?}");
+        assert!(host.scroll.get(&id).is_some_and(|offset| *offset > 0.));
+        assert_eq!(frame.scroll_y, host.scroll[&id]);
+        assert!(
+            frame.caret_y >= 0. && frame.caret_y + frame.line_height <= 80.,
+            "the caret line is in view: {frame:?}"
+        );
+        assert!(caret.is_some_and(|c| c[1] >= host.tree.rect(id)[1]));
+    }
+
+    #[test]
+    fn shift_enter_breaks_a_line_and_enter_submits_the_whole_text_and_clears_the_field() {
+        let (mut host, id) = composer();
+        host.edit(&[EditorEvent::Insert("first".into())]);
+        host.edit(&[EditorEvent::LineBreak]);
+        host.edit(&[EditorEvent::Insert("second".into())]);
+        assert_eq!(value(&host, id).0, "first\nsecond");
+        host.edit(&[EditorEvent::Enter]);
+        settle(&mut host);
+        assert!(
+            texts(&host).contains(&"first\nsecond".into()),
+            "{:?}",
+            texts(&host)
+        );
+        assert_eq!(value(&host, id).0, "", "submitting clears the field");
+    }
+
+    #[test]
+    fn up_and_down_keep_the_column_and_shift_extends_the_selection() {
+        let (mut host, id) = composer();
+        host.edit(&[EditorEvent::Insert("abcdefgh\nab\nabcdefgh".into())]);
+        let move_to = |host: &mut Host, direction: Direction, extend: bool| {
+            host.edit(&[EditorEvent::Move { direction, extend }]);
+        };
+        move_to(&mut host, Direction::TextStart, false);
+        for _ in 0..6 {
+            move_to(&mut host, Direction::Right, false);
+        }
+        assert_eq!(value(&host, id).1, [6, 6]);
+        // The short line ends before column 6, so the caret goes to its end; the next line is back at column 6.
+        move_to(&mut host, Direction::Down, false);
+        assert_eq!(value(&host, id).1, [11, 11]);
+        move_to(&mut host, Direction::Down, false);
+        assert_eq!(value(&host, id).1, [18, 18]);
+        // Shift+Up from there selects back to the short line's end.
+        move_to(&mut host, Direction::Up, true);
+        assert_eq!(value(&host, id).1, [11, 18]);
+
+        move_to(&mut host, Direction::TextStart, false);
+        for _ in 0..6 {
+            move_to(&mut host, Direction::Right, false);
+        }
+        move_to(&mut host, Direction::Down, true);
+        assert_eq!(value(&host, id).1, [6, 11]);
+    }
+
+    #[test]
+    fn home_and_end_stop_at_the_edges_of_a_wrapped_visual_line() {
+        let (mut host, id) = composer();
+        let long = "one two three four five six seven eight nine ten eleven twelve thirteen";
+        host.edit(&[EditorEvent::Insert(long.into())]);
+        host.edit(&[EditorEvent::Move {
+            direction: Direction::Start,
+            extend: false,
+        }]);
+        let (frame, _) = field_frame(&mut host);
+        let start = value(&host, id).1[0] as usize;
+        // The last visual line starts after a space that wrapped, not at the start of the text.
+        assert!(frame.caret_y > 0. && frame.caret_x.abs() < 0.5, "{frame:?}");
+        assert!(start > 0 && long[..start].ends_with(' '), "{start}");
+        host.edit(&[EditorEvent::Move {
+            direction: Direction::TextStart,
+            extend: false,
+        }]);
+        host.edit(&[EditorEvent::Move {
+            direction: Direction::End,
+            extend: false,
+        }]);
+        let (frame, _) = field_frame(&mut host);
+        let end = value(&host, id).1[0] as usize;
+        assert!(end > 0 && end < long.chars().count(), "{end}");
+        assert_eq!(frame.caret_y, 0., "End stays on the first visual line");
+    }
+
+    #[test]
+    fn a_click_on_the_second_line_places_the_caret_there_and_a_drag_selects_across_lines() {
+        let (mut host, id) = composer();
+        host.edit(&[EditorEvent::Insert(
+            "one two three four five six seven eight nine ten eleven twelve".into(),
+        )]);
+        host.frame(640., 560., 1., 4096);
+        let [x, y, _, _] = host.tree.rect(id);
+        host.pointer_move(Some([x + 4., y + 30.]));
+        host.pointer_down(PointSelection::Place);
+        host.pointer_up();
+        let (frame, _) = field_frame(&mut host);
+        assert!((frame.caret_y - 20.).abs() < 0.5, "{frame:?}");
+
+        host.pointer_move(Some([x + 2., y + 10.]));
+        host.pointer_down(PointSelection::Place);
+        host.frame(640., 560., 1., 4096);
+        host.pointer_move(Some([x + 150., y + 50.]));
+        host.frame(640., 560., 1., 4096);
+        host.pointer_up();
+        let (frame, _) = field_frame(&mut host);
+        let (_, [start, end]) = value(&host, id);
+        assert!(end > start, "the drag selects");
+        let mut rows: Vec<f32> = frame.selection.iter().map(|r| r[1]).collect();
+        rows.dedup();
+        assert_eq!(rows, [0., 20., 40.], "{frame:?}");
+    }
+
+    #[test]
+    fn pasted_lines_are_inserted_as_lines() {
+        let (mut host, id) = composer();
+        host.edit(&[EditorEvent::Insert("a\nb\nc".into())]);
+        assert_eq!(value(&host, id).0, "a\nb\nc");
+        let copied = host.edit(&[EditorEvent::SelectAll, EditorEvent::Copy]);
+        assert_eq!(copied.clipboard.as_deref(), Some("a\nb\nc"));
+    }
+
+    #[test]
+    fn the_wheel_scrolls_a_multi_line_field_while_the_pointer_is_over_it() {
+        let (mut host, id) = composer();
+        for _ in 0..8 {
+            host.edit(&[EditorEvent::Insert(
+                "The quick brown fox jumps over the lazy dog. ".into(),
+            )]);
+        }
+        host.frame(640., 560., 1., 4096);
+        let [x, y, _, _] = host.tree.rect(id);
+        host.pointer_move(Some([x + 10., y + 10.]));
+        let (bottom, _) = field_frame(&mut host);
+        assert!(
+            bottom.scroll_y > 0.,
+            "the caret follows the end: {bottom:?}"
+        );
+        assert!(host.wheel(-40.), "the field can scroll up");
+        let (scrolled, _) = field_frame(&mut host);
+        assert!(scrolled.scroll_y < bottom.scroll_y && scrolled.scroll_y >= 0.);
+        assert_eq!(host.scroll[&id], scrolled.scroll_y);
+    }
+
     fn overlay() -> Host {
         let mut host = Host::new(
             crate::apps::OVERLAY.into(),
