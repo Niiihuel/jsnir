@@ -1,23 +1,30 @@
 //! A window that runs any TSX app through `jsnir::host::Host`: winit input in, wgpu frames out.
-use crate::{Result, view::View};
+use crate::{
+    Result,
+    input::{Clicks, Clipboard, ImeArea, KeyInput, editor_key, ime_event},
+    renderer::Renderer,
+    surface::{self, Surface},
+    view::View,
+};
 use jsnir::{
     editor::EditorEvent,
     host::{Cursor, Host},
 };
-use jsnir_gpu::{
-    input::{Clicks, Clipboard, ImeArea, KeyInput, editor_key, ime_event},
-    surface::{self, Surface},
-};
 use std::{
-    sync::Arc,
+    path::Path,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU32, Ordering},
+        mpsc::{Receiver, Sender, channel},
+    },
     time::{Duration, Instant},
 };
 use winit::{
     application::ApplicationHandler,
     dpi::{LogicalSize, PhysicalPosition},
-    event::{ElementState, MouseButton, WindowEvent},
-    event_loop::{ActiveEventLoop, ControlFlow},
-    keyboard::ModifiersState,
+    event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
+    event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
+    keyboard::{Key, ModifiersState, NamedKey},
     window::{CursorIcon, Window, WindowId},
 };
 
@@ -36,6 +43,9 @@ pub struct AppWindow {
     window_focused: bool,
     ime_enabled: bool,
     wake: Option<Instant>,
+    // Messages from `Pusher`; None when the program has no channel (`open`).
+    inbox: Option<Receiver<Message>>,
+    shared: Arc<Shared>,
     error: Option<Box<dyn std::error::Error>>,
 }
 
@@ -55,6 +65,8 @@ impl AppWindow {
             window_focused: true,
             ime_enabled: false,
             wake: None,
+            inbox: None,
+            shared: Arc::default(),
             error: None,
         }
     }
@@ -67,6 +79,19 @@ impl AppWindow {
         if let Some(surface) = &self.surface {
             surface.window.request_redraw();
         }
+    }
+
+    fn resize(&mut self) {
+        if let Some(surface) = &mut self.surface {
+            surface.resize();
+        }
+        self.request_redraw();
+    }
+
+    // Tells the embedder and the app the window's scale: once when the window opens, then on each change.
+    fn set_scale(&mut self, scale: f32) {
+        self.shared.set_scale(scale);
+        self.host.push(format!(r#"{{"jsnirScale":{scale}}}"#));
     }
 
     // The platform input method is on only while a field has focus.
@@ -186,6 +211,21 @@ impl AppWindow {
         self.request_redraw();
     }
 
+    // Winit's wheel is positive up; the host's offset is positive down, so a wheel down moves the content up.
+    fn wheel(&mut self, delta: MouseScrollDelta) {
+        let Some(surface) = &self.surface else { return };
+        // Mouse wheel notches glide; touchpad pixels are already smooth and apply at once.
+        let changed = match delta {
+            MouseScrollDelta::LineDelta(_, y) => self.host.wheel_smooth(-y * 40.),
+            MouseScrollDelta::PixelDelta(p) => self
+                .host
+                .wheel(-(p.y / surface.window.scale_factor()) as f32),
+        };
+        if changed {
+            self.request_redraw();
+        }
+    }
+
     fn mouse(&mut self, state: ElementState, point: Option<[f32; 2]>) {
         match state {
             ElementState::Pressed => {
@@ -201,7 +241,15 @@ impl AppWindow {
     }
 
     fn keyboard(&mut self, key: winit::event::KeyEvent) {
-        if key.state == ElementState::Released || !self.host.focused() {
+        if key.state == ElementState::Released {
+            return;
+        }
+        // Escape reaches the app even when no field has focus, so menus and popovers can close.
+        if matches!(key.logical_key, Key::Named(NamedKey::Escape)) {
+            self.host.escape();
+            self.request_redraw();
+        }
+        if !self.host.focused() {
             return;
         }
         match editor_key(&key, self.modifiers) {
@@ -232,8 +280,10 @@ impl ApplicationHandler for AppWindow {
             .and_then(|window| surface::open(&events.owned_display_handle(), Arc::new(window)));
         match window {
             Ok((instance, surface)) => {
+                let scale = surface.window.scale_factor() as f32;
                 self.instance = Some(instance);
                 self.surface = Some(surface);
+                self.set_scale(scale);
                 self.sync_ime();
                 self.request_redraw();
             }
@@ -254,15 +304,15 @@ impl ApplicationHandler for AppWindow {
         }
         match event {
             WindowEvent::CloseRequested => events.exit(),
-            WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
-                if let Some(surface) = &mut self.surface {
-                    surface.resize();
-                }
-                self.request_redraw();
+            WindowEvent::Resized(_) => self.resize(),
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                self.set_scale(scale_factor as f32);
+                self.resize();
             }
             WindowEvent::RedrawRequested => self.redraw(events),
             WindowEvent::CursorMoved { position, .. } => self.cursor(Some(position)),
             WindowEvent::CursorLeft { .. } => self.cursor(None),
+            WindowEvent::MouseWheel { delta, .. } => self.wheel(delta),
             WindowEvent::Focused(focused) => {
                 self.window_focused = focused;
                 if !focused {
@@ -281,6 +331,14 @@ impl ApplicationHandler for AppWindow {
                 let point = self.host_pointer();
                 self.mouse(state, point);
             }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Right,
+                ..
+            } => {
+                self.host.context_press();
+                self.request_redraw();
+            }
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::KeyboardInput {
                 event,
@@ -298,6 +356,19 @@ impl ApplicationHandler for AppWindow {
         }
     }
 
+    fn user_event(&mut self, _: &ActiveEventLoop, _: ()) {
+        let Some(inbox) = &self.inbox else { return };
+        for message in inbox.try_iter() {
+            match message {
+                Message::Push(text) => self.host.push(text),
+                Message::Image { source, rgba, size } => self.host.set_image(source, rgba, size),
+                Message::RemoveImage(source) => self.host.remove_image(&source),
+                Message::Font(bytes) => self.host.add_font(bytes),
+                Message::DefaultFamily(family) => self.host.set_default_family(family),
+            }
+        }
+        self.request_redraw();
+    }
     fn about_to_wait(&mut self, events: &ActiveEventLoop) {
         let now = Instant::now();
         if self.wake.is_some_and(|wake| now >= wake) {
@@ -315,5 +386,226 @@ impl ApplicationHandler for AppWindow {
 impl AppWindow {
     fn host_pointer(&self) -> Option<[f32; 2]> {
         self.host.pointer()
+    }
+}
+
+/// Opens a native window or captures a settled frame to a new PPM file.
+pub fn open(
+    mut host: Host,
+    title: &str,
+    size: [u32; 2],
+    focus: bool,
+    output: Option<&Path>,
+) -> Result<()> {
+    if let Some(path) = output {
+        return capture_at(host, size, 1., focus, path);
+    }
+    let event_loop = EventLoop::new()?;
+    host.poll();
+    if focus {
+        host.focus_first_input();
+    }
+    let mut window = AppWindow::new(host, title, size.map(|side| side as f32));
+    event_loop.run_app(&mut window)?;
+    window.finish()
+}
+
+/// Like `open`, with a channel for `Host::push`: `start` receives a `Pusher` the program can move to other threads.
+pub fn open_with(
+    mut host: Host,
+    title: &str,
+    size: [u32; 2],
+    start: impl FnOnce(Pusher),
+) -> Result<()> {
+    let event_loop = EventLoop::<()>::with_user_event().build()?;
+    let (tx, inbox) = channel();
+    let shared = Arc::<Shared>::default();
+    start(Pusher {
+        tx,
+        proxy: event_loop.create_proxy(),
+        shared: shared.clone(),
+    });
+    host.poll();
+    let mut window = AppWindow::new(host, title, size.map(|side| side as f32));
+    window.inbox = Some(inbox);
+    window.shared = shared;
+    event_loop.run_app(&mut window)?;
+    window.finish()
+}
+/// What a `Pusher` sends to the window thread.
+enum Message {
+    Push(String),
+    Image {
+        source: String,
+        rgba: Vec<u8>,
+        size: [u32; 2],
+    },
+    RemoveImage(String),
+    Font(Vec<u8>),
+    DefaultFamily(String),
+}
+type ScaleCallback = Box<dyn Fn(f32) + Send>;
+/// The window's scale factor and its `on_scale` callback, shared between the window and its `Pusher`s.
+struct Shared {
+    // f32 bits; 1.0 until the window opens.
+    scale: AtomicU32,
+    on_scale: Mutex<Option<ScaleCallback>>,
+}
+impl Default for Shared {
+    fn default() -> Self {
+        Self {
+            scale: AtomicU32::new(1f32.to_bits()),
+            on_scale: Mutex::new(None),
+        }
+    }
+}
+impl Shared {
+    fn scale(&self) -> f32 {
+        f32::from_bits(self.scale.load(Ordering::Relaxed))
+    }
+    // Runs on the window thread.
+    fn set_scale(&self, scale: f32) {
+        self.scale.store(scale.to_bits(), Ordering::Relaxed);
+        if let Some(on_scale) = self.on_scale.lock().unwrap().as_ref() {
+            on_scale(scale);
+        }
+    }
+}
+/// Sends messages from any thread to the app's `onHost` handler and to its images, and wakes the window.
+#[derive(Clone)]
+pub struct Pusher {
+    tx: Sender<Message>,
+    proxy: EventLoopProxy<()>,
+    shared: Arc<Shared>,
+}
+impl Pusher {
+    /// Device pixels per logical pixel of the window; 1.0 until it opens. Decode images at this scale to keep them sharp.
+    pub fn scale(&self) -> f32 {
+        self.shared.scale()
+    }
+    /// Calls `f` on the window thread with the new scale whenever it changes, and once when the window opens. Replaces the previous callback.
+    pub fn on_scale(&self, f: impl Fn(f32) + Send + 'static) {
+        *self.shared.on_scale.lock().unwrap() = Some(Box::new(f));
+    }
+    /// Returns false once the window has closed.
+    pub fn push(&self, json: String) -> bool {
+        self.send(Message::Push(json))
+    }
+    /// Sets the pixels of the image that `Node::Image` names as `source` (straight RGBA8).
+    pub fn image(&self, source: String, rgba: Vec<u8>, size: [u32; 2]) -> bool {
+        self.send(Message::Image { source, rgba, size })
+    }
+    pub fn remove_image(&self, source: String) -> bool {
+        self.send(Message::RemoveImage(source))
+    }
+    /// Loads a TTF or OTF font file for `Font.family` (`Host::add_font`).
+    pub fn font(&self, bytes: Vec<u8>) -> bool {
+        self.send(Message::Font(bytes))
+    }
+    /// Sets the family of text without one (`Host::set_default_family`).
+    pub fn default_family(&self, family: String) -> bool {
+        self.send(Message::DefaultFamily(family))
+    }
+    fn send(&self, message: Message) -> bool {
+        self.tx.send(message).is_ok() && self.proxy.send_event(()).is_ok()
+    }
+}
+/// Waits until the app has answered and every transition has settled, then captures a frame of `size` logical
+/// pixels at `scale` device pixels per logical pixel, into a new PPM file at `path`.
+pub fn capture_at(
+    mut host: Host,
+    size: [u32; 2],
+    scale: f32,
+    focus: bool,
+    path: &Path,
+) -> Result<()> {
+    if !scale.is_finite() || scale <= 0. {
+        return Err("the capture scale must be positive".into());
+    }
+    let instance =
+        wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    let adapter = pollster::block_on(instance.request_adapter(&Default::default()))?;
+    let mut renderer = Renderer::new(&adapter, wgpu::TextureFormat::Rgba8Unorm)?;
+    let max_side = renderer.device.limits().max_texture_dimension_2d;
+    let pixels = size.map(|side| (side as f32 * scale).round() as u32);
+    if pixels.iter().any(|&side| side > max_side) {
+        return Err(format!("capture dimensions exceed the GPU limit of {max_side} pixels").into());
+    }
+    let [width, height] = size.map(|side| side as f32);
+    host.hide_caret = true;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut focused = false;
+    let mut settled = 0;
+    loop {
+        host.poll();
+        if focus && !focused {
+            host.focus_first_input();
+            focused = true;
+        }
+        let frame = host.frame(width, height, scale, max_side as usize);
+        settled = if frame.animating || host.busy() {
+            0
+        } else {
+            settled + 1
+        };
+        if settled >= 3 {
+            break;
+        }
+        if Instant::now() > deadline {
+            return Err("the app did not settle within 5 s".into());
+        }
+        std::thread::sleep(Duration::from_millis(16));
+    }
+    let frame = host.frame(width, height, scale, max_side as usize);
+    let draws = View::default().draws(&mut host, &renderer, frame.items, scale);
+    renderer.capture(pixels, scale, &draws, path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jsnir::text::TextEngine;
+
+    #[test]
+    fn the_scale_starts_at_one_and_reports_each_change() {
+        let shared = Shared::default();
+        assert_eq!(shared.scale(), 1.);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        *shared.on_scale.lock().unwrap() =
+            Some(Box::new(move |scale| sink.lock().unwrap().push(scale)));
+        shared.set_scale(1.5);
+        assert_eq!(shared.scale(), 1.5);
+        assert_eq!(*seen.lock().unwrap(), [1.5]);
+    }
+
+    // A 20 by 20 logical image at scale 2 covers the 40 by 40 checkerboard exactly, so every device pixel is its source pixel.
+    #[test]
+    fn an_image_at_its_pixel_size_is_drawn_one_to_one() {
+        let mut host = Host::new(jsnir::SHARP_APP.into(), "{}".into(), TextEngine::default());
+        let rgba: Vec<u8> = (0..40 * 40)
+            .flat_map(|i| {
+                let (x, y) = (i % 40, i / 40);
+                let v = if (x + y) % 2 == 0 { 0 } else { 255 };
+                [v, v, v, 255]
+            })
+            .collect();
+        host.set_image("checker".into(), rgba.clone(), [40, 40]);
+        let path = std::env::temp_dir().join(format!("jsnir-sharp-{}.ppm", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        capture_at(host, [20, 20], 2., false, &path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(bytes.starts_with(b"P6\n40 40\n255\n"));
+        let body = &bytes[bytes.len() - 40 * 40 * 3..];
+        for (i, pixel) in body.as_chunks::<3>().0.iter().enumerate() {
+            assert_eq!(
+                pixel,
+                &rgba[i * 4..i * 4 + 3],
+                "device pixel {} {}",
+                i % 40,
+                i / 40
+            );
+        }
     }
 }

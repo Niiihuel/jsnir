@@ -11,14 +11,12 @@ GPUI port, and a JSNIR port written in TSX. Same font (Inter 4.1), same 640 × 5
 
 ## Run the three versions
 
-Run from the repository root. Install the pinned TypeScript compiler before building JSNIR.
+Run from a Git checkout. Set up the pinned native TypeScript compiler before building JSNIR. [Source build setup](../../README.md#run-the-stepper)
 
 ```sh
-npm ci
-
 # JSNIR
-cargo run --release --locked --manifest-path backends/gpu/Cargo.toml --target-dir target -- stepper
-cargo run --release --locked --manifest-path backends/gpu/Cargo.toml --target-dir target -- stepper --step 3 --name Ada --focus
+cargo run --release --locked --features stepper --manifest-path backends/gpu/Cargo.toml --target-dir target -- stepper
+cargo run --release --locked --features stepper --manifest-path backends/gpu/Cargo.toml --target-dir target -- stepper --step 3 --name Ada --focus
 
 # GPUI
 cargo run --release --locked --manifest-path comparison/stepper/gpui/Cargo.toml -- --step 3 --name Ada --focus

@@ -4,6 +4,14 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 
+[features]
+examples = []
+stepper = []
+
+[[example]]
+name = "layout"
+required-features = ["examples"]
+
 [dependencies]
 cosmic-text = "=0.14.2"
 rquickjs = "=0.14.0"

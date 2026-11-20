@@ -6,7 +6,7 @@ use crate::{
     history::{HistoryScroll, HistoryView, ScrollEvent},
     layout::Layout,
     live, or_log, spawn_app,
-    text::{TextBitmap, TextEngine},
+    text::{TextBitmap, TextEngine, TextStyle},
     tree::{Batch, Edges, Font, Node, Op, Replica, Style, Tree},
 };
 use std::{
@@ -27,8 +27,8 @@ const SEND: u16 = 1;
 // Both apps produce the same tree and the same changes: the Rust one is the reference without a VM.
 struct ChatJs(Vm, Rc<RefCell<Replica>>);
 impl App for ChatJs {
-    fn mount(&mut self) -> Vec<Op> {
-        self.0.call("jsnirMount", ())
+    fn mount(&mut self) -> Result<Vec<Op>, String> {
+        self.0.try_call("jsnirMount", ())
     }
     fn handle(&mut self, e: Event, _: &Tree) -> Vec<Op> {
         or_log(self.0.try_call("jsnirEvent", (e.callback, e.text)))
@@ -47,9 +47,14 @@ impl App for ChatJs {
 }
 struct ChatRust;
 impl App for ChatRust {
-    fn mount(&mut self) -> Vec<Op> {
+    fn mount(&mut self) -> Result<Vec<Op>, String> {
         // Same tree and styles as app/chat.tsx.
-        let create = |id, parent, node| Op::Create { id, parent, node };
+        let create = |id, parent, node| Op::Create {
+            id,
+            parent,
+            before: None,
+            node,
+        };
         let style = |padding, gap, grow, height| Style {
             padding: Edges::All(padding),
             gap,
@@ -57,7 +62,7 @@ impl App for ChatRust {
             height,
             ..Default::default()
         };
-        vec![
+        Ok(vec![
             create(
                 1,
                 None,
@@ -101,13 +106,16 @@ impl App for ChatRust {
                 STATUS,
                 Some(1),
                 Node::Text {
+                    lines: None,
+                    align: Default::default(),
+                    spans: None,
                     text: String::new(),
                     style: Style::default(),
                     font: Font::default(),
                     paint: Box::default(),
                 },
             ),
-        ]
+        ])
     }
     fn handle(&mut self, e: Event, view: &Tree) -> Vec<Op> {
         assert_eq!(e.callback, SEND, "unknown callback");
@@ -124,7 +132,11 @@ impl App for ChatRust {
             Op::Create {
                 id,
                 parent: Some(HISTORY),
+                before: None,
                 node: Node::Text {
+                    lines: None,
+                    align: Default::default(),
+                    spans: None,
                     text: e.text,
                     style: Style::default(),
                     font: Font::default(),
@@ -192,13 +204,17 @@ impl Chat {
     pub fn new(mode: Mode, delay: Duration) -> Self {
         let (mount, bridge) = spawn_app(
             delay,
-            move |replica: Rc<RefCell<Replica>>| -> Box<dyn App> {
-                match mode {
+            move |replica: Rc<RefCell<Replica>>| -> Result<Box<dyn App>, String> {
+                Ok(match mode {
                     Mode::Rust => Box::new(ChatRust),
-                    _ => Box::new(ChatJs(Vm::load(CHAT_JS, replica.clone()), replica)),
-                }
+                    Mode::Js => Box::new(ChatJs(
+                        Vm::try_load(CHAT_JS, replica.clone(), None)?,
+                        replica,
+                    )),
+                })
             },
-        );
+        )
+        .expect("chat failed to mount");
         let created = creates(&mount.ops);
         let mut tree = Tree::default();
         tree.apply(mount).expect("invalid chat mount");
@@ -369,8 +385,14 @@ impl Chat {
         max_side: usize,
         cached: Option<EditorBitmapKey>,
     ) -> EditorFrame {
+        // The chat field keeps its own 14 px text.
+        let style = TextStyle {
+            size: 14.,
+            line_height: 19.,
+            ..TextStyle::default()
+        };
         self.editor
-            .frame(&mut self.text, size, scale, max_side, cached)
+            .frame(&mut self.text, &style, size, scale, max_side, cached)
     }
     /// If the draft or selection changed, applies them to the tree and appends them to the replica's log.
     pub fn publish_input(&mut self) {

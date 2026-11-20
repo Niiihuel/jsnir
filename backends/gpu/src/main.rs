@@ -1,26 +1,90 @@
-mod app;
+#[cfg(feature = "examples")]
 mod chat;
-mod view;
+#[cfg(feature = "examples")]
 mod window;
 
+#[cfg(feature = "examples")]
 use chat::Scene;
-use jsnir::{Mode, editor::EditorEvent, host::Host, text::TextEngine};
+#[cfg(feature = "examples")]
+use jsnir::{Mode, editor::EditorEvent};
+use jsnir::{host::Host, text::TextEngine};
+use jsnir_gpu::open;
+#[cfg(feature = "examples")]
 use jsnir_gpu::renderer::{self, Renderer};
-use std::{
-    path::Path,
-    time::{Duration, Instant},
-};
+#[cfg(any(feature = "examples", feature = "stepper"))]
+use std::path::Path;
+#[cfg(feature = "examples")]
+use std::time::{Duration, Instant};
+use std::{ffi::OsString, fs, path::PathBuf};
+#[cfg(feature = "examples")]
 use winit::event_loop::EventLoop;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-const USAGE: &str = "usage: jsnir-gpu rust|js [--offscreen file.ppm]
-       jsnir-gpu stepper [--step N] [--name NAME] [--plan pro|starter] [--focus] [--offscreen file.ppm]";
+const USAGE: &str =
+    "usage: jsnir-gpu run APP.js [--title TITLE] [--size WIDTHxHEIGHT] [--offscreen file.ppm]
+       jsnir-gpu --version";
 
 fn main() -> Result<()> {
-    if std::env::args().nth(1).as_deref() == Some("stepper") {
-        return stepper(std::env::args().skip(2).collect());
+    let mut args = std::env::args_os().skip(1);
+    match args.next().as_deref().and_then(|arg| arg.to_str()) {
+        Some("--version" | "-V") => {
+            println!("jsnir-gpu {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        Some("--help" | "-h") => {
+            println!("{USAGE}");
+            #[cfg(feature = "examples")]
+            println!("       jsnir-gpu rust|js [--offscreen file.ppm]");
+            #[cfg(feature = "stepper")]
+            println!(
+                "       jsnir-gpu stepper [--step N] [--name NAME] [--plan pro|starter] [--focus] [--offscreen file.ppm]"
+            );
+            Ok(())
+        }
+        Some("run") => run_external(args),
+        #[cfg(feature = "stepper")]
+        Some("stepper") => stepper(std::env::args().skip(2).collect()),
+        #[cfg(feature = "examples")]
+        None | Some("rust" | "js") => run_chat(),
+        _ => Err(USAGE.into()),
     }
+}
+
+fn run_external(mut args: impl Iterator<Item = OsString>) -> Result<()> {
+    let source = PathBuf::from(args.next().ok_or(USAGE)?);
+    let mut title = String::from("JSNIR");
+    let mut size = [800, 600];
+    let mut output = None;
+    while let Some(flag) = args.next() {
+        let value = args.next().ok_or(USAGE)?;
+        match flag.to_str() {
+            Some("--title") => title = value.into_string().map_err(|_| "title must be UTF-8")?,
+            Some("--size") => {
+                size = value
+                    .to_str()
+                    .and_then(window_size)
+                    .ok_or("expected a positive WIDTHxHEIGHT")?
+            }
+            Some("--offscreen") => output = Some(PathBuf::from(value)),
+            _ => return Err(USAGE.into()),
+        }
+    }
+    let script =
+        fs::read_to_string(&source).map_err(|error| format!("{}: {error}", source.display()))?;
+    let host = Host::try_new(script, "{}".into(), TextEngine::default())
+        .map_err(|error| format!("{}: {error}", source.display()))?;
+    open(host, &title, size, false, output.as_deref())
+}
+
+fn window_size(value: &str) -> Option<[u32; 2]> {
+    let (width, height) = value.split_once('x')?;
+    let size = [width.parse().ok()?, height.parse().ok()?];
+    (!size.contains(&0)).then_some(size)
+}
+
+#[cfg(feature = "examples")]
+fn run_chat() -> Result<()> {
     let mode = Mode::from_args();
     let mut args = std::env::args_os().skip(2);
     if let Some(command) = args.next() {
@@ -36,6 +100,7 @@ fn main() -> Result<()> {
     app.finish()
 }
 
+#[cfg(feature = "examples")]
 fn offscreen(mode: Mode, path: &Path) -> Result<()> {
     let instance =
         wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
@@ -62,10 +127,11 @@ fn offscreen(mode: Mode, path: &Path) -> Result<()> {
     scene.chat.publish_input();
     let size = [640, 480];
     let (draws, _) = scene.draws(&renderer, size, 1., true, false);
-    renderer.capture(size, &draws, path)
+    renderer.capture(size, 1., &draws, path)
 }
 
 /// Inter, the only font of the stepper comparison (OFL, assets/fonts).
+#[cfg(feature = "stepper")]
 fn inter() -> TextEngine {
     const REGULAR: &[u8] = include_bytes!("../../../assets/fonts/Inter-Regular.ttf");
     const SEMIBOLD: &[u8] = include_bytes!("../../../assets/fonts/Inter-SemiBold.ttf");
@@ -73,6 +139,7 @@ fn inter() -> TextEngine {
 }
 
 /// The React Bits Stepper port (app/stepper.tsx), in a window or captured offscreen in a settled state.
+#[cfg(feature = "stepper")]
 fn stepper(args: Vec<String>) -> Result<()> {
     let mut state = serde_json::Map::new();
     let (mut focus, mut output) = (false, None);
@@ -96,52 +163,12 @@ fn stepper(args: Vec<String>) -> Result<()> {
         }
     }
     let state = serde_json::Value::Object(state).to_string();
-    let mut host = Host::new(jsnir::apps::STEPPER.into(), state, inter());
-    if let Some(output) = output {
-        return capture(host, focus, Path::new(&output));
-    }
-    let event_loop = EventLoop::new()?;
-    host.poll();
-    if focus {
-        host.focus_first_input();
-    }
-    let mut window = app::AppWindow::new(host, "Stepper · JSNIR", [640., 560.]);
-    event_loop.run_app(&mut window)?;
-    window.finish()
-}
-
-/// Waits until the app has answered and every transition has settled, then captures 640 × 560 at scale 1.
-fn capture(mut host: Host, focus: bool, path: &Path) -> Result<()> {
-    let instance =
-        wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-    let adapter = pollster::block_on(instance.request_adapter(&Default::default()))?;
-    let mut renderer = Renderer::new(&adapter, wgpu::TextureFormat::Rgba8Unorm)?;
-    let max_side = renderer.device.limits().max_texture_dimension_2d as usize;
-    host.hide_caret = true;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut focused = false;
-    let mut settled = 0;
-    loop {
-        host.poll();
-        if focus && !focused {
-            host.focus_first_input();
-            focused = true;
-        }
-        let frame = host.frame(640., 560., 1., max_side);
-        settled = if frame.animating || host.busy() {
-            0
-        } else {
-            settled + 1
-        };
-        if settled >= 3 {
-            break;
-        }
-        if Instant::now() > deadline {
-            return Err("the stepper did not settle within 5 s".into());
-        }
-        std::thread::sleep(Duration::from_millis(16));
-    }
-    let frame = host.frame(640., 560., 1., max_side);
-    let draws = view::View::default().draws(&mut host, &renderer, frame.items, 1.);
-    renderer.capture([640, 560], &draws, path)
+    let host = Host::new(jsnir::apps::STEPPER.into(), state, inter());
+    open(
+        host,
+        "Stepper · JSNIR",
+        [640, 560],
+        focus,
+        output.as_deref().map(Path::new),
+    )
 }

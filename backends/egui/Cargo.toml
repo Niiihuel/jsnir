@@ -5,7 +5,7 @@ edition = "2024"
 license = "MIT"
 
 [dependencies]
-jsnir = { path = "../.." }
+jsnir = { path = "../..", features = ["examples"] }
 eframe = { version = "=0.36.2", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
 egui_glow = "=0.36.2"
 glow = "0.17"

@@ -14,8 +14,8 @@ The first priorities are keeping the UI responsive when the app VM fails, preser
 3. **One host for every app.** The chat still has its own scene and window; the counter has its own runtime.
    Move both onto `host.rs` (which needs list virtualization) and delete the duplicates.
    *Done when* `backends/gpu` has one window type and the chat captures are unchanged.
-4. **Run any app, not only compiled-in ones.** `jsnir-gpu run path/to/app.tsx`, compiling with the same `tsc`
-   setup, plus live reload in the generic host (today only the chat reloads).
+4. **Develop external apps.** The engine opens an external bundle with `jsnir-gpu run path/to/app.js`.
+   Add live reload for the generic host and support for compiling larger TSX projects. [External app setup](releases.md#run-an-external-app)
 5. **Bounded queues.** The UI→app log grows until the next event; coalesce repeated `setinput` and `setrect`
    for the same node.
 

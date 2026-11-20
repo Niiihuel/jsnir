@@ -809,7 +809,7 @@ Rust keeps the history's position, computes the visible range by division and up
 The offscreen wgpu capture matches in all its 307,200 pixels between Rust and JS. It includes a sent message, the editor with a selection and the status text. It ran on OpenGL with llvmpipe. The stripped `jsnir-gpu` executable is 13.64 MB on this machine.
 
 ```sh
-cargo build --release --locked --manifest-path backends/gpu/Cargo.toml --target-dir target
+cargo build --release --locked --features examples --manifest-path backends/gpu/Cargo.toml --target-dir target
 out=$(mktemp -d)
 for mode in rust js; do
   env -u DISPLAY -u WAYLAND_DISPLAY EGL_PLATFORM=surfaceless LIBGL_ALWAYS_SOFTWARE=1 WGPU_BACKEND=gl \
@@ -840,7 +840,7 @@ The React Bits Stepper (the "onboarding" demo: four steps, a text field, a slidi
 
 ## Run the egui benchmarks
 
-Build from the repository root after installing the pinned TypeScript compiler with `npm ci`. The egui backend builds a small C wrapper for SDL2. The scripts use Python 3 and the counter's pixel comparisons use ImageMagick 7.
+Build from the repository root after setting up the pinned TypeScript compiler. The egui backend builds a small C wrapper for SDL2. The scripts use Python 3 and the counter's pixel comparisons use ImageMagick 7. [Native compiler setup](../README.md#run-the-stepper)
 
 ```sh
 cargo build --release --locked --manifest-path backends/egui/Cargo.toml --target-dir target

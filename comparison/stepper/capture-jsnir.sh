@@ -2,7 +2,7 @@
 # Captures the JSNIR port in the six spec states (offscreen wgpu, scale 1) as captures/jsnir-s1..s6.png.
 set -eu
 root=$(cd "$(dirname "$0")/../.." && pwd)
-cargo build --release --locked --manifest-path "$root/backends/gpu/Cargo.toml" --target-dir "$root/target"
+cargo build --release --locked --features stepper --manifest-path "$root/backends/gpu/Cargo.toml" --target-dir "$root/target"
 bin="$root/target/release/jsnir-gpu"
 out="$root/comparison/stepper/captures"
 tmp=$(mktemp -d)

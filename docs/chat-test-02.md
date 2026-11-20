@@ -58,8 +58,9 @@ One run per mode on this machine. During the scroll, the history was already in 
 
 ### Run the current replay
 
+Set up the TypeScript compiler from the repository root before building. [Native compiler setup](../README.md#run-the-stepper)
+
 ```bash
-npm ci
 out=$(mktemp -d "$PWD/metrics/local-chat-XXXXXX")
 python3 scripts/chat_replay.py "$out/replay"
 SDL_VIDEODRIVER=offscreen target/release/jsnir-egui rust scroll "$out/scroll-rust.csv"

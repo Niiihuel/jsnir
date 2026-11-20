@@ -20,12 +20,17 @@ pub struct Image {
 #[derive(Clone)]
 pub struct Shape {
     rect: Rect,
+    // Cuts the quad to this rectangle, axis-aligned, with the scissor.
     clip: Rect,
+    // Rounded rectangle and corner radius of an ancestor clip, anti-aliased; None for none.
+    round_clip: Option<(Rect, f32)>,
     color: Color,
     end_color: Color,
     uv: [f32; 4],
     radius: f32,
     image: Option<Image>,
+    // The mask's alpha, stretched to the rectangle it is paired with.
+    mask: Option<(Image, Rect)>,
     mode: Mode,
 }
 
@@ -69,31 +74,51 @@ impl Draw {
         Draw::Shape(Shape {
             rect,
             clip,
+            round_clip: None,
             color: top,
             end_color: bottom,
             uv: [0., 0., 1., 1.],
             radius,
             image: None,
+            mask: None,
             mode: Mode::Fill,
         })
+    }
+
+    /// Cuts the shape to the rounded rectangle `round` (rectangle and corner radius, logical pixels), anti-aliased.
+    pub fn rounded_clip(mut self, round: Option<(Rect, f32)>) -> Self {
+        if let Draw::Shape(shape) = &mut self {
+            shape.round_clip = round;
+        }
+        self
+    }
+
+    /// Multiplies the shape by the alpha of the mask, stretched to its rectangle (logical pixels). Nothing shows outside it.
+    pub fn masked(mut self, mask: Option<(Image, Rect)>) -> Self {
+        if let Draw::Shape(shape) = &mut self {
+            shape.mask = mask;
+        }
+        self
     }
 
     /// An image at its natural size, `scale` device pixels per logical pixel.
     pub fn image(image: &Image, [x, y]: [f32; 2], scale: f32, clip: Rect) -> Self {
         let [w, h] = image.size.map(|side| side as f32 / scale);
-        Self::image_in(image, [x, y, w, h], clip, WHITE)
+        Self::image_in(image, [x, y, w, h], 0., clip, WHITE)
     }
 
-    /// An image stretched to `rect`, multiplied by `tint` (straight RGBA).
-    pub fn image_in(image: &Image, rect: Rect, clip: Rect, tint: Color) -> Self {
+    /// An image stretched to `rect`, with corners rounded by `radius`, multiplied by `tint` (straight RGBA).
+    pub fn image_in(image: &Image, rect: Rect, radius: f32, clip: Rect, tint: Color) -> Self {
         Draw::Shape(Shape {
             rect,
             clip,
+            round_clip: None,
             color: tint,
             end_color: tint,
             uv: [0., 0., 1., 1.],
-            radius: 0.,
+            radius,
             image: Some(image.clone()),
+            mask: None,
             mode: Mode::Fill,
         })
     }
@@ -111,11 +136,13 @@ impl Draw {
         Draw::Shape(Shape {
             rect,
             clip,
+            round_clip: None,
             color,
             end_color: color,
             uv: [0., 0., 1., 1.],
             radius,
             image: None,
+            mask: None,
             mode: Mode::Inset { spread, offset },
         })
     }
@@ -141,11 +168,13 @@ impl Draw {
         Draw::Shape(Shape {
             rect,
             clip,
+            round_clip: None,
             color,
             end_color: color,
             uv: [0., 0., 1., 1.],
             radius: 0.,
             image: None,
+            mask: None,
             mode: Mode::Shadow {
                 element: [margin, margin, element[2], element[3]],
                 element_radius: radius,
@@ -167,6 +196,10 @@ struct Quad {
     shape: [f32; 4],
     params: [f32; 4],
     params2: [f32; 4],
+    // The rounded clip's rectangle: the scissor cuts the rectangle clip, so this slot needs no other.
+    round_clip: [f32; 4],
+    mask: [f32; 4],
+    clip_radius: f32,
 }
 
 // Offscreen texture for one nesting level of layers.
@@ -180,6 +213,8 @@ pub struct Renderer {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pipeline: wgpu::RenderPipeline,
+    // Shared by the image (group 0) and the mask (group 1) of every quad.
+    layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     format: wgpu::TextureFormat,
     white: Image,
@@ -198,9 +233,36 @@ impl Renderer {
                 ..Default::default()
             }))?;
         let shader = device.create_shader_module(wgpu::include_wgsl!("quad.wgsl"));
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("JSNIR image"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Quads"),
+            // Group 0 is the image, group 1 the mask: both use the same layout.
+            bind_group_layouts: &[Some(&layout), Some(&layout)],
+            immediate_size: 0,
+        });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Quads"),
-            layout: None,
+            layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vertex"),
@@ -209,7 +271,8 @@ impl Renderer {
                     step_mode: wgpu::VertexStepMode::Instance,
                     attributes: &wgpu::vertex_attr_array![
                         0 => Float32x4, 1 => Float32x4, 2 => Float32x4, 3 => Float32x4,
-                        4 => Float32x4, 5 => Float32x4, 6 => Float32x4
+                        4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 7 => Float32x4,
+                        8 => Float32x4, 9 => Float32
                     ],
                 })],
                 compilation_options: Default::default(),
@@ -238,12 +301,13 @@ impl Renderer {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
-        let white = Self::upload(&device, &queue, &pipeline, &sampler, [1, 1], &WHITE);
+        let white = Self::upload(&device, &queue, &layout, &sampler, [1, 1], &WHITE);
         let instances = Self::buffer(&device, 64);
         Ok(Self {
             device,
             queue,
             pipeline,
+            layout,
             sampler,
             format,
             white,
@@ -265,22 +329,40 @@ impl Renderer {
         Self::upload(
             &self.device,
             &self.queue,
-            &self.pipeline,
+            &self.layout,
             &self.sampler,
             bitmap.size,
             &bitmap.rgba,
         )
     }
 
+    /// An image from straight RGBA8 pixels. The texture is premultiplied, as the blend expects.
+    pub fn rgba_image(&self, rgba: &[u8], size: [usize; 2]) -> Image {
+        let mut premultiplied = Vec::with_capacity(rgba.len());
+        for pixel in rgba.as_chunks::<4>().0 {
+            let a = u32::from(pixel[3]);
+            premultiplied.extend(
+                pixel[..3]
+                    .iter()
+                    .map(|&c| ((u32::from(c) * a + 127) / 255) as u8),
+            );
+            premultiplied.push(pixel[3]);
+        }
+        self.image(TextBitmap {
+            size,
+            rgba: premultiplied,
+        })
+    }
+
     fn bind(
         device: &wgpu::Device,
-        pipeline: &wgpu::RenderPipeline,
+        layout: &wgpu::BindGroupLayout,
         sampler: &wgpu::Sampler,
         view: &wgpu::TextureView,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
-            layout: &pipeline.get_bind_group_layout(0),
+            layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -297,7 +379,7 @@ impl Renderer {
     fn upload(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        pipeline: &wgpu::RenderPipeline,
+        layout: &wgpu::BindGroupLayout,
         sampler: &wgpu::Sampler,
         size: [usize; 2],
         rgba: &[u8],
@@ -325,7 +407,7 @@ impl Renderer {
         );
         let bindings = Self::bind(
             device,
-            pipeline,
+            layout,
             sampler,
             &texture.create_view(&Default::default()),
         );
@@ -353,7 +435,7 @@ impl Renderer {
         });
         let bindings = Self::bind(
             &self.device,
-            &self.pipeline,
+            &self.layout,
             &self.sampler,
             &texture.create_view(&Default::default()),
         );
@@ -409,6 +491,13 @@ impl Renderer {
                     ],
                 ),
             };
+            // The mask rectangle relative to the quad; the whole quad without a mask (white texture).
+            let mask = match &shape.mask {
+                Some((_, [mx, my, mw, mh])) => {
+                    [(mx - x) * scale, (my - y) * scale, mw * scale, mh * scale]
+                }
+                None => [0., 0., w * scale, h * scale],
+            };
             Quad {
                 edges: [x_edge(x), y_edge(y), x_edge(x + w), y_edge(y + h)],
                 color: premultiply(shape.color),
@@ -417,11 +506,16 @@ impl Renderer {
                 shape: [w * scale, h * scale, shape.radius * scale, mode],
                 params,
                 params2,
+                round_clip: shape
+                    .round_clip
+                    .map_or([0.; 4], |(rect, _)| rect.map(|v| v * scale)),
+                mask,
+                clip_radius: shape.round_clip.map_or(0., |(_, radius)| radius * scale),
             }
         };
         // Commands in order; each shape keeps its instance index and scissor.
         enum Step<'a> {
-            Shape(usize, [u32; 4], &'a Option<Image>),
+            Shape(usize, [u32; 4], Option<&'a Image>, Option<&'a Image>),
             Push,
             Pop(usize),
         }
@@ -436,7 +530,13 @@ impl Renderer {
                         continue;
                     }
                     if let Some(scissor) = scissor(shape.clip, size, scale) {
-                        steps.push(Step::Shape(quads.len(), scissor, &shape.image));
+                        let mask = shape.mask.as_ref().map(|(image, _)| image);
+                        steps.push(Step::Shape(
+                            quads.len(),
+                            scissor,
+                            shape.image.as_ref(),
+                            mask,
+                        ));
                         quads.push(quad(shape));
                     }
                 }
@@ -451,11 +551,13 @@ impl Renderer {
                     quads.push(quad(&Shape {
                         rect: full,
                         clip: full,
+                        round_clip: None,
                         color: tint,
                         end_color: tint,
                         uv: [0., 0., 1., 1.],
                         radius: 0.,
                         image: None,
+                        mask: None,
                         mode: Mode::Fill,
                     }));
                 }
@@ -520,11 +622,12 @@ impl Renderer {
         let stride = size_of::<Quad>() as u64;
         for step in steps {
             match step {
-                Step::Shape(index, [x, y, w, h], image) => {
+                Step::Shape(index, [x, y, w, h], image, mask) => {
                     let offset = index as u64 * stride;
                     pass.set_vertex_buffer(0, self.instances.slice(offset..offset + stride));
                     pass.set_scissor_rect(x, y, w, h);
-                    pass.set_bind_group(0, &image.as_ref().unwrap_or(&self.white).bindings, &[]);
+                    pass.set_bind_group(0, &image.unwrap_or(&self.white).bindings, &[]);
+                    pass.set_bind_group(1, &mask.unwrap_or(&self.white).bindings, &[]);
                     pass.draw(0..4, 0..1);
                 }
                 Step::Push => {
@@ -542,6 +645,7 @@ impl Renderer {
                     pass.set_vertex_buffer(0, self.instances.slice(offset..offset + stride));
                     pass.set_scissor_rect(0, 0, size[0], size[1]);
                     pass.set_bind_group(0, &self.layers[level].bindings, &[]);
+                    pass.set_bind_group(1, &self.white.bindings, &[]);
                     pass.draw(0..4, 0..1);
                 }
             }
@@ -550,8 +654,8 @@ impl Renderer {
         self.queue.submit([encoder.finish()]);
     }
 
-    /// Draws offscreen and writes a binary PPM (`P6`) to a new file at `path`.
-    pub fn capture(&mut self, size: [u32; 2], draws: &[Draw], path: &Path) -> Result<()> {
+    /// Draws offscreen and returns the pixels row by row, `stride` bytes apart, in the renderer's format.
+    fn read(&mut self, size: [u32; 2], scale: f32, draws: &[Draw]) -> Result<(usize, Vec<u8>)> {
         let extent = extent(size);
         let target = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("JSNIR capture"),
@@ -563,7 +667,7 @@ impl Renderer {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
-        self.draw(&target, size, 1., draws);
+        self.draw(&target, size, scale, draws);
         let [width, height] = size;
         let alignment = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
         let stride = (width * 4).div_ceil(alignment) * alignment;
@@ -595,7 +699,20 @@ impl Renderer {
             });
         self.device.poll(wgpu::PollType::wait_indefinitely())?;
         receive.recv()??;
-        let pixels = buffer.slice(..).get_mapped_range()?;
+        let pixels = buffer.slice(..).get_mapped_range()?.to_vec();
+        Ok((stride as usize, pixels))
+    }
+
+    /// Draws offscreen at `scale` device pixels per logical pixel and writes a binary PPM (`P6`) to a new file at `path`.
+    pub fn capture(
+        &mut self,
+        size: [u32; 2],
+        scale: f32,
+        draws: &[Draw],
+        path: &Path,
+    ) -> Result<()> {
+        let (stride, pixels) = self.read(size, scale, draws)?;
+        let [width, height] = size;
         let bgra = matches!(self.format, wgpu::TextureFormat::Bgra8Unorm);
         let mut file = std::io::BufWriter::new(
             std::fs::OpenOptions::new()
@@ -604,7 +721,7 @@ impl Renderer {
                 .open(path)?,
         );
         write!(file, "P6\n{width} {height}\n255\n")?;
-        for row in pixels.chunks_exact(stride as usize) {
+        for row in pixels.chunks_exact(stride) {
             for pixel in row[..width as usize * 4].as_chunks::<4>().0 {
                 let rgb = if bgra {
                     [pixel[2], pixel[1], pixel[0]]
@@ -633,4 +750,77 @@ fn scissor([x, y, w, h]: Rect, [width, height]: [u32; 2], scale: f32) -> Option<
     let (x0, x1) = (start(x, width), end(x + w, width));
     let (y0, y1) = (start(y, height), end(y + h, height));
     (x1 > x0 && y1 > y0).then(|| [x0, y0, x1 - x0, y1 - y0])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The target is cleared to black, which is what an empty pixel shows.
+    const BLACK: Color = [0, 0, 0, 255];
+    const RED: Color = [255, 0, 0, 255];
+
+    fn renderer() -> Renderer {
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default()))
+            .expect("a GPU adapter");
+        Renderer::new(&adapter, wgpu::TextureFormat::Rgba8Unorm).expect("a renderer")
+    }
+
+    // The pixel at (x, y) of a frame read back with `Renderer::read`.
+    fn pixel((stride, bytes): &(usize, Vec<u8>), x: usize, y: usize) -> Color {
+        let at = y * stride + x * 4;
+        bytes[at..at + 4].try_into().unwrap()
+    }
+
+    fn assert_close(actual: Color, expected: Color) {
+        assert!(
+            actual.iter().zip(expected).all(|(a, e)| a.abs_diff(e) <= 2),
+            "{actual:?} is not {expected:?}"
+        );
+    }
+
+    #[test]
+    fn a_mask_keeps_the_box_where_its_alpha_is_one() {
+        let mut renderer = renderer();
+        // Alpha 0 inside a 10 px circle at the bottom-right corner, 1 everywhere else.
+        let rgba: Vec<u8> = (0..40 * 40)
+            .flat_map(|i| {
+                let (x, y) = ((i % 40) as f32 + 0.5, (i / 40) as f32 + 0.5);
+                let inside = (x - 30.).powi(2) + (y - 30.).powi(2) < 100.;
+                [255, 255, 255, if inside { 0 } else { 255 }]
+            })
+            .collect();
+        let mask = renderer.rgba_image(&rgba, [40, 40]);
+        let rect = [0., 0., 40., 40.];
+        let draws = [Draw::gradient(rect, rect, 0., RED, RED).masked(Some((mask, rect)))];
+        let frame = renderer.read([40, 40], 1., &draws).unwrap();
+        assert_close(pixel(&frame, 30, 30), BLACK);
+        assert_close(pixel(&frame, 20, 20), RED);
+    }
+
+    #[test]
+    fn a_rounded_clip_cuts_the_corners_of_its_children() {
+        let mut renderer = renderer();
+        let rect = [0., 0., 40., 40.];
+        // A 40 px red child in a clip of the same rectangle rounded by 20 px.
+        let draws = [Draw::gradient(rect, rect, 0., RED, RED).rounded_clip(Some((rect, 20.)))];
+        let frame = renderer.read([40, 40], 1., &draws).unwrap();
+        assert_close(pixel(&frame, 1, 1), BLACK);
+        assert_close(pixel(&frame, 20, 20), RED);
+    }
+
+    #[test]
+    fn a_square_child_of_a_rounded_clip_keeps_its_corners() {
+        let mut renderer = renderer();
+        // The parent is rounded by 20 px. Its child has a rectangular clip of its own, so its corner is
+        // not rounded: only the parent's rounded box cuts it.
+        let parent = [0., 0., 60., 60.];
+        let child = [20., 20., 30., 30.];
+        let draws = [Draw::gradient(child, child, 0., RED, RED).rounded_clip(Some((parent, 20.)))];
+        let frame = renderer.read([60, 60], 1., &draws).unwrap();
+        assert_close(pixel(&frame, 21, 21), RED);
+        assert_close(pixel(&frame, 1, 1), BLACK);
+    }
 }

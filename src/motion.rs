@@ -106,24 +106,39 @@ impl Animation {
     }
 }
 
-/// What each animated property shows, per node. Times are milliseconds on any monotonic clock.
+/// What a node animates: one of its properties, or a value the host keeps for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Channel {
+    Property(Property),
+    /// Opacity of the scrollbar thumb of a `scroll` node.
+    Thumb,
+    /// Offset of a `scroll` node while a wheel eases it to its target.
+    Scroll,
+}
+impl From<Property> for Channel {
+    fn from(property: Property) -> Self {
+        Channel::Property(property)
+    }
+}
+
+/// What each animated channel shows, per node. Times are milliseconds on any monotonic clock.
 #[derive(Default)]
 pub struct Motion {
-    targets: HashMap<(u16, Property), Value>,
-    running: HashMap<(u16, Property), Animation>,
+    targets: HashMap<(u16, Channel), Value>,
+    running: HashMap<(u16, Channel), Animation>,
 }
 impl Motion {
-    /// Sets the value a property should reach and returns what to show now. With a transition and a
+    /// Sets the value a channel should reach and returns what to show now. With a transition and a
     /// previous target, a change animates from the value currently on screen.
     pub fn show(
         &mut self,
         id: u16,
-        property: Property,
+        channel: impl Into<Channel>,
         target: Value,
         transition: Option<&Transition>,
         now: f64,
     ) -> Value {
-        let key = (id, property);
+        let key = (id, channel.into());
         match self.targets.insert(key, target) {
             Some(previous) if previous != target => match transition {
                 Some(transition) => {
@@ -162,16 +177,17 @@ impl Motion {
     pub fn start(
         &mut self,
         id: u16,
-        property: Property,
+        channel: impl Into<Channel>,
         from: Value,
         target: Value,
         transition: &Transition,
         now: f64,
     ) {
-        self.targets.insert((id, property), target);
+        let key = (id, channel.into());
+        self.targets.insert(key, target);
         let transition = transition.clone();
         self.running.insert(
-            (id, property),
+            key,
             Animation {
                 from,
                 to: target,
@@ -180,13 +196,20 @@ impl Motion {
             },
         );
     }
-    /// The target last set for a property.
-    pub fn target(&self, id: u16, property: Property) -> Option<Value> {
-        self.targets.get(&(id, property)).copied()
+    /// The target last set for a channel.
+    pub fn target(&self, id: u16, channel: impl Into<Channel>) -> Option<Value> {
+        self.targets.get(&(id, channel.into())).copied()
     }
-    /// Whether any animation is still running, so the backend keeps drawing frames.
-    pub fn animating(&self) -> bool {
-        !self.running.is_empty()
+    /// Forgets a channel's target and animation: its value is set by the host again.
+    pub fn release(&mut self, id: u16, channel: impl Into<Channel>) {
+        let key = (id, channel.into());
+        self.targets.remove(&key);
+        self.running.remove(&key);
+    }
+    /// Whether any animation is still running at `now`, so the backend keeps drawing frames. An animation
+    /// whose node is no longer walked (under a hidden node, say) is over once its time has passed.
+    pub fn animating(&self, now: f64) -> bool {
+        self.running.values().any(|a| a.at(now).is_some())
     }
     /// Drops everything about removed nodes, so a reused id starts fresh.
     pub fn forget(&mut self, ids: &[u16]) {
@@ -245,6 +268,6 @@ mod tests {
         assert!((show(&mut motion, 1., 50.) - 0.5).abs() < 1e-6);
         assert!((show(&mut motion, 1., 100.) - 0.75).abs() < 1e-6);
         assert_eq!(show(&mut motion, 1., 200.), 1.);
-        assert!(!motion.animating());
+        assert!(!motion.animating(200.));
     }
 }

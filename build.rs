@@ -1,20 +1,59 @@
-//! Compiles the TSX apps with tsc. JSX is not erasable syntax, so Node's type stripping is not enough.
+//! Compiles the optional TSX examples for source builds.
 //! TypeScript 7 dropped `outFile`: each file is emitted separately and the SDK and the app are concatenated here.
 use std::{env, fs, path::Path, process::Command};
 
+#[path = "src/typescript.rs"]
+mod typescript;
+
 fn main() {
+    let mut apps = Vec::new();
+    if cfg!(feature = "examples") {
+        apps.extend(["chat", "counter", "sharp"]);
+    }
+    if cfg!(feature = "stepper") {
+        apps.extend([
+            "stepper",
+            "hosted",
+            "images",
+            "lines",
+            "keyed",
+            "scroll",
+            "states",
+            "masks",
+            "text",
+            "fields",
+            "spans",
+            "borders",
+            "scrollbar",
+            "overlay",
+            "fill",
+        ]);
+    }
+    if apps.is_empty() {
+        println!("cargo:rerun-if-changed=build.rs");
+        return;
+    }
+
     let root = env::var("CARGO_MANIFEST_DIR").unwrap();
     let out = env::var_os("OUT_DIR").unwrap();
     let out = Path::new(&out);
-    for path in ["app/sdk.ts", "app/jsnir.d.ts", "app/tsconfig.base.json"] {
+    println!("cargo:rerun-if-env-changed=JSNIR_TSC");
+    for path in [
+        "app/sdk.ts",
+        "app/jsnir.d.ts",
+        "app/tsconfig.base.json",
+        "package-lock.json",
+    ] {
         println!("cargo:rerun-if-changed={path}");
     }
-    let tsc = Path::new(&root).join("node_modules/.bin/tsc");
+    let tsc = typescript::compiler(Path::new(&root));
     assert!(
-        tsc.exists(),
-        "TypeScript is missing: run `npm ci` at the JSNIR root"
+        tsc.is_file(),
+        "TypeScript compiler not found at {}. Set JSNIR_TSC to the native compiler or run `npm ci`.",
+        tsc.display()
     );
-    for app in ["chat", "counter", "stepper"] {
+    println!("cargo:rerun-if-changed={}", tsc.display());
+    for app in apps {
         println!("cargo:rerun-if-changed=app/{app}.tsx");
         println!("cargo:rerun-if-changed=app/tsconfig.{app}.json");
         let dir = out.join(app);

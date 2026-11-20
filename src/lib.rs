@@ -4,40 +4,84 @@
 //! applies each batch whole or rejects it, and never waits for JS to draw a frame.
 #[macro_use]
 mod contract;
+#[cfg(feature = "examples")]
 pub mod chat;
 pub mod design;
 pub mod editor;
+#[cfg(any(feature = "examples", test))]
 pub mod history;
 pub mod host;
 pub mod icons;
 mod layout;
+#[cfg(feature = "examples")]
 mod live;
+#[cfg(feature = "examples")]
 pub mod measure;
 pub mod motion;
 pub mod text;
 pub mod tree;
+#[cfg(any(feature = "examples", all(test, feature = "stepper")))]
+mod typescript;
 
-/// The TSX apps compiled at build time (SDK + app in one script).
+/// Test app for image sampling (SDK + app), for the GPU backend's tests.
+#[cfg(feature = "examples")]
+pub const SHARP_APP: &str = include_str!(concat!(env!("OUT_DIR"), "/sharp.js"));
+
+/// The Stepper comparison script compiled at build time (SDK + app in one script).
+#[cfg(feature = "stepper")]
 pub mod apps {
     pub const STEPPER: &str = include_str!(concat!(env!("OUT_DIR"), "/stepper.js"));
+    /// Test app for `Host::push` (SDK + app).
+    pub const HOSTED: &str = include_str!(concat!(env!("OUT_DIR"), "/hosted.js"));
+    /// Test app for `Host::set_image` (SDK + app).
+    pub const IMAGES: &str = include_str!(concat!(env!("OUT_DIR"), "/images.js"));
+    /// Test app for `Text` with `lines` (SDK + app).
+    pub const LINES: &str = include_str!(concat!(env!("OUT_DIR"), "/lines.js"));
+    /// Test app for `For` (SDK + app).
+    pub const KEYED: &str = include_str!(concat!(env!("OUT_DIR"), "/keyed.js"));
+    /// Test app for `scroll` (SDK + app).
+    pub const SCROLL: &str = include_str!(concat!(env!("OUT_DIR"), "/scroll.js"));
+    /// Test app for interaction states: group hover and active, transitions, `SetSource` (SDK + app).
+    pub const STATES: &str = include_str!(concat!(env!("OUT_DIR"), "/states.js"));
+    /// Test app for masks and rounded clips (SDK + app).
+    pub const MASKS: &str = include_str!(concat!(env!("OUT_DIR"), "/masks.js"));
+    /// Test app for `Text` alignment (SDK + app).
+    pub const TEXT: &str = include_str!(concat!(env!("OUT_DIR"), "/text.js"));
+    /// Test app for `TextInput` with a font, focused and unfocused (SDK + app).
+    pub const FIELDS: &str = include_str!(concat!(env!("OUT_DIR"), "/fields.js"));
+    /// Test app for rich `Text`: spans with colors, weights, underlines and an inline image (SDK + app).
+    pub const SPANS: &str = include_str!(concat!(env!("OUT_DIR"), "/spans.js"));
+    /// Test app for per-side borders (`edgeSides`) (SDK + app).
+    pub const BORDERS: &str = include_str!(concat!(env!("OUT_DIR"), "/borders.js"));
+    /// Test app for scrollbars: thumbs, auto-hide and dragging (SDK + app).
+    pub const SCROLLBAR: &str = include_str!(concat!(env!("OUT_DIR"), "/scrollbar.js"));
+    /// Test app for overlays: tooltips, popovers anchored, flipped and clamped, context presses and dismiss (SDK + app).
+    pub const OVERLAY: &str = include_str!(concat!(env!("OUT_DIR"), "/overlay.js"));
+    /// Test app for flex sizing: a grow row with a scroll column above a footer, with and without `minHeight: 0` (SDK + app).
+    pub const FILL: &str = include_str!(concat!(env!("OUT_DIR"), "/fill.js"));
 }
 
 use contract::Columns;
 use rquickjs::{CatchResultExt, Ctx, Exception, Function, function::IntoArgs};
 use std::{
     cell::RefCell,
+    rc::Rc,
+    sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel},
+    thread,
+    time::Duration,
+};
+#[cfg(feature = "examples")]
+use std::{
     collections::VecDeque,
     fs::File,
     io::{BufWriter, Write},
     path::Path,
-    rc::Rc,
-    sync::mpsc::{
-        Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, channel, sync_channel,
-    },
-    thread,
-    time::{Duration, Instant},
+    sync::mpsc::{RecvTimeoutError, TryRecvError},
+    time::Instant,
 };
-use tree::{Batch, Node, Op, Replica, Tree};
+#[cfg(feature = "examples")]
+use tree::Node;
+use tree::{Batch, Op, Replica, Tree};
 
 /// Registers a native function on a JS object and records its TypeScript signature from the same declaration.
 /// A leading `Ctx` parameter is the VM context and does not appear in the JS signature.
@@ -70,6 +114,7 @@ struct Vm {
 }
 impl Vm {
     /// The counter app (app/counter.tsx).
+    #[cfg(feature = "examples")]
     fn counter(replica: Rc<RefCell<Replica>>) -> Self {
         Self::load(
             include_str!(concat!(env!("OUT_DIR"), "/counter.js")),
@@ -178,12 +223,14 @@ impl Vm {
         let ops = std::mem::take(&mut *self.ops.borrow_mut());
         result.map(|()| ops)
     }
+    #[cfg(all(test, feature = "examples"))]
     fn call(&self, name: &str, args: impl for<'js> IntoArgs<'js>) -> Vec<Op> {
         self.try_call(name, args).unwrap_or_else(|e| panic!("{e}"))
     }
 }
 
 /// The counter as the backends see it. The ids come from the mounted tree.
+#[cfg(feature = "examples")]
 #[derive(Debug, Clone)]
 pub struct Counter {
     pub display: u16,
@@ -193,6 +240,7 @@ pub struct Counter {
 }
 
 /// Where the app logic runs.
+#[cfg(feature = "examples")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     /// Reference app in Rust, without a VM.
@@ -200,6 +248,7 @@ pub enum Mode {
     /// The TSX app in QuickJS.
     Js,
 }
+#[cfg(feature = "examples")]
 impl Mode {
     /// Reads the mode from the first command-line argument (`rust` or `js`, default `js`).
     pub fn from_args() -> Self {
@@ -212,8 +261,14 @@ impl Mode {
 }
 
 // Same tree as `Counter` in app/counter.tsx, for the mode without a VM.
+#[cfg(feature = "examples")]
 fn rust_mount() -> Batch {
-    let create = |id, parent, node| Op::Create { id, parent, node };
+    let create = |id, parent, node| Op::Create {
+        id,
+        parent,
+        before: None,
+        node,
+    };
     Batch {
         base: 0,
         ops: vec![
@@ -231,6 +286,9 @@ fn rust_mount() -> Batch {
     }
 }
 
+/// Callback id of messages from the embedding program (`Host::push`). SDK callbacks start at 1.
+pub const HOST_CALLBACK: u16 = 0;
+
 /// An event from the UI to the app. `text` carries the submitted text of a field.
 #[derive(Debug, Clone, Default)]
 pub struct Event {
@@ -240,6 +298,7 @@ pub struct Event {
 /// Message from the UI to the app thread: an event, or new code for a live reload.
 enum Inbox {
     Event(Event),
+    #[cfg(feature = "examples")]
     Reload(String),
 }
 /// Ordered log from the UI to the app thread's replica.
@@ -258,11 +317,12 @@ const MAX_PENDING: u16 = 64;
 
 /// App logic running on its own thread: JS in a VM, or Rust in reference mode.
 trait App {
-    fn mount(&mut self) -> Vec<Op>;
+    fn mount(&mut self) -> Result<Vec<Op>, String>;
     fn handle(&mut self, event: Event, view: &Tree) -> Vec<Op>;
     /// The view changed in these nodes (or in all of them with `None`). JS apps copy it to their columns.
     fn sync(&mut self, _view: &Tree, _ids: Option<&[u16]>) {}
     /// Replaces the app code and returns the new mount. On failure the previous app keeps running.
+    #[cfg(feature = "examples")]
     fn reload(&mut self, _js: &str) -> Result<Vec<Op>, String> {
         Err("this app does not support live reload".into())
     }
@@ -282,22 +342,32 @@ fn touched(ops: &[Op]) -> Vec<u16> {
 /// App thread: mounts the view, keeps the replica up to date with the log, and answers each event with a batch.
 fn spawn_app(
     delay: Duration,
-    make: impl FnOnce(Rc<RefCell<Replica>>) -> Box<dyn App> + Send + 'static,
-) -> (Batch, Bridge) {
-    let (init, boot) = sync_channel(1);
+    make: impl FnOnce(Rc<RefCell<Replica>>) -> Result<Box<dyn App>, String> + Send + 'static,
+) -> Result<(Batch, Bridge), String> {
+    let (init, boot) = sync_channel::<Result<Batch, String>>(1);
     let (events, rx) = sync_channel::<Inbox>(MAX_PENDING.into());
     let (tx, updates) = sync_channel(MAX_PENDING.into());
     let (log, entries) = channel();
     thread::spawn(move || {
         let replica: Rc<RefCell<Replica>> = Rc::default();
-        let mut app = make(replica.clone());
-        let mount = Batch {
-            base: 0,
-            ops: app.mount(),
+        let start = || {
+            let mut app = make(replica.clone())?;
+            let mount = Batch {
+                base: 0,
+                ops: app.mount()?,
+            };
+            replica.borrow_mut().produced(&mount)?;
+            app.sync(&replica.borrow().view, None);
+            Ok((app, mount))
         };
-        let _ = replica.borrow_mut().produced(&mount);
-        app.sync(&replica.borrow().view, None);
-        if init.send(mount).is_err() {
+        let (mut app, mount) = match start() {
+            Ok(mounted) => mounted,
+            Err(error) => {
+                let _ = init.send(Err(error));
+                return;
+            }
+        };
+        if init.send(Ok(mount)).is_err() {
             return;
         }
         for message in rx {
@@ -321,6 +391,7 @@ fn spawn_app(
             let ops = match message {
                 Inbox::Event(event) => app.handle(event, &replica.borrow().view),
                 // The new app replaces the old one in a single batch: remove the root, then mount.
+                #[cfg(feature = "examples")]
                 Inbox::Reload(js) => match app.reload(&js) {
                     Ok(mount) => {
                         let root = replica.borrow().view.root;
@@ -352,21 +423,23 @@ fn spawn_app(
             }
         }
     });
-    let mount = boot.recv().expect("app failed to mount");
-    (
+    let mount = boot.recv().map_err(|_| "app thread failed to start")??;
+    Ok((
         mount,
         Bridge {
             events,
             updates,
             log,
         },
-    )
+    ))
 }
 
+#[cfg(feature = "examples")]
 struct CounterJs(Vm);
+#[cfg(feature = "examples")]
 impl App for CounterJs {
-    fn mount(&mut self) -> Vec<Op> {
-        self.0.call("jsnirMount", ())
+    fn mount(&mut self) -> Result<Vec<Op>, String> {
+        self.0.try_call("jsnirMount", ())
     }
     fn handle(&mut self, e: Event, _: &Tree) -> Vec<Op> {
         or_log(self.0.try_call("jsnirEvent", (e.callback, e.text)))
@@ -382,6 +455,7 @@ pub fn dts() -> String {
 }
 
 // One row per event: event → node → batch → version → first frame drawn after the batch.
+#[cfg(feature = "examples")]
 struct Trace {
     out: BufWriter<File>,
     start: Instant,
@@ -390,6 +464,7 @@ struct Trace {
     waiting: VecDeque<(u64, u128, u64)>,
     unframed: Vec<String>,
 }
+#[cfg(feature = "examples")]
 impl Trace {
     fn us(&self) -> u128 {
         self.start.elapsed().as_micros()
@@ -419,6 +494,7 @@ impl Trace {
 }
 
 /// The counter runtime used by the benchmark backends.
+#[cfg(feature = "examples")]
 pub struct Runtime {
     pub view: Counter,
     tree: Tree,
@@ -429,6 +505,7 @@ pub struct Runtime {
     budget: Duration,
     last_activation: Option<Instant>,
 }
+#[cfg(feature = "examples")]
 impl Runtime {
     /// Reads `JSNIR_DELAY_MS` (JS callback delay), `JSNIR_WAIT_US` (poll budget) and `JSNIR_TRACE` (new trace CSV).
     pub fn new(mode: Mode) -> Self {
@@ -449,8 +526,10 @@ impl Runtime {
         let (mount, bridge) = match mode {
             Mode::Rust => (rust_mount(), None),
             Mode::Js => {
-                let (mount, bridge) =
-                    spawn_app(delay, |replica| Box::new(CounterJs(Vm::counter(replica))));
+                let (mount, bridge) = spawn_app(delay, |replica| {
+                    Ok(Box::new(CounterJs(Vm::counter(replica))))
+                })
+                .expect("counter failed to mount");
                 (mount, Some(bridge))
             }
         };
@@ -606,6 +685,7 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "examples")]
     #[test]
     fn ordered_burst_and_wrap() {
         for mode in [Mode::Js, Mode::Rust] {
@@ -640,16 +720,41 @@ mod tests {
             "app/jsnir.d.ts is stale: JSNIR_UPDATE=1 cargo test contract"
         );
     }
+    #[cfg(any(feature = "examples", feature = "stepper"))]
     #[test]
     fn contract_typescript_apps_typecheck() {
         // Apps are checked against the generated .d.ts: using a contract that Rust does not offer fails to compile.
         let root = env!("CARGO_MANIFEST_DIR");
-        let tsc = Path::new(root).join("node_modules/.bin/tsc");
+        let tsc = typescript::compiler(std::path::Path::new(root));
         assert!(
-            tsc.exists(),
-            "TypeScript is missing: run `npm ci` at the JSNIR root"
+            tsc.is_file(),
+            "TypeScript compiler not found at {}. Set JSNIR_TSC or run `npm ci`.",
+            tsc.display()
         );
-        for app in ["chat", "counter", "stepper"] {
+        let mut apps = Vec::new();
+        if cfg!(feature = "examples") {
+            apps.extend(["chat", "counter"]);
+        }
+        if cfg!(feature = "stepper") {
+            apps.extend([
+                "stepper",
+                "hosted",
+                "images",
+                "lines",
+                "keyed",
+                "scroll",
+                "states",
+                "masks",
+                "text",
+                "fields",
+                "spans",
+                "borders",
+                "scrollbar",
+                "overlay",
+                "fill",
+            ]);
+        }
+        for app in apps {
             let out = std::process::Command::new(&tsc)
                 .args(["-p", &format!("{root}/app/tsconfig.{app}.json")])
                 .output()
@@ -661,12 +766,15 @@ mod tests {
             );
         }
     }
+    #[cfg(feature = "examples")]
     fn mount(vm: &Vm) -> Vec<Op> {
         vm.call("jsnirMount", ())
     }
+    #[cfg(feature = "examples")]
     fn event(vm: &Vm, callback: u16, text: &str) -> Vec<Op> {
         vm.call("jsnirEvent", (callback, text.to_owned()))
     }
+    #[cfg(feature = "examples")]
     #[test]
     fn counter_emits_one_set_per_click_and_keeps_the_button() {
         let vm = Vm::counter(Rc::default());
@@ -679,6 +787,7 @@ mod tests {
             assert_eq!(event(&vm, 1, ""), vec![Op::Set { id: 2, value }]);
         }
     }
+    #[cfg(feature = "examples")]
     #[test]
     fn chat_emits_exactly_one_create_and_one_status_update() {
         let replica: Rc<RefCell<Replica>> = Rc::default();
@@ -711,7 +820,11 @@ mod tests {
                 Op::Create {
                     id: 6,
                     parent: Some(3),
+                    before: None,
                     node: Node::Text {
+                        lines: None,
+                        align: Default::default(),
+                        spans: None,
                         text: "Hello".into(),
                         style: Default::default(),
                         font: Default::default(),
@@ -725,6 +838,7 @@ mod tests {
             ]
         );
     }
+    #[cfg(feature = "examples")]
     #[test]
     fn js_reads_the_layout_from_columns_without_crossing() {
         let replica: Rc<RefCell<Replica>> = Rc::default();
@@ -773,6 +887,7 @@ mod tests {
         });
         assert_eq!(read, vec![16, 430, 608, 34, 398]);
     }
+    #[cfg(feature = "examples")]
     #[test]
     fn signal_writes_within_an_event_are_batched_and_bad_batches_rejected() {
         let sdk = include_str!(concat!(env!("OUT_DIR"), "/counter/sdk.js"));
@@ -801,6 +916,7 @@ mod tests {
             "an invalid batch leaves no operations"
         );
     }
+    #[cfg(feature = "examples")]
     #[test]
     fn fast_answer_lands_in_the_same_poll_and_slow_one_does_not_block() {
         let mut r = Runtime::with_delay(Mode::Js, Duration::ZERO);
@@ -830,6 +946,7 @@ mod tests {
             "past the deadline, poll does not wait"
         );
     }
+    #[cfg(feature = "examples")]
     #[test]
     fn slow_callback_keeps_drawing_and_traces_each_click() {
         let path = std::env::temp_dir().join(format!("jsnir-trace-{}.csv", std::process::id()));

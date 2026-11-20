@@ -6,7 +6,7 @@
 //! draws only the visible ones. Per Taffy's benchmark, layout costs ≈ 0.25–0.47 µs per node; 10,000
 //! rows would take more than half a frame at 120 Hz.
 use crate::{
-    text::{TextEngine, TextStyle, WRAP_SLACK},
+    text::{TextEngine, TextStyle, WRAP_SLACK, node_spans},
     tree::{Align, Axis, Justify, Node, Position, Tree},
 };
 use std::collections::HashMap;
@@ -24,6 +24,8 @@ pub struct Layout {
     viewport: Option<(f32, f32)>,
     // Heights currently pinned by an animation, so they can be released when it ends.
     pinned: HashMap<u16, f32>,
+    // Content height of each scroll node in the last computed layout.
+    content: HashMap<u16, f32>,
 }
 impl Default for Layout {
     fn default() -> Self {
@@ -37,6 +39,7 @@ impl Default for Layout {
             root: None,
             viewport: None,
             pinned: HashMap::new(),
+            content: HashMap::new(),
         }
     }
 }
@@ -51,13 +54,39 @@ fn edges<T>(sides: [f32; 4], make: impl Fn(f32) -> T) -> Rect<T> {
     }
 }
 
-fn taffy_style(node: &Node) -> taffy::Style {
+// Children of a scroll node keep their natural size: Taffy would shrink them to fit the box.
+fn in_scroll(tree: &Tree, id: u16) -> bool {
+    tree.parent(id)
+        .and_then(|p| tree.nodes.get(&p))
+        .and_then(Node::style)
+        .is_some_and(|s| s.scroll)
+}
+
+// A fixed node is a Taffy root of its own: it is not a child of its parent's Taffy node, so the parent's
+// layout ignores it, and it is laid out in `compute` at the size its own style and content give it.
+fn is_fixed(node: &Node) -> bool {
+    node.style().is_some_and(|s| s.position == Position::Fixed)
+}
+fn detached(tree: &Tree, id: u16) -> bool {
+    tree.nodes.get(&id).is_some_and(is_fixed)
+}
+
+fn taffy_style(node: &Node, in_scroll: bool) -> taffy::Style {
     let mut out = taffy::Style::default();
     if let Some(s) = node.style() {
         let side = |v: Option<f32>| v.map_or(Dimension::auto(), length);
         out.size = Size {
             width: side(s.width),
             height: side(s.height),
+        };
+        let limit = |v: Option<f32>| v.map_or(auto(), LengthPercentageAuto::length);
+        out.min_size = Size {
+            width: limit(s.min_width),
+            height: limit(s.min_height),
+        };
+        out.max_size = Size {
+            width: limit(s.max_width),
+            height: limit(s.max_height),
         };
         if let Node::Icon { size, .. } = node {
             out.size = Size {
@@ -66,7 +95,11 @@ fn taffy_style(node: &Node) -> taffy::Style {
             };
         }
         out.flex_grow = s.grow;
-        out.flex_shrink = s.shrink.unwrap_or(1.);
+        out.flex_shrink = if in_scroll {
+            0.
+        } else {
+            s.shrink.unwrap_or(1.)
+        };
         out.flex_basis = side(s.basis);
         out.padding = edges(s.padding.sides(), LengthPercentage::length);
         out.margin = edges(s.margin.sides(), LengthPercentageAuto::length);
@@ -95,11 +128,15 @@ fn taffy_style(node: &Node) -> taffy::Style {
                 bottom: auto(),
             };
         }
-        if s.clip {
-            // As CSS `overflow: hidden`: the node may shrink below its content.
+        if s.clip || s.scroll {
+            // As CSS `overflow: hidden`: the node may shrink below its content. A scroll node scrolls vertically.
             out.overflow = taffy::Point {
                 x: taffy::Overflow::Hidden,
-                y: taffy::Overflow::Hidden,
+                y: if s.scroll {
+                    taffy::Overflow::Scroll
+                } else {
+                    taffy::Overflow::Hidden
+                },
             };
         }
         out.flex_direction = match (node, s.direction) {
@@ -126,7 +163,7 @@ impl Layout {
                 None => return,
             },
         };
-        let style = taffy_style(node);
+        let style = taffy_style(node, in_scroll(tree, id));
         let t = if matches!(node, Node::Text { .. }) {
             self.taffy.new_leaf_with_context(style, id)
         } else {
@@ -139,11 +176,13 @@ impl Layout {
         }
         self.nodes[i] = Some(t);
         match parent {
+            Some(_) if is_fixed(node) => {}
             Some(p) => self.taffy.add_child(p, t).expect("taffy: child"),
             None => self.root = Some(id),
         }
     }
     /// Lays out a whole tree, for when its structure changed (for example, after an app reload).
+    #[cfg(feature = "examples")]
     pub fn from_tree(tree: &Tree) -> Self {
         let mut layout = Self::default();
         let mut stack: Vec<(u16, Option<u16>)> = tree.root.map(|r| (r, None)).into_iter().collect();
@@ -168,10 +207,41 @@ impl Layout {
             }
         }
     }
-    /// The node's style changed.
+    /// The children of `parent` changed order: Taffy takes the tree's order. Lists keep their rows out of Taffy.
+    pub fn reordered(&mut self, tree: &Tree, parent: u16) {
+        let Some(t) = self.get(parent) else {
+            return;
+        };
+        if matches!(tree.nodes.get(&parent), Some(Node::List { .. })) {
+            return;
+        }
+        let children: Vec<NodeId> = tree
+            .children(parent)
+            .iter()
+            .filter(|c| !detached(tree, **c))
+            .filter_map(|c| self.get(*c))
+            .collect();
+        self.taffy
+            .set_children(t, &children)
+            .expect("taffy: children");
+    }
+    /// The node's style changed. A scroll node's children change with it: their flex-shrink depends on it.
     pub fn restyled(&mut self, tree: &Tree, id: u16) {
+        self.restyle(tree, id);
+        if tree
+            .nodes
+            .get(&id)
+            .and_then(Node::style)
+            .is_some_and(|s| s.scroll)
+        {
+            for &child in tree.children(id) {
+                self.restyle(tree, child);
+            }
+        }
+    }
+    fn restyle(&mut self, tree: &Tree, id: u16) {
         if let (Some(node), Some(t)) = (tree.nodes.get(&id), self.get(id)) {
-            let mut style = taffy_style(node);
+            let mut style = taffy_style(node, in_scroll(tree, id));
             if Some(id) == self.root
                 && let Some((width, height)) = self.viewport
             {
@@ -212,6 +282,24 @@ impl Layout {
             }
         }
     }
+    /// Content height of a scroll node in the last layout, in logical pixels.
+    pub fn content_height(&self, id: u16) -> f32 {
+        self.content.get(&id).copied().unwrap_or(0.)
+    }
+    // The fixed nodes below `root`, at any depth: each one is a Taffy root. Lists keep their rows out of the layout.
+    fn fixed_nodes(&self, tree: &Tree, root: u16) -> Vec<u16> {
+        let mut out = Vec::new();
+        let mut stack = vec![root];
+        while let Some(id) = stack.pop() {
+            if id != root && detached(tree, id) && self.get(id).is_some() {
+                out.push(id);
+            }
+            if !matches!(tree.nodes.get(&id), Some(Node::List { .. })) {
+                stack.extend(tree.children(id));
+            }
+        }
+        out
+    }
     /// Computes the layout for the window size and returns the absolute rectangles that changed.
     /// Taffy caches per node: if nothing changed, the previous result is reused.
     pub fn compute(
@@ -237,43 +325,75 @@ impl Layout {
                 .expect("taffy: style");
             self.viewport = Some((width, height));
         }
-        let space = Size {
+        let window = Size {
             width: AvailableSpace::Definite(width),
             height: AvailableSpace::Definite(height),
         };
-        self.taffy
-            .compute_layout_with_measure(root_node, space, |input, _, id, style| {
-                taffy::compute_leaf_layout(
-                    input,
-                    style,
-                    |_, _| 0.,
-                    |known, available| {
-                        let Some(Node::Text {
-                            text: value, font, ..
-                        }) = id.as_ref().and_then(|id| tree.nodes.get(id))
-                        else {
-                            return Size::ZERO;
-                        };
-                        let width = known.width.or(match available.width {
-                            AvailableSpace::Definite(width) => Some(width),
-                            AvailableSpace::MinContent => Some(1.),
-                            AvailableSpace::MaxContent => None,
-                        });
-                        // A hair of slack, so a line laid out in exactly its measured width never wraps on rounding.
-                        let [width, height] = text.measure_styled(
-                            value,
-                            width.map(|w| w + WRAP_SLACK),
-                            TextStyle::resolve(font),
-                        );
-                        Size { width, height }
-                    },
-                )
-            })
-            .expect("taffy: layout");
-        // Taffy gives each position relative to the parent: accumulate from the root.
+        // A fixed node takes its own style's size, or its content's (max-content) where the style sets none.
+        let fixed = self.fixed_nodes(tree, root);
+        let mut roots = vec![(root_node, window)];
+        for &id in &fixed {
+            let style = tree.nodes.get(&id).and_then(Node::style);
+            let side =
+                |v: Option<f32>| v.map_or(AvailableSpace::MaxContent, AvailableSpace::Definite);
+            let space = Size {
+                width: side(style.and_then(|s| s.width)),
+                height: side(style.and_then(|s| s.height)),
+            };
+            roots.push((self.get(id).expect("fixed node in the layout"), space));
+        }
+        for (node, space) in roots {
+            self.taffy
+                .compute_layout_with_measure(node, space, |input, _, id, style| {
+                    taffy::compute_leaf_layout(
+                        input,
+                        style,
+                        |_, _| 0.,
+                        |known, available| {
+                            let Some(Node::Text {
+                                text: value,
+                                font,
+                                lines,
+                                spans,
+                                ..
+                            }) = id.as_ref().and_then(|id| tree.nodes.get(id))
+                            else {
+                                return Size::ZERO;
+                            };
+                            let width = known.width.or(match available.width {
+                                AvailableSpace::Definite(width) => Some(width),
+                                AvailableSpace::MinContent => Some(1.),
+                                AvailableSpace::MaxContent => None,
+                            });
+                            let style = TextStyle::resolve(font);
+                            // Measures the text the node draws: cut to its line limit at this width.
+                            let runs = node_spans(value, spans.as_deref());
+                            let cut;
+                            let runs = match (lines, width) {
+                                (Some(lines), Some(width)) => {
+                                    cut = text.limit_lines(&runs, width, *lines, &style);
+                                    cut.as_slice()
+                                }
+                                _ => &runs[..],
+                            };
+                            // A hair of slack, so a line laid out in exactly its measured width never wraps on rounding.
+                            let [width, height] =
+                                text.measure_styled(runs, width.map(|w| w + WRAP_SLACK), &style);
+                            Size { width, height }
+                        },
+                    )
+                })
+                .expect("taffy: layout");
+        }
+        // Taffy gives each position relative to the parent: accumulate from each root.
         let mut rects: HashMap<u16, [f32; 4]> = HashMap::new();
         let mut follows = Vec::new();
-        let mut stack = vec![(root, 0.0, 0.0)];
+        // Scroll nodes, with their bottom padding: their content height is read below.
+        let mut scrolls = Vec::new();
+        let mut stack: Vec<(u16, f32, f32)> = std::iter::once(root)
+            .chain(fixed)
+            .map(|id| (id, 0., 0.))
+            .collect();
         while let Some((id, px, py)) = stack.pop() {
             let l = self
                 .taffy
@@ -294,11 +414,19 @@ impl Layout {
             {
                 follows.push((id, target));
             }
+            if let Some(s) = tree
+                .nodes
+                .get(&id)
+                .and_then(Node::style)
+                .filter(|s| s.scroll)
+            {
+                scrolls.push((id, s.padding.sides()[2]));
+            }
             if !matches!(tree.nodes.get(&id), Some(Node::List { .. })) {
                 stack.extend(
                     tree.children(id)
                         .iter()
-                        .filter(|c| self.get(**c).is_some())
+                        .filter(|c| self.get(**c).is_some() && !detached(tree, **c))
                         .map(|&c| (c, rect[0], rect[1])),
                 );
             }
@@ -308,6 +436,19 @@ impl Layout {
             if let Some(&rect) = rects.get(&target) {
                 rects.insert(id, rect);
             }
+        }
+        // Content height: from the top of the scroll node to its lowest child, plus the bottom padding.
+        self.content.clear();
+        for (id, padding) in scrolls {
+            let top = rects[&id][1];
+            let bottom = tree
+                .children(id)
+                .iter()
+                .filter(|c| !detached(tree, **c))
+                .filter_map(|c| rects.get(c))
+                .map(|r| r[1] + r[3])
+                .fold(top, f32::max);
+            self.content.insert(id, bottom - top + padding);
         }
         let mut changed: Vec<(u16, [f32; 4])> = rects
             .into_iter()

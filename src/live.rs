@@ -2,6 +2,7 @@
 //! and hands over the new script. If it fails to compile or has type errors, nothing reloads and the app
 //! keeps running as it was.
 //! shortcut: polls modification times every 250 ms instead of using inotify; enough for development.
+use crate::typescript;
 use std::{
     fs,
     path::Path,
@@ -55,7 +56,7 @@ pub(crate) fn watch(app: &'static str) -> Receiver<String> {
 // Same as build.rs: tsc emits the SDK and the app separately (TypeScript 7 has no outFile) and they are concatenated.
 fn compile(root: &str, app: &str) -> Result<String, String> {
     let out = std::env::temp_dir().join(format!("jsnir-live-{}-{app}", std::process::id()));
-    let tsc = Path::new(root).join("node_modules/.bin/tsc");
+    let tsc = typescript::compiler(Path::new(root));
     let result = Command::new(&tsc)
         .args([
             "-p",

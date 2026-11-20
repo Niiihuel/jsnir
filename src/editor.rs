@@ -1,8 +1,8 @@
 //! Single-line editor shared by the backends. Internal indices are UTF-8 byte offsets.
-use crate::text::{METRICS, TextBitmap, TextEngine};
+use crate::text::{TextBitmap, TextEngine, TextStyle, attrs, metrics};
 use cosmic_text::{
-    Action, Affinity, Attrs, AttrsList, Buffer, BufferLine, BufferRef, Change, Cursor, Edit,
-    Editor, LayoutGlyph, LayoutRun, LineEnding, Motion, Selection, Shaping, Wrap,
+    Action, Affinity, AttrsList, Buffer, BufferLine, BufferRef, Change, Cursor, Edit, Editor,
+    FontSystem, LayoutGlyph, LayoutRun, LineEnding, Motion, Selection, Shaping,
 };
 use std::{borrow::Cow, ops::Range};
 use unicode_segmentation::UnicodeSegmentation;
@@ -112,6 +112,8 @@ struct Preedit {
 
 pub struct LineEditor {
     inner: Editor<'static>,
+    // Style the text is shaped in: the field's font.
+    style: TextStyle,
     preedit: Option<Preedit>,
     preview: Option<Buffer>,
     undo: Vec<EditRecord>,
@@ -123,7 +125,8 @@ pub struct LineEditor {
 impl Default for LineEditor {
     fn default() -> Self {
         Self {
-            inner: empty_editor(""),
+            inner: empty_editor("", &TextStyle::default()),
+            style: TextStyle::default(),
             preedit: None,
             preview: None,
             undo: Vec::new(),
@@ -142,6 +145,33 @@ impl LineEditor {
         buffer
     }
 
+    fn buffer_mut(&mut self) -> &mut Buffer {
+        let BufferRef::Owned(buffer) = self.inner.buffer_ref_mut() else {
+            unreachable!()
+        };
+        buffer
+    }
+
+    /// Shapes the text again: the fonts changed, so the glyphs and the bitmap are stale.
+    pub fn fonts_changed(&mut self) {
+        for line in &mut self.buffer_mut().lines {
+            line.reset();
+        }
+        self.invalidate();
+    }
+
+    // Shapes the text in `style`, which the field's font names.
+    fn set_style(&mut self, fonts: &mut FontSystem, style: &TextStyle) {
+        self.style = style.clone();
+        let list = AttrsList::new(&attrs(style));
+        let buffer = self.buffer_mut();
+        buffer.set_metrics(fonts, metrics(style));
+        for line in &mut buffer.lines {
+            line.set_attrs_list(list.clone());
+        }
+        self.fonts_changed();
+    }
+
     pub fn text(&self) -> &str {
         self.buffer().lines[0].text()
     }
@@ -155,7 +185,7 @@ impl LineEditor {
 
     pub fn reset(&mut self, text: &str, [anchor, head]: [u32; 2]) {
         let text = single_line(text);
-        self.inner = empty_editor(&text);
+        self.inner = empty_editor(&text, &self.style);
         let anchor = Cursor::new(0, byte_at(&text, anchor as usize));
         let head = Cursor::new(0, byte_at(&text, head as usize));
         self.inner.set_cursor(head);
@@ -427,7 +457,7 @@ impl LineEditor {
                 if let EditorEvent::Point { x, select } = *event {
                     self.inner.shape_as_needed(engine.fonts(), false);
                     let x = x + self.scroll_x;
-                    if let Some(mut cursor) = self.buffer().hit(x, METRICS.line_height / 2.) {
+                    if let Some(mut cursor) = self.buffer().hit(x, self.style.line_height / 2.) {
                         cursor.index = grapheme_edge(
                             self.text(),
                             cursor.index,
@@ -479,11 +509,25 @@ impl LineEditor {
     pub fn frame(
         &mut self,
         engine: &mut TextEngine,
+        style: &TextStyle,
         size: [f32; 2],
         scale: f32,
         max_side: usize,
         cached: Option<EditorBitmapKey>,
     ) -> EditorFrame {
+        // Color and alignment do not change the shaping: only the fields that do re-shape the text.
+        let shaping = |s: &TextStyle| {
+            (
+                s.size,
+                s.line_height,
+                s.weight,
+                s.letter_spacing,
+                s.family.clone(),
+            )
+        };
+        if shaping(&self.style) != shaping(style) {
+            self.set_style(engine.fonts(), style);
+        }
         let width = size[0].max(0.);
         let (cursor, selected, composition) = if let Some(preedit) = &self.preedit {
             let replace = self.selected_bytes();
@@ -492,7 +536,7 @@ impl LineEditor {
             if self.preview.is_none() {
                 let mut display = self.text().to_owned();
                 display.replace_range(replace, &preedit.text);
-                self.preview = Some(engine.shape(&display, None, Wrap::None));
+                self.preview = Some(engine.shape(&display, &self.style));
             }
             let selected = preedit
                 .active
@@ -549,19 +593,19 @@ impl LineEditor {
                 .preedit
                 .as_ref()
                 .is_none_or(|preedit| preedit.active.is_some()),
-            line_height: METRICS.line_height,
+            line_height: self.style.line_height,
             selection,
             composition,
         }
     }
 }
 
-fn empty_editor(text: &str) -> Editor<'static> {
-    let mut buffer = Buffer::new_empty(METRICS);
+fn empty_editor(text: &str, style: &TextStyle) -> Editor<'static> {
+    let mut buffer = Buffer::new_empty(metrics(style));
     buffer.lines.push(BufferLine::new(
         text,
         LineEnding::None,
-        AttrsList::new(&Attrs::new()),
+        AttrsList::new(&attrs(style)),
         Shaping::Advanced,
     ));
     Editor::new(buffer)

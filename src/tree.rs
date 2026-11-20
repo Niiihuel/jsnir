@@ -20,8 +20,35 @@ contract_strings! {
     pub enum Justify as "Justify" { Start, Center, End, Between }
 }
 contract_strings! {
-    /// `absolute` takes the node out of the flow; `left` and `top` place it inside its parent.
-    pub enum Position as "Position" { Relative, Absolute }
+    /// `absolute` takes the node out of the flow; `left` and `top` place it inside its parent. `fixed` also
+    /// leaves the flow, but it is placed in window coordinates, outside its ancestors' clips and scrolls, and
+    /// `anchor` places it. Set at creation: a `SetStyle` cannot change it.
+    pub enum Position as "Position" { Relative, Absolute, Fixed }
+}
+contract_strings! {
+    /// Side of the anchor node a fixed node is placed on.
+    pub enum Side as "Side" { Top, Right, Bottom, Left }
+}
+contract_strings! {
+    /// Alignment of a fixed node along the side of its anchor: at its start, center or end.
+    pub enum AnchorAlign as "AnchorAlign" { Start, Center, End }
+}
+contract_struct! {
+    /// Places a `fixed` node next to the on-screen rectangle of another node, recomputed every frame. `gap` is
+    /// the distance from that rectangle. If `flip` and the node would overflow the window on `side` while the
+    /// opposite side fits, it goes on the opposite side. Then it is clamped inside the window, 8 px from its edges.
+    /// The anchor must exist when the node is created or restyled; if it is removed later, the node is hidden.
+    pub struct Anchor as "Anchor" {
+        node: u16,
+        side: Side,
+        align: AnchorAlign,
+        gap: f32,
+        flip: bool,
+    }
+}
+contract_strings! {
+    /// Alignment of the lines of a `Text` inside its width (CSS `text-align`; start is the default).
+    pub enum TextAlign as "TextAlign" { Start, Center, End }
 }
 
 /// Space around the four sides: one number for all of them, or `[top, right, bottom, left]` as in CSS.
@@ -75,9 +102,24 @@ contract_struct! {
         top: Option<f32>,
         /// Clips the children to the node's rectangle (CSS `overflow: hidden`).
         clip: bool,
+        /// Scrolls its content vertically with the wheel when it is taller than the box. Implies `clip`.
+        scroll: bool,
+        /// Hover and press of this node also set the hover and active states of its descendants, like CSS `.group:hover .child`.
+        group: bool,
         /// An absolute node that takes the rectangle of another node (relative to its own parent).
         /// Moving it from one target to another animates with its `x` and `width` transitions.
         follow: Option<u16>,
+        /// Stacking order: the node and its descendants are drawn above the lower layers, in ascending order and
+        /// in document order within one layer. Unset: 0, or 1 for a `fixed` node.
+        layer: Option<i32>,
+        /// For a `fixed` node: the node it is placed next to.
+        anchor: Option<Anchor>,
+        /// Smallest and largest sizes in logical pixels (CSS `min-width`, `max-width`...). A `scroll` or `clip` node
+        /// is not held at its content's size by a flex parent unless it sets a minimum, as in CSS.
+        min_width: Option<f32>,
+        min_height: Option<f32>,
+        max_width: Option<f32>,
+        max_height: Option<f32>,
     }
 }
 impl Style {
@@ -92,8 +134,13 @@ impl Style {
             .chain(self.shrink)
             .chain(self.basis)
             .chain(p)
+            .chain(self.min_width)
+            .chain(self.min_height)
+            .chain(self.max_width)
+            .chain(self.max_height)
             .all(positive)
             && m.into_iter().chain(self.left).chain(self.top).all(finite)
+            && self.anchor.as_ref().is_none_or(|a| a.gap.is_finite())
     }
 }
 
@@ -134,9 +181,18 @@ contract_struct! {
     /// Paint overrides for an interaction state. Rust applies them without asking JS.
     pub struct Variant as "Variant" {
         background: Option<u32>,
+        gradient: Option<[u32; 2]>,
         brightness: Option<f32>,
         scale: Option<f32>,
+        opacity: Option<f32>,
+        x: Option<f32>,
+        y: Option<f32>,
+        color: Option<u32>,
         edge: Option<u32>,
+        /// Layout height, animated by the `height` transition like the node's own.
+        height: Option<f32>,
+        /// Visual width, animated by the `width` transition.
+        width: Option<f32>,
     }
 }
 contract_struct! {
@@ -150,15 +206,40 @@ contract_struct! {
     }
 }
 contract_struct! {
+    /// A thin scrollbar of a `scroll` node whose content is taller than its box. Lengths are logical pixels;
+    /// colors are `0xRRGGBBAA`.
+    pub struct Scrollbar as "Scrollbar" {
+        /// Width of the track and the thumb.
+        width: f32,
+        /// Color of the thumb, which is as long as the visible share of the content, at least `minThumb`.
+        thumb: u32,
+        /// Color of the track along the right edge. None: no track.
+        track: Option<u32>,
+        /// Corner radius of the track and the thumb.
+        radius: f32,
+        /// Shortest the thumb gets, however much content there is.
+        min_thumb: f32,
+        /// Gap between the bar and the node's right, top and bottom edges.
+        inset: f32,
+        /// Shows the bar only while the pointer is over the node or the thumb is dragged, fading over 150 ms.
+        auto_hide: bool,
+    }
+}
+contract_struct! {
     /// How a node looks. Colors are `0xRRGGBBAA`. Changes animate with the matching `transitions`.
     pub struct Paint as "Paint" {
         background: Option<u32>,
         /// Vertical gradient, top to bottom (overrides `background`).
         gradient: Option<[u32; 2]>,
         radius: f32,
+        /// Names an image set with `Host::set_image`; its alpha, stretched to the node's rectangle, multiplies what this node draws (fill, gradient, edge, highlight, image). Not its children or shadows. While the mask is missing, those draw nothing.
+        mask: Option<String>,
         /// Inner ring (CSS `inset 0 0 0 <edgeWidth> <edge>`).
         edge: Option<u32>,
         edge_width: Option<f32>,
+        /// Widths of the top, right, bottom and left edges, drawn in `edge`; replaces `edgeWidth`. A side of
+        /// width 0 has no edge. Corners stay rounded by `radius`.
+        edge_sides: Option<[f32; 4]>,
         /// Inner top highlight (CSS `inset 0 1px 0 <highlight>`).
         highlight: Option<u32>,
         shadows: Vec<Shadow>,
@@ -178,14 +259,41 @@ contract_struct! {
         hover: Option<Variant>,
         active: Option<Variant>,
         focus: Option<Variant>,
+        /// Scrollbar drawn over a `scroll` node's content.
+        scrollbar: Option<Scrollbar>,
     }
 }
 impl Paint {
     fn valid(&self) -> bool {
         let finite = |v: f32| v.is_finite();
+        let variants = [&self.hover, &self.active, &self.focus]
+            .into_iter()
+            .flatten();
         let numbers = [self.radius, self.x, self.y]
             .into_iter()
             .chain(self.edge_width)
+            .chain(self.edge_sides.into_iter().flatten())
+            .chain(
+                self.scrollbar
+                    .iter()
+                    .flat_map(|s| [s.width, s.radius, s.min_thumb, s.inset]),
+            )
+            .chain(
+                variants
+                    .clone()
+                    .flat_map(|v| {
+                        [
+                            v.opacity,
+                            v.x,
+                            v.y,
+                            v.scale,
+                            v.brightness,
+                            v.height,
+                            v.width,
+                        ]
+                    })
+                    .flatten(),
+            )
             .chain(self.opacity)
             .chain(self.scale)
             .chain(self.brightness)
@@ -203,6 +311,10 @@ impl Paint {
                     .chain(t.bezier.into_iter().flatten())
             }));
         numbers.into_iter().all(finite)
+            && variants
+                .flat_map(|v| [v.height, v.width])
+                .flatten()
+                .all(|v| v >= 0.)
             && self
                 .transitions
                 .iter()
@@ -216,6 +328,33 @@ contract_struct! {
         weight: Option<u16>,
         line_height: Option<f32>,
         letter_spacing: f32,
+        /// Family of the text. No value: the default family, set with `Host::set_default_family`.
+        family: Option<String>,
+    }
+}
+contract_struct! {
+    /// A run of rich text. Unset fields take the node's font and color.
+    pub struct Span as "Span" {
+        text: String,
+        /// RGBA, as the colors of `Paint`.
+        color: Option<u32>,
+        weight: Option<u16>,
+        size: Option<f32>,
+        /// Family of the run, as `Font.family`.
+        family: Option<String>,
+        /// Underlines the run in its color.
+        underline: bool,
+        /// Shows this image in place of the run's text: one character as wide as the image.
+        image: Option<InlineImage>,
+    }
+}
+contract_struct! {
+    /// An image set in a line of text, `width` by `height` logical pixels, centered on the line.
+    pub struct InlineImage as "InlineImage" {
+        /// Name the app gave the image with `Host::set_image`.
+        source: String,
+        width: f32,
+        height: f32,
     }
 }
 contract_strings! {
@@ -238,7 +377,19 @@ contract_enum! {
         /// Counter label, drawn as three seven-segment digits.
         Label { value: u16 },
         Button { callback: u16 },
-        Text { text: String, (default) style: Style, (default) font: Font, (default) paint: Box<Paint> },
+        Text {
+            text: String,
+            (default) style: Style,
+            (default) font: Font,
+            (default) paint: Box<Paint>,
+            /// At most this many lines; the last one shown ends in "…" when the text does not fit. None: no limit.
+            (default) lines: Option<u16>,
+            /// Alignment of each line inside the node's width.
+            (default) align: TextAlign,
+            /// Rich text: these spans replace `text` for drawing, and `text` is their plain concatenation.
+            /// Empty: plain `text`.
+            (default) spans: Option<Vec<Span>>,
+        },
         /// Text field. The app declares it on mount; afterwards only the UI writes it.
         Input {
             (default) text: String,
@@ -261,17 +412,40 @@ contract_enum! {
             /// Callback for a click or tap. 0: not pressable.
             (default) press: u16,
             (default) disabled: bool,
+            /// Callback with text "1" when the pointer enters the box and "0" when it leaves, unless a higher layer
+            /// covers the pointer. 0: none.
+            (default) hover: u16,
+            /// Callback for a right-button press over the box; its text is the JSON `{"x":..,"y":..}` of the window
+            /// point. 0: none.
+            (default) contextmenu: u16,
+            /// Callback with text "" when Escape is pressed, or when the pointer is pressed outside the box and
+            /// outside any higher layer. For light dismiss of menus and popovers. 0: none.
+            (default) dismiss: u16,
         },
         /// A stroke icon of `size` × `size` logical pixels.
         Icon { icon: Icon, size: f32, stroke: f32, (default) style: Style, (default) paint: Box<Paint> },
+        /// An image the embedding program supplied with `Host::set_image`, stretched to its box. `paint.radius` rounds its corners and `paint.color` multiplies it (white glyphs become that color). Nothing is drawn while the source is missing.
+        Image { source: String, (default) style: Style, (default) paint: Box<Paint> },
     }
 }
 contract_enum! {
     /// Batch operations.
     pub enum Op as "Operation", tag "op" {
-        Create { id: u16, (default) parent: Option<u16>, node: Node },
+        Create {
+            id: u16,
+            (default) parent: Option<u16>,
+            /// Sibling to insert the node before. None: last among the parent's children.
+            (default) before: Option<u16>,
+            node: Node,
+        },
+        /// Moves a node among its siblings: before `before`, or last with None.
+        Move { id: u16, before: Option<u16> },
         Set { id: u16, value: u16 },
         SetText { id: u16, text: String },
+        /// Replaces the spans of a `Node::Text`.
+        SetSpans { id: u16, spans: Vec<Span> },
+        /// Changes the source of a `Node::Image`.
+        SetSource { id: u16, source: String },
         /// Replaces the paint of a node. Properties with a transition animate from what is on screen.
         SetPaint { id: u16, paint: Box<Paint> },
         SetStyle { id: u16, style: Style },
@@ -293,6 +467,10 @@ pub(crate) fn ts_decls() -> String {
         Align::ts_decl(),
         Justify::ts_decl(),
         Position::ts_decl(),
+        TextAlign::ts_decl(),
+        Side::ts_decl(),
+        AnchorAlign::ts_decl(),
+        Anchor::ts_decl(),
         Style::ts_decl(),
         Property::ts_decl(),
         Easing::ts_decl(),
@@ -300,8 +478,11 @@ pub(crate) fn ts_decls() -> String {
         Shadow::ts_decl(),
         Variant::ts_decl(),
         Starting::ts_decl(),
+        Scrollbar::ts_decl(),
         Paint::ts_decl(),
         Font::ts_decl(),
+        InlineImage::ts_decl(),
+        Span::ts_decl(),
         Icon::ts_decl(),
         Node::ts_decl(),
         Op::ts_decl(),
@@ -317,7 +498,8 @@ impl Node {
             | Node::Text { style, .. }
             | Node::Input { style, .. }
             | Node::Box { style, .. }
-            | Node::Icon { style, .. } => Some(style),
+            | Node::Icon { style, .. }
+            | Node::Image { style, .. } => Some(style),
             Node::Label { .. } | Node::Button { .. } => None,
         }
     }
@@ -328,7 +510,8 @@ impl Node {
             | Node::Text { style, .. }
             | Node::Input { style, .. }
             | Node::Box { style, .. }
-            | Node::Icon { style, .. } => Some(style),
+            | Node::Icon { style, .. }
+            | Node::Image { style, .. } => Some(style),
             Node::Label { .. } | Node::Button { .. } => None,
         }
     }
@@ -338,7 +521,8 @@ impl Node {
             Node::Text { paint, .. }
             | Node::Input { paint, .. }
             | Node::Box { paint, .. }
-            | Node::Icon { paint, .. } => Some(paint),
+            | Node::Icon { paint, .. }
+            | Node::Image { paint, .. } => Some(paint),
             _ => None,
         }
     }
@@ -347,7 +531,8 @@ impl Node {
             Node::Text { paint, .. }
             | Node::Input { paint, .. }
             | Node::Box { paint, .. }
-            | Node::Icon { paint, .. } => Some(paint),
+            | Node::Icon { paint, .. }
+            | Node::Image { paint, .. } => Some(paint),
             _ => None,
         }
     }
@@ -374,11 +559,14 @@ impl Op {
             Op::Create { id, parent, .. } => [Some(*id), *parent],
             Op::Set { id, .. }
             | Op::SetText { id, .. }
+            | Op::SetSpans { id, .. }
+            | Op::SetSource { id, .. }
             | Op::SetPaint { id, .. }
             | Op::SetStyle { id, .. }
             | Op::SetDisabled { id, .. }
             | Op::SetInput { id, .. }
             | Op::SetRect { id, .. }
+            | Op::Move { id, .. }
             | Op::Remove { id } => [Some(*id), None],
             Op::After { .. } => [None, None],
         }
@@ -457,6 +645,19 @@ fn find<'a>(
         None => nodes.get(&id),
     }
 }
+// Parent of a node as the batch sees it: nodes the batch created have the parent it gave them.
+fn parent_in(
+    tree: &Tree,
+    created: &HashMap<u16, Option<&Node>>,
+    created_parent: &HashMap<u16, u16>,
+    id: u16,
+) -> Option<u16> {
+    if created.contains_key(&id) {
+        created_parent.get(&id).copied()
+    } else {
+        tree.parent(id)
+    }
+}
 impl Tree {
     /// Applies a whole app batch or no operation at all. On rejection the tree and version stay intact.
     pub fn apply(&mut self, batch: Batch) -> Result<(), &'static str> {
@@ -518,7 +719,15 @@ impl Tree {
                     }
                 }
                 (_, true) => return Err("app_only_op"),
-                (Op::Create { id, parent, node }, false) => {
+                (
+                    Op::Create {
+                        id,
+                        parent,
+                        before,
+                        node,
+                    },
+                    false,
+                ) => {
                     if find(&self.nodes, &created, *id).is_some() {
                         return Err("duplicate_id");
                     }
@@ -531,11 +740,25 @@ impl Tree {
                         }
                         _ => return Err("invalid_parent"),
                     }
+                    if let Some(b) = before
+                        && (parent.is_none()
+                            || find(&self.nodes, &created, *b).is_none()
+                            || parent_in(self, &created, &created_parent, *b) != *parent)
+                    {
+                        return Err("invalid_sibling");
+                    }
                     if matches!(node, Node::Label { value } if *value >= 1000) {
                         return Err("value_out_of_range");
                     }
                     if node.style().is_some_and(|s| !s.valid()) {
                         return Err("invalid_style");
+                    }
+                    if node
+                        .style()
+                        .and_then(|s| s.anchor.as_ref())
+                        .is_some_and(|a| find(&self.nodes, &created, a.node).is_none())
+                    {
+                        return Err("invalid_anchor");
                     }
                     if node.paint().is_some_and(|p| !p.valid()) {
                         return Err("invalid_paint");
@@ -546,6 +769,22 @@ impl Tree {
                     }
                     created.insert(*id, Some(node));
                 }
+                (Op::Move { id, before }, false) => {
+                    if find(&self.nodes, &created, *id).is_none() {
+                        return Err("invalid_node");
+                    }
+                    // The root has no siblings to move among.
+                    let Some(parent) = parent_in(self, &created, &created_parent, *id) else {
+                        return Err("invalid_node");
+                    };
+                    if let Some(b) = before
+                        && (b == id
+                            || find(&self.nodes, &created, *b).is_none()
+                            || parent_in(self, &created, &created_parent, *b) != Some(parent))
+                    {
+                        return Err("invalid_sibling");
+                    }
+                }
                 (Op::Set { id, value }, false) => {
                     if !matches!(find(&self.nodes, &created, *id), Some(Node::Label { .. })) {
                         return Err("invalid_node");
@@ -554,8 +793,13 @@ impl Tree {
                         return Err("value_out_of_range");
                     }
                 }
-                (Op::SetText { id, .. }, false) => {
+                (Op::SetText { id, .. } | Op::SetSpans { id, .. }, false) => {
                     if !matches!(find(&self.nodes, &created, *id), Some(Node::Text { .. })) {
+                        return Err("invalid_node");
+                    }
+                }
+                (Op::SetSource { id, .. }, false) => {
+                    if !matches!(find(&self.nodes, &created, *id), Some(Node::Image { .. })) {
                         return Err("invalid_node");
                     }
                 }
@@ -571,14 +815,20 @@ impl Tree {
                     }
                 }
                 (Op::SetStyle { id, style }, false) => {
-                    if find(&self.nodes, &created, *id)
-                        .and_then(Node::style)
-                        .is_none()
-                    {
+                    let Some(old) = find(&self.nodes, &created, *id).and_then(Node::style) else {
                         return Err("invalid_node");
-                    }
-                    if !style.valid() {
+                    };
+                    if !style.valid()
+                        || (old.position == Position::Fixed) != (style.position == Position::Fixed)
+                    {
                         return Err("invalid_style");
+                    }
+                    if style
+                        .anchor
+                        .as_ref()
+                        .is_some_and(|a| find(&self.nodes, &created, a.node).is_none())
+                    {
+                        return Err("invalid_anchor");
                     }
                 }
                 (Op::SetDisabled { id, .. }, false) => {
@@ -598,12 +848,20 @@ impl Tree {
     fn write(&mut self, ops: Vec<Op>) {
         for op in ops {
             match op {
-                Op::Create { id, parent, node } => {
+                Op::Create {
+                    id,
+                    parent,
+                    before,
+                    node,
+                } => {
                     if let Some(children) = parent
                         .and_then(|p| self.nodes.get_mut(&p))
                         .and_then(Node::children_mut)
                     {
-                        children.push(id);
+                        let at = before
+                            .and_then(|b| children.iter().position(|c| *c == b))
+                            .unwrap_or(children.len());
+                        children.insert(at, id);
                     }
                     if parent.is_none() {
                         self.root = Some(id);
@@ -635,6 +893,18 @@ impl Tree {
                         }
                     }
                 }
+                Op::Move { id, before } => {
+                    if let Some(parent) = self.parent(id)
+                        && let Some(children) =
+                            self.nodes.get_mut(&parent).and_then(Node::children_mut)
+                    {
+                        children.retain(|c| *c != id);
+                        let at = before
+                            .and_then(|b| children.iter().position(|c| *c == b))
+                            .unwrap_or(children.len());
+                        children.insert(at, id);
+                    }
+                }
                 Op::Set { id, value: new } => {
                     if let Some(Node::Label { value }) = self.nodes.get_mut(&id) {
                         *value = new;
@@ -643,6 +913,16 @@ impl Tree {
                 Op::SetText { id, text: new } => {
                     if let Some(Node::Text { text, .. }) = self.nodes.get_mut(&id) {
                         *text = new;
+                    }
+                }
+                Op::SetSpans { id, spans: new } => {
+                    if let Some(Node::Text { spans, .. }) = self.nodes.get_mut(&id) {
+                        *spans = Some(new);
+                    }
+                }
+                Op::SetSource { id, source: new } => {
+                    if let Some(Node::Image { source, .. }) = self.nodes.get_mut(&id) {
+                        *source = new;
                     }
                 }
                 Op::SetPaint { id, paint } => {
@@ -757,11 +1037,30 @@ impl Replica {
         }
         false
     }
-    /// A batch the UI already applied. It touches only UI nodes, so it commutes with the pending ones.
-    pub fn foreign(&mut self, batch: Batch) {
+    /// Applies a confirmed UI batch. Updates for retired node instances stay out of the optimistic view.
+    pub fn foreign(&mut self, mut batch: Batch) {
         self.confirmed
             .apply_ui(batch.clone())
             .expect("invalid UI batch in the replica");
+        if !self.pending.is_empty() {
+            // A pending create can reuse an id that the UI still uses for the previous node.
+            let replaced: std::collections::HashSet<_> = self
+                .pending
+                .iter()
+                .filter(|(_, applied)| *applied)
+                .flat_map(|(batch, _)| batch.ops.iter())
+                .filter_map(|op| match op {
+                    Op::Create { id, .. } => Some(*id),
+                    _ => None,
+                })
+                .collect();
+            batch.ops.retain(|op| match op {
+                Op::SetInput { id, .. } | Op::SetRect { id, .. } => {
+                    self.view.nodes.get(id).is_some() && !replaced.contains(id)
+                }
+                _ => unreachable!("the confirmed tree validated the UI batch"),
+            });
+        }
         self.view
             .apply_ui(batch)
             .expect("invalid UI batch in the replica");
@@ -783,6 +1082,46 @@ mod tests {
         t
     }
     #[test]
+    fn ui_updates_skip_removed_and_reused_ids_in_pending_subtrees() {
+        let confirmed = mounted();
+        let mut replica = Replica {
+            view: confirmed.clone(),
+            confirmed,
+            ..Default::default()
+        };
+        replica
+            .produced(&Batch {
+                base: 1,
+                ops: vec![
+                    Op::Remove { id: 2 },
+                    Op::Remove { id: 3 },
+                    Op::Create {
+                        id: 3,
+                        parent: Some(1),
+                        before: None,
+                        node: Node::Label { value: 1 },
+                    },
+                ],
+            })
+            .unwrap();
+        let rect = [10., 10., 100., 20.];
+        replica.foreign(Batch {
+            base: 0,
+            ops: (1..=3).map(|id| Op::SetRect { id, rect }).collect(),
+        });
+        assert_eq!(replica.confirmed.rect(2), rect);
+        assert_eq!(replica.confirmed.rect(3), rect);
+        assert_eq!(replica.view.rect(1), rect);
+        assert_eq!(replica.view.rect(3), [0.; 4]);
+        assert!(replica.view.nodes.get(&2).is_none());
+        replica.answered(true);
+        assert_eq!(replica.view.nodes, replica.confirmed.nodes);
+        assert_eq!(replica.view.version, replica.confirmed.version);
+        for id in 1..=3 {
+            assert_eq!(replica.view.rect(id), replica.confirmed.rect(id));
+        }
+    }
+    #[test]
     fn replica_reads_own_writes_and_follows_the_ui_answers() {
         let set = |base, id, value| Batch {
             base,
@@ -799,6 +1138,7 @@ mod tests {
                     Op::Create {
                         id,
                         parent,
+                        before: None,
                         node: if id == 1 {
                             Node::Column {
                                 children: vec![],
@@ -904,7 +1244,12 @@ mod tests {
     fn remove_replaces_the_root_atomically_and_reuses_ids() {
         let mut t = mounted();
         let label = |value| Node::Label { value };
-        let create = |id, parent, node| Op::Create { id, parent, node };
+        let create = |id, parent, node| Op::Create {
+            id,
+            parent,
+            before: None,
+            node,
+        };
         // Removing the label detaches it from its parent and deletes it.
         t.apply(Batch {
             base: 1,
@@ -972,7 +1317,12 @@ mod tests {
             style: Style::default(),
         };
         let mut t = Tree::default();
-        let create = |id, parent, node| Op::Create { id, parent, node };
+        let create = |id, parent, node| Op::Create {
+            id,
+            parent,
+            before: None,
+            node,
+        };
         t.apply(Batch {
             base: 0,
             ops: vec![create(1, None, column()), create(2, Some(1), column())],
@@ -980,6 +1330,9 @@ mod tests {
         .unwrap();
         // 3 is created under 2, then 2 is removed: 3 goes too, so 4 cannot hang from it.
         let text = Node::Text {
+            lines: None,
+            align: Default::default(),
+            spans: None,
             text: "orphan".into(),
             style: Style::default(),
             font: Font::default(),
@@ -1057,6 +1410,7 @@ mod tests {
                 vec![Op::Create {
                     id: 4,
                     parent: None,
+                    before: None,
                     node: label.clone(),
                 }],
                 "invalid_parent",
@@ -1066,6 +1420,7 @@ mod tests {
                 vec![Op::Create {
                     id: 4,
                     parent: Some(2),
+                    before: None,
                     node: label.clone(),
                 }],
                 "invalid_parent",
@@ -1077,6 +1432,7 @@ mod tests {
                     Op::Create {
                         id: 3,
                         parent: Some(1),
+                        before: None,
                         node: label,
                     },
                 ],
@@ -1097,5 +1453,171 @@ mod tests {
             (t.nodes[&2].clone(), t.version),
             (Node::Label { value: 7 }, 2)
         );
+    }
+    #[test]
+    fn create_before_and_move_reorder_siblings_and_reject_bad_siblings() {
+        let label = |value| Node::Label { value };
+        let mut t = mounted();
+        t.apply(Batch {
+            base: 1,
+            ops: vec![
+                Op::Create {
+                    id: 4,
+                    parent: Some(1),
+                    before: Some(2),
+                    node: label(4),
+                },
+                Op::Move {
+                    id: 3,
+                    before: Some(4),
+                },
+            ],
+        })
+        .unwrap();
+        assert_eq!(t.children(1), &[3, 4, 2][..]);
+        t.apply(Batch {
+            base: 2,
+            ops: vec![Op::Move {
+                id: 3,
+                before: None,
+            }],
+        })
+        .unwrap();
+        assert_eq!(t.children(1), &[4, 2, 3][..]);
+        // A rejected batch leaves the order alone, even when its first operation was valid.
+        let before = t.clone();
+        for (ops, err) in [
+            (
+                vec![Op::Move {
+                    id: 1,
+                    before: None,
+                }],
+                "invalid_node",
+            ),
+            (
+                vec![Op::Move {
+                    id: 2,
+                    before: Some(1),
+                }],
+                "invalid_sibling",
+            ),
+            (
+                vec![Op::Move {
+                    id: 2,
+                    before: Some(2),
+                }],
+                "invalid_sibling",
+            ),
+            (
+                vec![Op::Create {
+                    id: 5,
+                    parent: Some(1),
+                    before: Some(9),
+                    node: label(5),
+                }],
+                "invalid_sibling",
+            ),
+            (
+                vec![Op::Create {
+                    id: 5,
+                    parent: None,
+                    before: Some(1),
+                    node: label(5),
+                }],
+                "invalid_parent",
+            ),
+            (
+                vec![
+                    Op::Move {
+                        id: 3,
+                        before: None,
+                    },
+                    Op::Move {
+                        id: 2,
+                        before: Some(2),
+                    },
+                ],
+                "invalid_sibling",
+            ),
+        ] {
+            let mut rejected = before.clone();
+            assert_eq!(rejected.apply(Batch { base: 3, ops }), Err(err));
+            assert_eq!(rejected, before);
+        }
+    }
+    #[test]
+    fn variant_sizes_must_not_be_negative() {
+        let box_with = |variant: &str| {
+            serde_json::from_str::<Op>(&format!(
+                r#"{{"op":"create","id":1,"node":{{"kind":"box","paint":{{"hover":{variant}}}}}}}"#
+            ))
+            .unwrap()
+        };
+        let apply = |op| {
+            Tree::default().apply(Batch {
+                base: 0,
+                ops: vec![op],
+            })
+        };
+        assert_eq!(apply(box_with(r#"{"height":-1}"#)), Err("invalid_paint"));
+        assert_eq!(apply(box_with(r#"{"width":-1}"#)), Err("invalid_paint"));
+        assert!(apply(box_with(r#"{"height":20,"width":40,"opacity":0.5}"#)).is_ok());
+    }
+    #[test]
+    fn set_source_changes_only_images() {
+        let mut t = Tree::default();
+        let ops = serde_json::from_str(
+            r#"[{"op":"create","id":1,"node":{"kind":"column"}},
+                {"op":"create","id":2,"parent":1,"node":{"kind":"image","source":"a"}},
+                {"op":"create","id":3,"parent":1,"node":{"kind":"text","text":""}}]"#,
+        )
+        .unwrap();
+        t.apply(Batch { base: 0, ops }).unwrap();
+        let set = |id| Batch {
+            base: 1,
+            ops: vec![Op::SetSource {
+                id,
+                source: "b".into(),
+            }],
+        };
+        assert_eq!(t.clone().apply(set(3)), Err("invalid_node"));
+        assert_eq!(t.clone().apply(set(9)), Err("invalid_node"));
+        t.apply(set(2)).unwrap();
+        assert_eq!(
+            t.nodes[&2],
+            Node::Image {
+                source: "b".into(),
+                style: Style::default(),
+                paint: Box::default()
+            }
+        );
+    }
+
+    #[test]
+    fn a_fixed_node_needs_an_existing_anchor_and_keeps_its_position_kind() {
+        let mut t = mounted();
+        let fixed = |anchor: u16| {
+            serde_json::from_str::<Op>(&format!(
+                r#"{{"op":"create","id":9,"parent":1,"node":{{"kind":"box","style":{{"position":"fixed","layer":2,"anchor":{{"node":{anchor},"side":"right","align":"start","gap":8,"flip":true}}}}}}}}"#
+            ))
+            .unwrap()
+        };
+        let batch = |base, ops| Batch { base, ops };
+        assert_eq!(
+            t.apply(batch(1, vec![fixed(42)])),
+            Err("invalid_anchor"),
+            "the anchor must exist"
+        );
+        t.apply(batch(1, vec![fixed(2)])).unwrap();
+        let restyle = |position: &str| {
+            let json = format!(r#"{{"op":"setstyle","id":9,"style":{{"position":"{position}"}}}}"#);
+            serde_json::from_str::<Op>(&json).unwrap()
+        };
+        assert_eq!(
+            t.apply(batch(2, vec![restyle("relative")])),
+            Err("invalid_style"),
+            "a fixed node cannot leave the fixed position"
+        );
+        assert_eq!(t.apply(batch(2, vec![restyle("fixed")])), Ok(()));
     }
 }

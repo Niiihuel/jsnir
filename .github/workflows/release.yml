@@ -1,0 +1,76 @@
+name: Linux release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    env:
+      RUSTUP_TOOLCHAIN: 1.99.1
+    outputs:
+      commit: ${{ steps.source.outputs.commit }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: source
+        run: |
+          printf 'commit=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          files=$(git archive HEAD | tar -tf -)
+          if grep -Eq '^(app/stepper\.tsx$|comparison/stepper(/|$))' <<< "$files"; then
+            echo "The source archive contains the React Bits comparison." >&2
+            exit 1
+          fi
+      - name: Install build and smoke test tools
+        run: |
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+          cargo install --locked --version 0.9.0 --features cli --root "$RUNNER_TEMP/jsnir-tools" cargo-about
+          printf '%s\n' "$RUNNER_TEMP/jsnir-tools/bin" >> "$GITHUB_PATH"
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libegl-mesa0 libgl1-mesa-dri fonts-dejavu-core
+      - name: Build and test the archive
+        env:
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        run: bash scripts/build-release.sh "$RUNNER_TEMP/jsnir-release" "$RELEASE_TAG"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: jsnir-linux-x86_64
+          path: ${{ runner.temp }}/jsnir-release/
+          if-no-files-found: error
+
+  draft:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: jsnir-linux-x86_64
+      - name: Create prerelease draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          BUILD_COMMIT: ${{ needs.build.outputs.commit }}
+        run: |
+          sha256sum --check -- *.tar.gz.sha256
+          tag_commit=$(gh api "repos/$GITHUB_REPOSITORY/commits/$RELEASE_TAG" --jq .sha)
+          if [[ "$tag_commit" != "$BUILD_COMMIT" ]]; then
+            echo "The tag now points to a different commit." >&2
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" *.tar.gz *.tar.gz.sha256 \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --draft --prerelease \
+            --title "JSNIR $RELEASE_TAG" --generate-notes

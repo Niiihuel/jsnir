@@ -6,14 +6,19 @@ JSNIR runs TypeScript and TSX desktop apps with a native Rust UI and no WebView.
 
 The JSNIR port of the React Bits Stepper uses 390 nonblank lines of TSX. Across six settled states, 0.07–0.12% of its pixels differ from Chromium at the 6% comparison threshold. The GPUI port uses 1,162 nonblank lines of Rust plus a 574-line adapted text field, with 0.18–0.36% differing pixels. [Stepper comparison](comparison/stepper/README.md)
 
+The Linux preview archive ships the engine and the TSX SDK. Load an app compiled outside the repository with `jsnir-gpu run app.js`. [Install the engine and build an app](docs/releases.md)
+
 ## Run the Stepper
 
-Run these commands from the repository root in a Linux graphical session (Wayland or X11).
+Build the comparison from a Git checkout in a Linux graphical session (Wayland or X11). On Linux x86-64, fetch the pinned native compiler once to build without Node or npm.
 
 ```sh
-npm ci   # TypeScript 7.0.2, pinned in package.json; needed to compile the TSX apps
-cargo run --release --locked --manifest-path backends/gpu/Cargo.toml --target-dir target -- stepper
+JSNIR_TSC=$(bash scripts/fetch-tsc.sh target/typescript)
+export JSNIR_TSC
+cargo run --release --locked --features stepper --manifest-path backends/gpu/Cargo.toml --target-dir target -- stepper
 ```
+
+Reuse it in another shell with `export JSNIR_TSC="$PWD/target/typescript/lib/tsc"`. The source build also accepts the compiler installed by `npm ci` when the variable is unset.
 
 Use `--step`, `--name`, `--plan` and `--focus` to open a particular state. Append `--offscreen file.ppm` with a new output path to capture that state without opening a window.
 
@@ -51,7 +56,7 @@ function Option(props: { title: string; detail: string; selected: () => boolean;
 ## Run the chat
 
 ```sh
-cargo run --release --locked --manifest-path backends/gpu/Cargo.toml --target-dir target -- js
+cargo run --release --locked --features examples --manifest-path backends/gpu/Cargo.toml --target-dir target -- js
 ```
 
 Use `rust` in place of `js` to run the Rust reference app. Set `JSNIR_LIVE=1` in the interactive JS chat to reload edits to `app/chat.tsx` and keep the draft, selection, scroll and signal values. If an edit fails to compile, the previous version keeps running.
@@ -74,10 +79,9 @@ The Rust↔TypeScript contract is declared once in `src/contract.rs`, and `app/j
 ## Tests
 
 ```sh
-cargo test --release --locked                                              # core, includes type-checking app/*.tsx
-cargo test --release --locked --manifest-path backends/gpu/Cargo.toml --target-dir target --all-targets
+cargo test --release --locked --features examples,stepper                   # core and TSX checks, including the comparison
+cargo test --release --locked --features examples,stepper --manifest-path backends/gpu/Cargo.toml --target-dir target --all-targets
 cargo test --release --locked --manifest-path backends/egui/Cargo.toml --target-dir target
-npm run typecheck                                                         # TypeScript checks on their own
 ```
 
 The core tests cover batch validation, the replica on the JS thread, transitions against the CSS curves, and an end-to-end run of the Stepper through the host: clicks, typing, timers and removed panes, with JS answering from its own thread.
@@ -97,4 +101,4 @@ The project was called Jurui until 19 November 2026.
 
 ## License
 
-JSNIR is under [MIT](LICENSE). Inter uses the [SIL Open Font License](assets/fonts/Inter-LICENSE.txt), and the Hugeicons Free icons use MIT. The Chromium reference build downloads the pinned React Bits component. [Reference build](comparison/stepper/react/README.md)
+JSNIR is under [MIT](LICENSE). Inter uses the [SIL Open Font License](assets/fonts/Inter-LICENSE.txt), and the Hugeicons Free icons use [MIT](assets/icons/Hugeicons-LICENSE.txt). The Chromium reference build downloads the pinned React Bits component. [Reference build](comparison/stepper/react/README.md)

@@ -1,5 +1,8 @@
 // One instanced quad per drawing item. Positions inside the quad are in physical pixels.
 // Modes: 0 fill (texture × vertical gradient, rounded), 1 inner shadow without blur, 2 blurred outer shadow.
+// Every mode is multiplied by the mask's alpha (group 1; white when the quad has no mask) and by the
+// rounded clip, which is the rectangle `round_clip` with corners of `clip_radius` (0: no rounding).
+// The rectangular clip is the scissor, so it is not repeated here.
 struct Vertex {
     @builtin(position) position: vec4f,
     @location(0) uv: vec2f,
@@ -8,11 +11,17 @@ struct Vertex {
     @location(3) @interpolate(flat) shape: vec4f,
     @location(4) @interpolate(flat) params: vec4f,
     @location(5) @interpolate(flat) params2: vec4f,
+    @location(6) @interpolate(flat) round_clip: vec4f,
+    @location(7) @interpolate(flat) mask_rect: vec4f,
+    @location(8) @interpolate(flat) clip_radius: f32,
 }
 
 @group(0) @binding(0) var image: texture_2d<f32>;
 @group(0) @binding(1) var image_sampler: sampler;
+@group(1) @binding(0) var mask_image: texture_2d<f32>;
+@group(1) @binding(1) var mask_sampler: sampler;
 
+// Rectangles are in device pixels: `round_clip` in the target, `mask_rect` relative to the quad.
 @vertex fn vertex(
     @builtin(vertex_index) index: u32,
     @location(0) edges: vec4f,
@@ -22,11 +31,15 @@ struct Vertex {
     @location(4) shape: vec4f,
     @location(5) params: vec4f,
     @location(6) params2: vec4f,
+    @location(7) round_clip: vec4f,
+    @location(8) mask_rect: vec4f,
+    @location(9) clip_radius: f32,
 ) -> Vertex {
     let uv = vec2f(f32(index & 1u), f32(index >> 1u));
     return Vertex(
         vec4f(mix(edges.xy, edges.zw, uv), 0.0, 1.0),
         mix(texcoords.xy, texcoords.zw, uv), mix(color, end_color, uv.y), uv, shape, params, params2,
+        round_clip, mask_rect, clip_radius,
     );
 }
 
@@ -84,5 +97,13 @@ fn sample_quad(input: Vertex) -> vec4f {
 }
 
 @fragment fn fragment(input: Vertex) -> @location(0) vec4f {
-    return sample_quad(input);
+    // Sampled outside any branch, as a level-0 sample. Outside `mask_rect` the mask is transparent.
+    let mask_uv = (input.point * input.shape.xy - input.mask_rect.xy) / input.mask_rect.zw;
+    let inside = all(mask_uv >= vec2f(0.0)) && all(mask_uv <= vec2f(1.0));
+    let mask_alpha = select(0.0, textureSampleLevel(mask_image, mask_sampler, mask_uv, 0.0).a, inside);
+    let clip = select(
+        1.0, coverage(rounded(input.position.xy, input.round_clip.xy, input.round_clip.zw, input.clip_radius)),
+        input.clip_radius > 0.0,
+    );
+    return sample_quad(input) * mask_alpha * clip;
 }
