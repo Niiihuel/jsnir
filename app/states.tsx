@@ -1,6 +1,6 @@
 // Test app for interaction states: a group row whose children take its hover and active variants, a text
 // with a color transition, a pill that grows on hover, an image that a press switches, and a scroll column
-// of group rows without press callbacks.
+// of group rows without press callbacks, and a group row whose texts underline on hover.
 var rest = 0x102030ff;
 var hot = 0xf0a050ff;
 var pressed = 0x00ff00ff;
@@ -31,6 +31,10 @@ function States(): Element {
                     </Row>
                 ))}
             </Column>
+            <Row style={{ group: true, height: 30, padding: 4 }} paint={{ hover: { background: rowFill }, transitions: [] }}>
+                <Text paint={{ hover: { underline: true }, transitions: [] }}>{"Title"}</Text>
+                <Text paint={{ hover: { underline: true }, transitions: [] }}>{"Subtitle"}</Text>
+            </Row>
         </Column>
     );
 }

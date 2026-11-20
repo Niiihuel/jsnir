@@ -15,7 +15,7 @@ function Overlay(): Element {
     return (
         <Column style={{ padding: 16, gap: 16 }}>
             <Row style={{ justify: "between", align: "center" }}>
-                <Box style={{ width: 100, height: 32 }} paint={{ background: button, radius: 4 }} ref={(id) => (menuButton = id)} onPress={() => { menu.value = true; }}>
+                <Box style={{ width: 100, height: 32 }} paint={{ background: button, radius: 4 }} ref={(id) => (menuButton = id)} onPress={() => { menu.value = !menu.value; }}>
                     <Text>{"menu"}</Text>
                 </Box>
                 <Box style={{ width: 100, height: 32 }} paint={{ background: button, radius: 4 }} ref={(id) => (edgeButton = id)} onPress={() => { edge.value = true; }}>

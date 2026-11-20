@@ -667,7 +667,8 @@ function For<T>({
 // ---------- Overlays ----------
 
 /** A panel on top of the page, placed beside the node `anchor()` returns while `open` is true, 8 px from it. Escape or
- *  a press outside closes it (sets `open` to false). It is mounted in the element it is written in, so an anchor the
+ *  a press outside closes it (sets `open` to false); a press on the anchor does not, so the opener toggles it:
+ *  `onPress={() => { open.value = !open.value; }}`. It is mounted in the element it is written in, so an anchor the
  *  panel names must exist when it opens. */
 function Popover(props: {
     open: Signal<boolean>;

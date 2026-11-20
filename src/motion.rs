@@ -232,6 +232,12 @@ impl Motion {
     pub fn animating(&self, now: f64) -> bool {
         self.running.values().any(|a| a.at(now).is_some())
     }
+    /// Whether any node's `channel` is animating at `now`: the scroll glides, for one.
+    pub fn animating_on(&self, channel: Channel, now: f64) -> bool {
+        self.running
+            .iter()
+            .any(|((_, c), a)| *c == channel && a.at(now).is_some())
+    }
     /// Runs a node's keyframe animations at `now`. A list that differs from the last one restarts them. With
     /// `reduced` (reduced motion), infinite animations do not run. With `frozen` (a capture), each animation shows
     /// its value `frozen` ms after its own start, and none counts as running.

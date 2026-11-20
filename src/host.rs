@@ -221,6 +221,8 @@ pub struct Host {
     // boxes it entered or left since (their callbacks have been told).
     hover_rects: Vec<(u16, Rect, i32)>,
     hovered_boxes: Vec<u16>,
+    // Hover is kept as it is until this time on `clock`: the page is scrolling, or has been until then.
+    hover_frozen_until: f64,
     dismiss_rects: Vec<(u16, Rect, i32)>,
     // On-screen rectangle of each node in the last frame, by id, unclipped: what a fixed node anchors to.
     screen: Vec<Option<Rect>>,
@@ -251,6 +253,9 @@ pub struct Host {
 }
 
 const HEIGHT_TRANSITION: Property = Property::Height;
+// Hover is not updated while the page scrolls: Chrome keeps the old hover state during a scroll and dispatches a
+// synthetic mouse move once the scroll has been idle for about 100 ms.
+const SCROLL_HOVER_IDLE_MS: f64 = 100.;
 
 impl Host {
     /// Starts `script` (SDK + app) on its own thread. `args` is a JSON value the app reads with `args()`.
@@ -317,6 +322,7 @@ impl Host {
             hovered_groups: Vec::new(),
             hover_rects: Vec::new(),
             hovered_boxes: Vec::new(),
+            hover_frozen_until: 0.,
             dismiss_rects: Vec::new(),
             screen: Vec::new(),
             pressed_groups: Vec::new(),
@@ -571,6 +577,7 @@ impl Host {
         };
         self.motion.release(id, Channel::Scroll);
         self.scroll.insert(id, next);
+        self.hover_frozen_until = self.now() + SCROLL_HOVER_IDLE_MS;
         true
     }
 
@@ -581,6 +588,7 @@ impl Host {
             return false;
         };
         let now = self.now();
+        self.hover_frozen_until = now + SCROLL_HOVER_IDLE_MS;
         let transition = ease_out(Property::Y);
         // A glide in progress continues from where it is on screen.
         let from = match self.motion.target(id, Channel::Scroll) {
@@ -783,18 +791,41 @@ impl Host {
         }
     }
 
-    // A press outside a dismissing box, and not on a higher layer, dismisses it.
+    // A press outside a dismissing box, and not on a higher layer, dismisses it. A press on the node it is anchored
+    // to is not outside: that press is the anchor's own, which toggles the box.
     fn dismiss_outside(&mut self, point: [f32; 2]) {
         let top = self.top_hit(point);
         let ids: Vec<u16> = self
             .dismiss_rects
             .iter()
-            .filter(|(_, rect, layer)| !contains(*rect, point) && !higher(top, *layer))
+            .filter(|(id, rect, layer)| {
+                !contains(*rect, point) && !higher(top, *layer) && !self.on_anchor(*id, point)
+            })
             .map(|(id, _, _)| *id)
             .collect();
         for id in ids {
             self.dismiss(id);
         }
+    }
+
+    // Whether `point` is on the node that `id`, or its nearest anchored ancestor, is anchored to.
+    fn on_anchor(&self, id: u16, point: [f32; 2]) -> bool {
+        let mut node = Some(id);
+        while let Some(current) = node {
+            let anchor = self
+                .tree
+                .nodes
+                .get(&current)
+                .and_then(Node::style)
+                .and_then(|s| s.anchor.as_ref());
+            if let Some(anchor) = anchor {
+                return self
+                    .screen_rect(anchor.node)
+                    .is_some_and(|rect| contains(rect, point));
+            }
+            node = self.tree.parent(current);
+        }
+        false
     }
 
     fn dismiss(&mut self, id: u16) {
@@ -969,9 +1000,18 @@ impl Host {
     /// Lays out the tree for the window and returns what to draw.
     pub fn frame(&mut self, width: f32, height: f32, scale: f32, max_side: usize) -> Frame {
         let now = self.now();
-        let frame = self.render(width, height, scale, max_side, now);
-        // A scroll or a layout change may have moved what is under the pointer: hover follows it, and a
-        // changed hover is drawn at once.
+        let mut frame = self.render(width, height, scale, max_side, now);
+        // A glide keeps hover frozen until it has been over for SCROLL_HOVER_IDLE_MS.
+        if self.motion.animating_on(Channel::Scroll, now) {
+            self.hover_frozen_until = now + SCROLL_HOVER_IDLE_MS;
+        }
+        if now < self.hover_frozen_until {
+            // Keeps drawing until the idle time is over, so hover is then recomputed.
+            frame.animating = true;
+            return frame;
+        }
+        // A layout change may have moved what is under the pointer: hover follows it, and a changed hover is
+        // drawn at once.
         if self.refresh_hover() {
             return self.render(width, height, scale, max_side, now);
         }
@@ -1159,6 +1199,7 @@ impl Host {
                     edge: v.edge.or(out.edge),
                     height: v.height.or(out.height),
                     width: v.width.or(out.width),
+                    underline: v.underline.or(out.underline),
                 };
             }
         }
@@ -1448,6 +1489,7 @@ struct Shown {
     draw: f32,
     left: f32,
     width: f32,
+    underline: bool,
     looping: bool,
 }
 
@@ -1562,6 +1604,7 @@ impl Walker<'_> {
             draw,
             left,
             width,
+            underline: v.underline.unwrap_or(false),
         }
     }
 
@@ -1817,11 +1860,25 @@ impl Walker<'_> {
                     ..TextStyle::of(font, inner.color(color))
                 };
                 // Draws the text cut to its line limit at the width the layout measured.
-                let runs = node_spans(text, spans.as_deref());
+                let mut runs = node_spans(text, spans.as_deref()).into_owned();
+                if shown.underline {
+                    runs.iter_mut().for_each(|run| run.underline = true);
+                }
                 let rich = spans.as_ref().is_some_and(|spans| !spans.is_empty());
-                // Rich text cuts and places its marks in one cached step, so unchanged text shapes nothing.
-                let (runs, marks) = if rich {
-                    host.text.cut_marks(&runs, layout_rect[2], *lines, &style)
+                // Rich or underlined text cuts and places its marks in one cached step, so unchanged text shapes
+                // nothing. The underline is in the spans, so the cached marks are keyed by it.
+                let (runs, marks) = if rich || shown.underline {
+                    // Plain text is cut in the style layout measured it in.
+                    let cut_style = if rich {
+                        style.clone()
+                    } else {
+                        TextStyle {
+                            align: *align,
+                            ..TextStyle::resolve(font)
+                        }
+                    };
+                    host.text
+                        .cut_marks(&runs, layout_rect[2], *lines, &cut_style)
                 } else {
                     let runs = match lines {
                         Some(lines) => host.text.limit_lines(
@@ -1830,7 +1887,7 @@ impl Walker<'_> {
                             *lines,
                             &TextStyle::resolve(font),
                         ),
-                        None => runs.into_owned(),
+                        None => runs,
                     };
                     (runs, Vec::new())
                 };
@@ -2803,6 +2860,32 @@ mod tests {
     }
 
     #[test]
+    fn a_group_hover_underlines_the_texts_inside_until_it_leaves() {
+        let mut host = states();
+        let row = host.tree.parent(text_id(&host, "Title")).unwrap();
+        let [x, y, _, h] = host.tree.rect(row);
+        // Underlines are 1 px tall fills.
+        let underlines = |frame: &Frame| {
+            frame
+                .items
+                .iter()
+                .filter(|item| matches!(item, Item::Fill { rect, .. } if rect[3] == 1.))
+                .count()
+        };
+        assert_eq!(underlines(&frame_of(&mut host)), 0);
+
+        // One mark per glyph of the title and the subtitle.
+        host.pointer_move(Some([x + 2., y + h / 2.]));
+        assert!(underlines(&frame_of(&mut host)) > 0);
+        host.text.shapes = 0;
+        assert!(underlines(&frame_of(&mut host)) > 0);
+        assert_eq!(host.text.shapes, 0, "unchanged underlines shape nothing");
+
+        host.pointer_move(Some([600., 500.]));
+        assert_eq!(underlines(&frame_of(&mut host)), 0);
+    }
+
+    #[test]
     fn a_transition_on_a_group_child_animates_then_settles() {
         let mut host = states();
         let row = host.tree.parent(text_id(&host, "Fading")).unwrap();
@@ -2817,28 +2900,77 @@ mod tests {
         assert_eq!(color_of(&frame_of(&mut host), "Fading"), HOT);
     }
 
-    #[test]
-    fn hover_follows_a_scroll_without_a_pointer_move() {
-        let mut host = states();
+    // The scroll column of the states app, and the pointer five pixels into it: row 0 is under it.
+    fn scroll_column(host: &mut Host) -> (u16, Rect) {
         let scroll = host
             .tree
-            .parent(host.tree.parent(text_id(&host, "row 0")).unwrap())
+            .parent(host.tree.parent(text_id(host, "row 0")).unwrap())
             .unwrap();
-        let [x, top, width, _] = host.tree.rect(scroll);
-        // Five pixels into the box: row 0 is under the pointer.
+        let [x, top, width, height] = host.tree.rect(scroll);
         host.pointer_move(Some([x + 4., top + 5.]));
-        let frame = frame_of(&mut host);
-        let fills = fills_of(&frame, ROW_FILL);
+        (scroll, [x, top, width, height])
+    }
+
+    #[test]
+    fn hover_follows_a_scroll_once_the_scroll_is_idle() {
+        let mut host = states();
+        let (_, [_, top, width, _]) = scroll_column(&mut host);
+        let fills = fills_of(&frame_of(&mut host), ROW_FILL);
         assert_eq!(fills.len(), 1);
         assert!((fills[0][1] - top).abs() < 0.01, "{fills:?}");
 
-        // Scrolling 45 px moves row 1 under the same point.
+        // Scrolling 45 px moves row 1 under the same point, but hover keeps row 0 until the scroll is idle.
         assert!(host.wheel(45.));
+        let fills = fills_of(&frame_of(&mut host), ROW_FILL);
+        assert_eq!(fills.len(), 1);
+        assert!((fills[0][1] - (top - 45.)).abs() < 0.01, "{fills:?}");
+
+        std::thread::sleep(Duration::from_millis(120));
         let frame = frame_of(&mut host);
         let fills = fills_of(&frame, ROW_FILL);
         assert_eq!(fills.len(), 1);
         assert!((fills[0][1] - (top - 15.)).abs() < 0.01, "{fills:?}");
         assert!((fills[0][2] - width).abs() < 0.01, "{fills:?}");
+    }
+
+    #[test]
+    fn hover_stays_put_during_a_glide_and_follows_once_it_is_idle() {
+        let mut host = states();
+        let (scroll, [_, top, _, _]) = scroll_column(&mut host);
+        frame_of(&mut host);
+
+        assert!(host.wheel_smooth(45.));
+        std::thread::sleep(Duration::from_millis(40));
+        let frame = frame_of(&mut host);
+        let mid = host.scroll[&scroll];
+        assert!(frame.animating && mid > 0. && mid < 45., "{mid}");
+        // Row 0 moves up with the glide and stays the hovered row.
+        let fills = fills_of(&frame, ROW_FILL);
+        assert_eq!(fills.len(), 1);
+        assert!((fills[0][1] - (top - mid)).abs() < 0.01, "{fills:?}");
+
+        // Settling ends the glide, then the idle time passes: row 1 is under the pointer and hovered.
+        settle(&mut host);
+        assert_eq!(host.scroll[&scroll], 45.);
+        let fills = fills_of(&frame_of(&mut host), ROW_FILL);
+        assert_eq!(fills.len(), 1);
+        assert!((fills[0][1] - (top - 15.)).abs() < 0.01, "{fills:?}");
+    }
+
+    #[test]
+    fn a_pointer_move_during_a_scroll_updates_hover_at_once() {
+        let mut host = states();
+        let (_, [x, top, _, _]) = scroll_column(&mut host);
+        frame_of(&mut host);
+        assert!(host.wheel(45.));
+        let fills = fills_of(&frame_of(&mut host), ROW_FILL);
+        assert!((fills[0][1] - (top - 45.)).abs() < 0.01, "{fills:?}");
+
+        // Row 1 is under the moved pointer: no idle time to wait for.
+        host.pointer_move(Some([x + 4., top + 6.]));
+        let fills = fills_of(&frame_of(&mut host), ROW_FILL);
+        assert_eq!(fills.len(), 1);
+        assert!((fills[0][1] - (top - 15.)).abs() < 0.01, "{fills:?}");
     }
 
     #[test]
@@ -3412,6 +3544,32 @@ mod tests {
         assert!(
             panel_for(&host, menu).is_none(),
             "a press outside dismisses"
+        );
+    }
+
+    #[test]
+    fn a_press_on_the_anchor_closes_its_popover_once_and_the_next_opens_it() {
+        let mut host = overlay();
+        let menu = box_of(&host, "menu");
+        click(&mut host, "menu");
+        assert!(panel_for(&host, menu).is_some());
+
+        // The anchor is not outside the popover: the press sends no dismiss, and the anchor's own press closes it.
+        let rect = host.screen_rect(menu).unwrap();
+        host.pointer_move(Some(centre(rect)));
+        host.pointer_down(PointSelection::Place);
+        assert_eq!(
+            host.pending, 0,
+            "no dismiss is sent for a press on the anchor"
+        );
+        host.pointer_up();
+        settle(&mut host);
+        assert!(panel_for(&host, menu).is_none(), "the anchor closes it");
+
+        click(&mut host, "menu");
+        assert!(
+            panel_for(&host, menu).is_some(),
+            "and the next press opens it"
         );
     }
 

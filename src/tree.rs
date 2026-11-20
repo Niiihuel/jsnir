@@ -265,6 +265,8 @@ contract_struct! {
         height: Option<f32>,
         /// Visual width, animated by the `width` transition.
         width: Option<f32>,
+        /// Underlines all the text of a `Text` while the variant is active (CSS `text-decoration: underline`).
+        underline: Option<bool>,
     }
 }
 contract_struct! {
