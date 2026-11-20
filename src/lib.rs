@@ -41,6 +41,8 @@ pub mod apps {
     pub const KEYED: &str = include_str!(concat!(env!("OUT_DIR"), "/keyed.js"));
     /// Test app for `scroll` (SDK + app).
     pub const SCROLL: &str = include_str!(concat!(env!("OUT_DIR"), "/scroll.js"));
+    /// Test app for chat scrolling: `scrollAnchor: "end"`, `scrollTo` and `onScroll` (SDK + app).
+    pub const SCROLLCHAT: &str = include_str!(concat!(env!("OUT_DIR"), "/scrollchat.js"));
     /// Test app for interaction states: group hover and active, transitions, `SetSource` (SDK + app).
     pub const STATES: &str = include_str!(concat!(env!("OUT_DIR"), "/states.js"));
     /// Test app for masks and rounded clips (SDK + app).
@@ -289,6 +291,7 @@ fn rust_mount() -> Batch {
                     hover: 0,
                     contextmenu: 0,
                     dismiss: 0,
+                    scroll: 0,
                 },
             ),
             create(2, Some(1), Node::Label { value: 0 }),
@@ -754,6 +757,7 @@ mod tests {
                 "lines",
                 "keyed",
                 "scroll",
+                "scrollchat",
                 "states",
                 "masks",
                 "text",

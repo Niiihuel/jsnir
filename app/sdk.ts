@@ -273,6 +273,10 @@ function setPaint(id: number, paint: Paint): void {
 function setSpans(id: number, spans: Span[]): void {
     send([{ op: "setspans", id: id, spans: spans }]);
 }
+/** Scrolls a `scroll` node (its id from a `ref`) to `offset` pixels, or to its `start` or `end`. `smooth` glides there. */
+function scrollTo(id: number, to: { offset?: number; to?: ScrollEdge; smooth?: boolean }): void {
+    send([{ op: "scrollto", id: id, offset: to.offset, to: to.to, smooth: to.smooth ?? false }]);
+}
 /** Calls `run` once after `ms` milliseconds. Rust keeps the timer; JS does not wait. */
 function after(ms: number, run: () => void): void {
     var callback = register(function () {
@@ -295,6 +299,8 @@ function Box(props: {
     onContextMenu?: (p: { x: number; y: number }) => void;
     /** Escape, or a press outside the box and outside any higher layer: light dismiss of menus and popovers. */
     onDismiss?: () => void;
+    /** A `scroll` box's offset changed: once per frame, with its offset and its content and box heights in pixels. */
+    onScroll?: (s: { top: number; height: number; client: number }) => void;
     disabled?: Source<boolean>;
     ref?: (id: number) => void;
     children?: Children;
@@ -325,6 +331,10 @@ function Box(props: {
             var dismiss = onDismiss === undefined ? 0 : register(function () {
                 (onDismiss as () => void)();
             });
+            var onScroll = props.onScroll;
+            var scroll = onScroll === undefined ? 0 : register(function (text) {
+                (onScroll as (s: { top: number; height: number; client: number }) => void)(JSON.parse(text));
+            });
             ops.push({
                 op: "create",
                 id: id,
@@ -338,6 +348,7 @@ function Box(props: {
                     hover: hover,
                     contextmenu: contextmenu,
                     dismiss: dismiss,
+                    scroll: scroll,
                 },
             });
             mountChildren(props.children, id, ops);

@@ -226,6 +226,12 @@ contract_columns! {
     width: |t, id| t.rect(id)[2] as i32,
     /// Height computed by the layout.
     height: |t, id| t.rect(id)[3] as i32,
+    /// Offset of a scroll node, in logical pixels (0 for other nodes).
+    scrollTop: |t, id| t.scroll(id)[0] as i32,
+    /// Content height of a scroll node, in logical pixels.
+    scrollHeight: |t, id| t.scroll(id)[1] as i32,
+    /// Box height of a scroll node, in logical pixels.
+    clientHeight: |t, id| t.scroll(id)[2] as i32,
 }
 
 /// Block of i32 on the Rust heap that backs an immutable `ArrayBuffer` for JS.

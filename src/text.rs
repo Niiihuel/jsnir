@@ -1,8 +1,8 @@
 //! Measuring and rasterizing static text in logical points, independent of the backend.
 use crate::tree::{Font, Span, TextAlign};
 use cosmic_text::{
-    Align, Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache, Weight, Wrap,
-    fontdb,
+    Align, Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, Style, SwashCache, Weight,
+    Wrap, fontdb,
 };
 use std::{borrow::Cow, collections::HashMap};
 
@@ -150,6 +150,10 @@ fn run_attrs<'a>(run: &'a TextStyle, span: &Span, index: usize) -> Attrs<'a> {
     if span.size.is_some() {
         attrs = attrs.metrics(metrics(run));
     }
+    // cosmic-text does not slant upright glyphs: without an italic face the family's upright one is used.
+    if span.italic {
+        attrs = attrs.style(Style::Italic);
+    }
     attrs
 }
 
@@ -202,13 +206,17 @@ fn cut_spans(spans: &[Span], end: usize) -> Vec<Span> {
     out
 }
 
-/// An inline image or an underline of rich text, where it is laid out: logical pixels from the top left.
+/// An inline image, or a line or background of rich text, where it is laid out: logical pixels from the top left.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Mark {
     /// The image of span `span`: `[x, y, width, height]`.
     Image { span: usize, rect: [f32; 4] },
-    /// A 1 px line under the glyphs of span `span`: `[x, y, width, 1]`.
+    /// A line under the glyphs of span `span`: `[x, y, width, thickness]`.
     Underline { span: usize, rect: [f32; 4] },
+    /// A line through the middle of the glyphs of span `span`: `[x, y, width, thickness]`.
+    Strike { span: usize, rect: [f32; 4] },
+    /// The glyphs of span `span` on one line, as `[x, y, width, line height]`.
+    Background { span: usize, rect: [f32; 4] },
 }
 
 /// cosmic-text's alignment of a line; None keeps the paragraph's own (start) alignment.
@@ -473,35 +481,76 @@ impl TextEngine {
         }
     }
 
-    /// Where the inline images and underlines of `spans` are when laid out in `width` (one line if `None`).
+    /// Where the inline images, lines and backgrounds of `spans` are when laid out in `width` (one line if `None`).
+    /// Backgrounds come first, so they are drawn under the glyphs' lines.
     pub fn marks(&mut self, spans: &[Span], width: Option<f32>, style: &TextStyle) -> Vec<Mark> {
         if blank(spans) {
             return Vec::new();
         }
         let wrap = width.map(|width| width + WRAP_SLACK);
         let buffer = self.shape_styled(spans, wrap, Wrap::WordOrGlyph, style);
+        let mut backgrounds = Vec::new();
         let mut marks = Vec::new();
         for run in buffer.layout_runs() {
+            // A background span's glyphs on this line are one fragment, from its first glyph to its last.
+            let mut fragments: Vec<Mark> = Vec::new();
             for glyph in run.glyphs {
                 let Some(span) = spans.get(glyph.metadata) else {
                     continue;
                 };
+                if span.background.is_some() {
+                    match fragments.last_mut() {
+                        Some(Mark::Background { span: index, rect })
+                            if *index == glyph.metadata =>
+                        {
+                            rect[2] = glyph.x + glyph.w - rect[0];
+                        }
+                        _ => fragments.push(Mark::Background {
+                            span: glyph.metadata,
+                            rect: [glyph.x, run.line_top, glyph.w, run.line_height],
+                        }),
+                    }
+                }
                 if let Some(image) = &span.image {
                     let top = run.line_top + (run.line_height - image.height) / 2.;
                     marks.push(Mark::Image {
                         span: glyph.metadata,
                         rect: [glyph.x, top, image.width, image.height],
                     });
-                } else if span.underline {
+                    continue;
+                }
+                if span.underline {
                     let (offset, thickness) = self.underline(glyph.font_id, glyph.font_size);
                     marks.push(Mark::Underline {
                         span: glyph.metadata,
                         rect: [glyph.x, run.line_y - offset, glyph.w, thickness],
                     });
                 }
+                if span.strike {
+                    let (offset, thickness) = self.strikeout(glyph.font_id, glyph.font_size);
+                    marks.push(Mark::Strike {
+                        span: glyph.metadata,
+                        rect: [glyph.x, run.line_y - offset, glyph.w, thickness],
+                    });
+                }
             }
+            backgrounds.extend(fragments);
         }
-        marks
+        backgrounds.extend(marks);
+        backgrounds
+    }
+
+    /// The line through the middle of a glyph's font at `size`, as `underline`: its top is `offset` above the baseline
+    /// and it is `thickness` tall, from the font's `OS/2` table. A font without one gets a line at 30% of the size.
+    fn strikeout(&mut self, font: fontdb::ID, size: f32) -> (f32, f32) {
+        let metrics = self
+            .fonts()
+            .get_font(font)
+            .map(|f| f.as_swash().metrics(&[]).scale(size));
+        match metrics {
+            Some(m) => (m.strikeout_offset, m.stroke_size.max(1.)),
+            None => (size * 0.3, 1.),
+        }
     }
 
     /// The underline of a glyph's font at `size`: the top of the stroke is `offset` above the baseline (negative
@@ -805,5 +854,96 @@ mod tests {
         assert!(cut[0].text.starts_with("The"), "{cut:?}");
         let [_, height] = engine.measure_styled(&cut, Some(60. + WRAP_SLACK), &style);
         assert!((height - style.line_height).abs() < 0.01, "{height}");
+    }
+
+    #[test]
+    fn strikes_and_backgrounds_are_marked_once_and_then_shape_nothing() {
+        let mut engine = engine();
+        let style = TextStyle::default();
+        let spans = [
+            Span {
+                strike: true,
+                ..run("a")
+            },
+            Span {
+                background: Some(0x2040_80ff),
+                background_radius: 4.,
+                ..run("b")
+            },
+        ];
+        let marks = engine.marks(&spans, None, &style);
+        assert!(
+            marks
+                .iter()
+                .any(|m| matches!(m, Mark::Strike { span: 0, rect } if rect[3] >= 1.)),
+            "{marks:?}"
+        );
+        assert!(
+            matches!(marks[0], Mark::Background { span: 1, .. }),
+            "backgrounds come first: {marks:?}"
+        );
+        let first = engine.cut_marks(&spans, 300., None, &style);
+        engine.shapes = 0;
+        let second = engine.cut_marks(&spans, 300., None, &style);
+        assert_eq!(first, second);
+        assert_eq!(engine.shapes, 0, "unchanged marks shape nothing");
+    }
+
+    #[test]
+    fn a_background_wrapped_onto_two_lines_is_two_fragments() {
+        let mut engine = engine();
+        let style = TextStyle::default();
+        let word = engine.measure_styled(&[run("xxxxxxxx")], None, &style)[0];
+        let spans = [Span {
+            background: Some(0xff0000ff),
+            background_radius: 2.,
+            ..run("xxxxxxxx yyyyyyyy")
+        }];
+        let marks = engine.marks(&spans, Some(word * 1.5), &style);
+        let lines: Vec<[f32; 4]> = marks
+            .iter()
+            .filter_map(|m| match m {
+                Mark::Background { span: 0, rect } => Some(*rect),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lines.len(), 2, "{marks:?}");
+        assert!(lines[0][1] < lines[1][1], "{lines:?}");
+        assert!(lines.iter().all(|r| r[2] > 0. && r[3] > 0.), "{lines:?}");
+    }
+
+    #[test]
+    fn italic_picks_the_italic_face_of_a_family_that_has_one() {
+        // The upright face is used when the family has no italic one: cosmic-text does not slant glyphs.
+        let (Ok(regular), Ok(oblique)) = (
+            std::fs::read("/usr/share/fonts/TTF/DejaVuSans.ttf"),
+            std::fs::read("/usr/share/fonts/TTF/DejaVuSans-Oblique.ttf"),
+        ) else {
+            eprintln!("skipped: DejaVu Sans with its oblique face is not installed");
+            return;
+        };
+        let mut engine =
+            TextEngine::with_fonts(&[regular.as_slice(), oblique.as_slice()], [255; 3]);
+        let family = Some("DejaVu Sans".to_owned());
+        let spans = [
+            Span {
+                family: family.clone(),
+                ..run("H")
+            },
+            Span {
+                family,
+                italic: true,
+                ..run("H")
+            },
+        ];
+        let buffer = engine.shape_styled(&spans, None, Wrap::None, &TextStyle::default());
+        let glyphs = buffer.layout_runs().next().expect("a line").glyphs;
+        let face = |span: usize| {
+            glyphs
+                .iter()
+                .find(|g| g.metadata == span)
+                .map(|g| g.font_id)
+        };
+        assert_ne!(face(0), face(1), "the italic run takes the oblique face");
     }
 }

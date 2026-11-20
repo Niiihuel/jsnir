@@ -18,6 +18,7 @@ fn main() {
             "lines",
             "keyed",
             "scroll",
+            "scrollchat",
             "states",
             "masks",
             "text",

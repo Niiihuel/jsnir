@@ -51,6 +51,14 @@ contract_strings! {
     /// Alignment of the lines of a `Text` inside its width (CSS `text-align`; start is the default).
     pub enum TextAlign as "TextAlign" { Start, Center, End }
 }
+contract_strings! {
+    /// Where a scroll node's offset is kept when its content changes (see `Style.scrollAnchor`).
+    pub enum ScrollAnchor as "ScrollAnchor" { Start, End }
+}
+contract_strings! {
+    /// An end of a scroll node's content, for `ScrollTo`.
+    pub enum ScrollEdge as "ScrollEdge" { Start, End }
+}
 
 /// Space around the four sides: one number for all of them, or `[top, right, bottom, left]` as in CSS.
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq)]
@@ -105,6 +113,12 @@ contract_struct! {
         clip: bool,
         /// Scrolls its content vertically with the wheel when it is taller than the box. Implies `clip`.
         scroll: bool,
+        /// Where the offset of a `scroll` node is kept when its content changes. `start`: the offset stays as it is,
+        /// clamped to the content. `end`: it starts at the bottom and stays there while it is there; elsewhere the first
+        /// child in view keeps its place on screen, so content added above or below it does not move it (boxes that
+        /// straddle the top of the view are entered, so rows of a list box keep their place too). A wheel or `ScrollTo`
+        /// sets the offset, and the anchor follows it from there.
+        scroll_anchor: ScrollAnchor,
         /// Hover and press of this node also set the hover and active states of its descendants, like CSS `.group:hover .child`.
         group: bool,
         /// An absolute node that takes the rectangle of another node (relative to its own parent).
@@ -451,6 +465,14 @@ contract_struct! {
         family: Option<String>,
         /// Underlines the run in its color.
         underline: bool,
+        /// Draws the run in the italic face of its family, when that family has one (no synthetic slant).
+        italic: bool,
+        /// Strikes the run through its middle in its color.
+        strike: bool,
+        /// Fills the run behind its glyphs, one rounded rectangle per line it is on. RGBA, as the colors of `Paint`.
+        background: Option<u32>,
+        /// Corner radius of the background, in logical pixels.
+        background_radius: f32,
         /// Shows this image in place of the run's text: one character as wide as the image.
         image: Option<InlineImage>,
     }
@@ -533,6 +555,9 @@ contract_enum! {
             /// Callback with text "" when Escape is pressed, or when the pointer is pressed outside the box and
             /// outside any higher layer. For light dismiss of menus and popovers. 0: none.
             (default) dismiss: u16,
+            /// Callback with the JSON `{"top":..,"height":..,"client":..}` of a `scroll` node (its offset, content height
+            /// and box height, in logical pixels), at most once per frame and only when the offset changed. 0: none.
+            (default) scroll: u16,
         },
         /// A stroke icon of `size` × `size` logical pixels.
         Icon { icon: Icon, size: f32, stroke: f32, (default) style: Style, (default) paint: Box<Paint> },
@@ -570,6 +595,16 @@ contract_enum! {
         (ui) SetInput { id: u16, text: String, selection: [u32; 2] },
         /// UI only: rectangle computed by the layout (x, y, width, height).
         (ui) SetRect { id: u16, rect: [f32; 4] },
+        /// Moves a `scroll` node's offset to `offset` logical pixels, or to its `to` edge, clamped to its content. With
+        /// `smooth` it glides there as the wheel does. The batch is rejected unless one of `offset` and `to` is set.
+        ScrollTo {
+            id: u16,
+            (default) offset: Option<f32>,
+            (default) to: Option<ScrollEdge>,
+            (default) smooth: bool,
+        },
+        /// UI only: offset, content height and box height of a scroll node, in logical pixels.
+        (ui) SetScroll { id: u16, scroll: [f32; 3] },
     }
 }
 /// TypeScript declarations of every contract type, in dependency order.
@@ -580,6 +615,8 @@ pub(crate) fn ts_decls() -> String {
         Justify::ts_decl(),
         Position::ts_decl(),
         TextAlign::ts_decl(),
+        ScrollAnchor::ts_decl(),
+        ScrollEdge::ts_decl(),
         Side::ts_decl(),
         AnchorAlign::ts_decl(),
         Anchor::ts_decl(),
@@ -680,9 +717,10 @@ impl Op {
             | Op::SetDisabled { id, .. }
             | Op::SetInput { id, .. }
             | Op::SetRect { id, .. }
+            | Op::SetScroll { id, .. }
             | Op::Move { id, .. }
             | Op::Remove { id } => [Some(*id), None],
-            Op::After { .. } => [None, None],
+            Op::After { .. } | Op::ScrollTo { .. } => [None, None],
         }
     }
 }
@@ -742,6 +780,8 @@ pub struct Tree {
     pub app_seq: u64,
     // Absolute layout rectangles, by id. Only the UI writes them.
     rects: Vec<[f32; 4]>,
+    // Offset, content height and box height of each scroll node, by id. Only the UI writes them.
+    scrolls: Vec<[f32; 3]>,
     /// Tree root, if there is one.
     pub root: Option<u16>,
     // Parent of each id, to detach a removed node without walking the tree.
@@ -806,7 +846,26 @@ impl Tree {
                         return Err("invalid_node");
                     }
                 }
-                (Op::SetInput { .. } | Op::SetRect { .. }, false) => return Err("ui_only_op"),
+                (Op::SetScroll { id, scroll }, true) => {
+                    if self.nodes.get(id).is_none() || !scroll.iter().all(|v| v.is_finite()) {
+                        return Err("invalid_node");
+                    }
+                }
+                (Op::ScrollTo { id, offset, to, .. }, false) => {
+                    if !self
+                        .nodes
+                        .get(id)
+                        .is_some_and(|n| n.style().is_some_and(|s| s.scroll))
+                    {
+                        return Err("invalid_node");
+                    }
+                    if (offset.is_none() && to.is_none()) || !offset.is_none_or(f32::is_finite) {
+                        return Err("invalid_scroll");
+                    }
+                }
+                (Op::SetInput { .. } | Op::SetRect { .. } | Op::SetScroll { .. }, false) => {
+                    return Err("ui_only_op");
+                }
                 (Op::Remove { id }, false) => {
                     // Only nodes that existed before the batch and that the batch has not removed yet.
                     if self.nodes.get(id).is_none() || created.contains_key(id) {
@@ -1002,6 +1061,9 @@ impl Tree {
                         if let Some(rect) = self.rects.get_mut(i as usize) {
                             *rect = [0.0; 4];
                         }
+                        if let Some(scroll) = self.scrolls.get_mut(i as usize) {
+                            *scroll = [0.0; 3];
+                        }
                         if let Some(p) = self.parents.get_mut(i as usize) {
                             *p = None;
                         }
@@ -1062,6 +1124,15 @@ impl Tree {
                     }
                     self.rects[i] = rect;
                 }
+                Op::SetScroll { id, scroll } => {
+                    let i = id as usize;
+                    if self.scrolls.len() <= i {
+                        self.scrolls.resize(i + 1, [0.0; 3]);
+                    }
+                    self.scrolls[i] = scroll;
+                }
+                // The UI moves the offset: it is not part of the tree.
+                Op::ScrollTo { .. } => {}
                 Op::SetInput {
                     id,
                     text: new,
@@ -1105,6 +1176,10 @@ impl Tree {
     /// Absolute layout rectangle (x, y, width, height); zeros until computed.
     pub fn rect(&self, id: u16) -> [f32; 4] {
         self.rects.get(id as usize).copied().unwrap_or_default()
+    }
+    /// Offset, content height and box height of a `scroll` node in logical pixels; zeros until the UI reports them.
+    pub fn scroll(&self, id: u16) -> [f32; 3] {
+        self.scrolls.get(id as usize).copied().unwrap_or_default()
     }
     /// Text of a `Text` or `Input` node.
     pub fn text(&self, id: u16) -> Option<&str> {
@@ -1169,7 +1244,7 @@ impl Replica {
                 })
                 .collect();
             batch.ops.retain(|op| match op {
-                Op::SetInput { id, .. } | Op::SetRect { id, .. } => {
+                Op::SetInput { id, .. } | Op::SetRect { id, .. } | Op::SetScroll { id, .. } => {
                     self.view.nodes.get(id).is_some() && !replaced.contains(id)
                 }
                 _ => unreachable!("the confirmed tree validated the UI batch"),
@@ -1775,5 +1850,36 @@ mod tests {
         ] {
             assert_eq!(with(bad), Err("invalid_paint"), "{bad}");
         }
+    }
+
+    #[test]
+    fn scroll_to_needs_a_scroll_node_and_a_target_and_the_scroll_state_is_ui_only() {
+        let mut t = mounted();
+        let batch = |ops: &str, base: u64| Batch {
+            base,
+            ops: serde_json::from_str(ops).unwrap(),
+        };
+        let column = r#"[{"op":"scrollto","id":1,"to":"end"}]"#;
+        assert_eq!(t.apply(batch(column, t.app_seq)), Err("invalid_node"));
+        t.apply(batch(
+            r#"[{"op":"setstyle","id":1,"style":{"scroll":true}}]"#,
+            t.app_seq,
+        ))
+        .unwrap();
+        let none = r#"[{"op":"scrollto","id":1}]"#;
+        assert_eq!(t.apply(batch(none, t.app_seq)), Err("invalid_scroll"));
+        t.apply(batch(column, t.app_seq)).unwrap();
+        t.apply(batch(
+            r#"[{"op":"scrollto","id":1,"offset":40,"smooth":true}]"#,
+            t.app_seq,
+        ))
+        .unwrap();
+        let set = r#"[{"op":"setscroll","id":1,"scroll":[1,2,3]}]"#;
+        assert_eq!(t.apply(batch(set, t.app_seq)), Err("ui_only_op"));
+        t.apply_ui(batch(set, 0)).unwrap();
+        assert_eq!(t.scroll(1), [1., 2., 3.]);
+        assert_eq!(t.scroll(9), [0.; 3], "unknown nodes report zeros");
+        let unknown = r#"[{"op":"setscroll","id":9,"scroll":[1,2,3]}]"#;
+        assert_eq!(t.apply_ui(batch(unknown, 0)), Err("invalid_node"));
     }
 }

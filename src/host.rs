@@ -10,7 +10,7 @@ use crate::{
     text::{Mark, TextBitmap, TextEngine, TextStyle, WRAP_SLACK, node_spans, plain_text},
     tree::{
         Anchor, AnchorAlign, Batch, Easing, Icon, Node, Op, Paint, Position, Property, Replica,
-        Scrollbar, Shadow, Side, Span, Transition, Tree, Variant,
+        ScrollAnchor, ScrollEdge, Scrollbar, Shadow, Side, Span, Transition, Tree, Variant,
     },
 };
 use rquickjs::{Ctx, Exception, Function, function::MutFn};
@@ -182,6 +182,22 @@ struct Hit {
     layer: i32,
 }
 
+// A `scrollTo` op, applied by the frame that draws its node.
+struct ScrollRequest {
+    offset: Option<f32>,
+    to: Option<ScrollEdge>,
+    smooth: bool,
+}
+
+// Where an end-anchored scroll node was in its last frame. `child` is the first child whose bottom is in view, and
+// `gap` is its top minus the offset: the offset that keeps it where it was is its top minus `gap`.
+struct EndAnchor {
+    child: Option<u16>,
+    gap: f32,
+    offset: f32,
+    bottom: bool,
+}
+
 // A scroll node drawn in the last frame, in painting order (an outer one comes first).
 struct Scroll {
     id: u16,
@@ -190,6 +206,8 @@ struct Scroll {
     rect: Rect,
     // Scale of its content on screen, to turn screen pixels into logical ones.
     k: f32,
+    // Offset in logical pixels.
+    top: f32,
     // Largest offset: content height minus box height.
     max: f32,
     // Height of the box in logical pixels: a click on the track pages by this much.
@@ -237,6 +255,9 @@ pub struct Host {
     scrolls: Vec<Scroll>,
     // Offset of each scroll node in logical pixels; a node without an entry is at its top.
     scroll: HashMap<u16, f32>,
+    // `scrollTo` ops that the next frame drawing their node applies.
+    scroll_requests: HashMap<u16, ScrollRequest>,
+    anchors: HashMap<u16, EndAnchor>,
     // A scrollbar thumb being dragged: its scroll node, and how far below the thumb's top the pointer grabbed it.
     drag: Option<(u16, f32)>,
     images: HashMap<String, ImageData>,
@@ -333,6 +354,8 @@ impl Host {
             hits: Vec::new(),
             scrolls: Vec::new(),
             scroll: HashMap::new(),
+            scroll_requests: HashMap::new(),
+            anchors: HashMap::new(),
             drag: None,
             images: HashMap::new(),
             image_generation: 0,
@@ -468,6 +491,7 @@ impl Host {
         let mut restyled = Vec::new();
         let mut texts = Vec::new();
         let mut timers = Vec::new();
+        let mut requests = Vec::new();
         // Parents whose children were placed out of order, and moved nodes (their parent is known after the apply).
         let mut reordered = Vec::new();
         let mut moved = Vec::new();
@@ -489,6 +513,19 @@ impl Host {
                 Op::SetStyle { id, .. } => restyled.push(*id),
                 Op::SetText { id, .. } | Op::SetSpans { id, .. } => texts.push(*id),
                 Op::After { ms, callback } => timers.push((*ms, *callback)),
+                Op::ScrollTo {
+                    id,
+                    offset,
+                    to,
+                    smooth,
+                } => requests.push((
+                    *id,
+                    ScrollRequest {
+                        offset: *offset,
+                        to: *to,
+                        smooth: *smooth,
+                    },
+                )),
                 _ => {}
             }
         }
@@ -499,6 +536,7 @@ impl Host {
             eprintln!("batch rejected ({e})");
             return;
         }
+        self.scroll_requests.extend(requests);
         // Nodes created and removed in the same batch are gone too.
         removed.extend(
             created
@@ -509,6 +547,8 @@ impl Host {
         self.layout.removed(&removed);
         for id in &removed {
             self.scroll.remove(id);
+            self.scroll_requests.remove(id);
+            self.anchors.remove(id);
         }
         self.motion.forget(&removed);
         if self.focused.is_some_and(|f| removed.contains(&f)) {
@@ -625,6 +665,106 @@ impl Host {
             let next = (base + delta_y / s.k).clamp(0., s.max);
             (next != base).then_some((s.id, next))
         })
+    }
+
+    // The offset of a scroll node in this frame. A `scrollTo` that is waiting, or a glide, sets it. Otherwise an
+    // end-anchored node stays at the bottom while it is there; elsewhere, the child at the top of its view keeps its
+    // place when content above or below it changes, and a wheel scroll since the last frame moves the node.
+    fn frame_offset(&mut self, id: u16, max: f32, now: f64, end: bool) -> f32 {
+        let requested = match self.scroll_requests.remove(&id) {
+            Some(request) => {
+                self.request(id, request, max, now);
+                true
+            }
+            None => false,
+        };
+        let base = self.scroll_offset(id, max, now);
+        if !end {
+            return base;
+        }
+        // An offset moved by a glide, a wheel or a `scrollTo` since the last frame is kept as it is.
+        let kept = if requested {
+            base
+        } else {
+            match self.anchors.get(&id) {
+                None => max,
+                Some(anchor) if (base - anchor.offset).abs() > 0.5 => base,
+                Some(anchor) if anchor.bottom => max,
+                Some(anchor) => anchor
+                    .child
+                    .and_then(|child| self.child_top(id, child))
+                    .map_or(base, |top| top - anchor.gap),
+            }
+        }
+        .clamp(0., max);
+        if kept != base {
+            // The target of a finished glide stays set: it would move the offset back.
+            self.motion.release(id, Channel::Scroll);
+        }
+        let anchor = self.anchor_at(id, kept, max);
+        self.anchors.insert(id, anchor);
+        self.scroll.insert(id, kept);
+        kept
+    }
+
+    // Applies a `scrollTo` to the offset of a node drawn with `max`: at once, or as a glide from the offset on screen.
+    fn request(&mut self, id: u16, request: ScrollRequest, max: f32, now: f64) {
+        let current = self.scroll.get(&id).copied().unwrap_or(0.);
+        let target = request
+            .offset
+            .unwrap_or(match request.to {
+                Some(ScrollEdge::End) => max,
+                _ => 0.,
+            })
+            .clamp(0., max);
+        if request.smooth {
+            let transition = ease_out(Property::Y);
+            self.motion.start(
+                id,
+                Channel::Scroll,
+                Value::Number(current),
+                Value::Number(target),
+                &transition,
+                now,
+            );
+        } else {
+            self.motion.release(id, Channel::Scroll);
+            self.scroll.insert(id, target);
+        }
+    }
+
+    // The anchor of an end-anchored node at `offset`: the first node in view among its children, going down into the
+    // boxes that straddle the top of the view, so rows inside a list box keep their place too.
+    fn anchor_at(&self, id: u16, offset: f32, max: f32) -> EndAnchor {
+        let mut child = None;
+        let mut parent = id;
+        while let Some(next) = self.tree.children(parent).iter().copied().find(|&c| {
+            self.child_top(id, c)
+                .is_some_and(|top| top + self.tree.rect(c)[3] > offset)
+        }) {
+            child = Some(next);
+            let straddles = self.child_top(id, next).is_some_and(|top| top < offset);
+            if straddles && matches!(self.tree.nodes.get(&next), Some(Node::Box { .. })) {
+                parent = next;
+            } else {
+                break;
+            }
+        }
+        let gap = child
+            .and_then(|child| self.child_top(id, child))
+            .map_or(0., |top| top - offset);
+        EndAnchor {
+            child,
+            gap,
+            offset,
+            bottom: offset >= max - 0.5,
+        }
+    }
+
+    // Top of a node inside a scroll node, in its content, in logical pixels; None if it is no longer inside it.
+    fn child_top(&self, id: u16, node: u16) -> Option<f32> {
+        self.within(node, id)
+            .then(|| self.tree.rect(node)[1] - self.tree.rect(id)[1])
     }
 
     // The offset of a scroll node in this frame: where its glide is, or the stored one, clamped to `max`.
@@ -1114,6 +1254,7 @@ impl Host {
         }
         self.hits = hits;
         self.scrolls = scrolls;
+        self.publish_scrolls();
         self.group_rects = groups;
         self.hover_rects = hovers;
         self.dismiss_rects = dismissers;
@@ -1121,6 +1262,44 @@ impl Host {
             items,
             animating: self.motion.animating(now) || looping,
             ime_area,
+        }
+    }
+
+    // Sends the scroll state that changed since the last frame to JS: the `scroll` columns, and the `scroll` callbacks
+    // of the boxes whose offset changed. Once per frame, as the columns are read between callbacks.
+    fn publish_scrolls(&mut self) {
+        let mut ops = Vec::new();
+        let mut events = Vec::new();
+        for s in &self.scrolls {
+            let scroll = [s.top, s.max + s.view, s.view];
+            let before = self.tree.scroll(s.id);
+            if before == scroll {
+                continue;
+            }
+            ops.push(Op::SetScroll { id: s.id, scroll });
+            if before[0] != s.top
+                && let Some(Node::Box {
+                    scroll: callback, ..
+                }) = self.tree.nodes.get(&s.id)
+                && *callback != 0
+            {
+                events.push(Event {
+                    callback: *callback,
+                    text: format!(
+                        r#"{{"top":{},"height":{},"client":{}}}"#,
+                        scroll[0], scroll[1], scroll[2]
+                    ),
+                });
+            }
+        }
+        if ops.is_empty() {
+            return;
+        }
+        let batch = Batch { base: 0, ops };
+        self.tree.apply_ui(batch.clone()).expect("scroll batch");
+        let _ = self.bridge.log.send(Log::Ui(batch));
+        for event in events {
+            self.send(event);
         }
     }
 
@@ -1960,7 +2139,7 @@ impl Walker<'_> {
                                 mask: None,
                             });
                         }
-                        Mark::Underline { span, rect } => {
+                        Mark::Underline { span, rect } | Mark::Strike { span, rect } => {
                             let color = runs[span]
                                 .color
                                 .map_or(color, |c| c.to_be_bytes().map(f32::from));
@@ -1968,6 +2147,21 @@ impl Walker<'_> {
                             self.items.push(Item::Fill {
                                 rect: scaled(screen, rect, zoom),
                                 radius: [0.; 4],
+                                top: color,
+                                bottom: color,
+                                clip,
+                                round_clip,
+                                mask: None,
+                            });
+                        }
+                        Mark::Background { span, rect } => {
+                            let Some(background) = runs[span].background else {
+                                continue;
+                            };
+                            let color = inner.color(background.to_be_bytes().map(f32::from));
+                            self.items.push(Item::Fill {
+                                rect: scaled(screen, rect, zoom),
+                                radius: [runs[span].background_radius * zoom; 4],
                                 top: color,
                                 bottom: color,
                                 clip,
@@ -2073,6 +2267,7 @@ impl Walker<'_> {
                             layer: self.layer,
                             rect: intersect(content, clip),
                             k: inner.k,
+                            top: frame.scroll_y,
                             max: (frame.content_height - view).max(0.),
                             view,
                             bar: None,
@@ -2129,6 +2324,7 @@ impl Walker<'_> {
                         layer: self.layer,
                         rect: intersect(content, clip),
                         k: inner.k,
+                        top: offset,
                         max,
                         view,
                         bar: None,
@@ -2196,7 +2392,10 @@ impl Walker<'_> {
             // The offset is clamped to this frame's content, so it stays valid when the content shrinks.
             let content = host.layout.content_height(id);
             let max = (content - layout_rect[3]).max(0.);
-            let offset = host.scroll_offset(id, max, self.now);
+            let end = node
+                .style()
+                .is_some_and(|s| s.scroll_anchor == ScrollAnchor::End);
+            let offset = host.frame_offset(id, max, self.now, end);
             child.offset[1] -= offset * inner.k;
             let rects = paint
                 .scrollbar
@@ -2239,6 +2438,7 @@ impl Walker<'_> {
                 layer: self.layer,
                 rect: intersect(screen, clip),
                 k: inner.k,
+                top: offset,
                 max,
                 view: layout_rect[3],
                 bar: rects,
@@ -3416,6 +3616,36 @@ mod tests {
     }
 
     #[test]
+    fn a_background_span_wrapped_onto_two_lines_is_two_fills_drawn_under_its_text() {
+        let mut host = Host::new(
+            crate::apps::SPANS.into(),
+            "{}".into(),
+            TextEngine::default(),
+        );
+        settle(&mut host);
+        let frame = host.frame(640., 560., 1., 4096);
+        let background = [0x20, 0x40, 0x80, 0xff];
+        let fills = fills_of(&frame, background);
+        assert_eq!(fills.len(), 2, "{fills:?}");
+        assert!(fills[0][1] < fills[1][1], "one fill per line: {fills:?}");
+        let first = frame
+            .items
+            .iter()
+            .position(|item| matches!(item, Item::Fill { top, .. } if *top == background));
+        let text = frame
+            .items
+            .iter()
+            .position(
+                |item| matches!(item, Item::Text { text, .. } if text.starts_with("xxxxxxxx")),
+            )
+            .expect("the wrapped text");
+        assert!(
+            first.is_some_and(|first| first < text),
+            "drawn under the text"
+        );
+    }
+
+    #[test]
     fn rich_text_places_its_marks_once_and_then_shapes_nothing() {
         let mut host = Host::new(
             crate::apps::SPANS.into(),
@@ -4084,5 +4314,131 @@ mod tests {
         let frame = render_at(&mut host, 1000.);
         assert!(layers(&frame).is_empty(), "the base opacity 1 is back");
         assert!(!frame.animating);
+    }
+
+    // The chat of the scrollchat app: `rows` rows in a 300 px box anchored at its end.
+    fn chat(rows: u32) -> Host {
+        Host::new(
+            crate::apps::SCROLLCHAT.into(),
+            format!(r#"{{"rows":{rows}}}"#),
+            TextEngine::default(),
+        )
+    }
+
+    // The chat's box, and its largest offset.
+    fn chat_box(host: &Host) -> (u16, f32) {
+        let scroll = find(host, |n| n.style().is_some_and(|s| s.scroll));
+        (
+            scroll,
+            host.layout.content_height(scroll) - host.tree.rect(scroll)[3],
+        )
+    }
+
+    // Where a row is in the box on screen, relative to the box's top: its content position less the offset.
+    fn row_in_view(host: &Host, scroll: u16, label: &str) -> f32 {
+        host.tree.rect(text_id(host, label))[1] - host.scroll[&scroll]
+    }
+
+    #[test]
+    fn a_chat_box_anchored_at_its_end_starts_at_the_bottom() {
+        let mut host = chat(50);
+        settle(&mut host);
+        let (scroll, max) = chat_box(&host);
+        assert!(max > 0., "the rows overflow the box");
+        assert_eq!(host.scroll[&scroll], max);
+    }
+
+    #[test]
+    fn rows_added_while_at_the_bottom_keep_the_bottom_in_view() {
+        let mut host = chat(50);
+        settle(&mut host);
+        host.push(r#"{"rows":53}"#.into());
+        settle(&mut host);
+        let (scroll, max) = chat_box(&host);
+        assert_eq!(host.scroll[&scroll], max);
+        assert!(texts(&host).contains(&"row 52".into()));
+    }
+
+    #[test]
+    fn a_chat_scrolled_up_keeps_its_rows_still_when_rows_come_in_below_or_above() {
+        let mut host = chat(50);
+        settle(&mut host);
+        let (scroll, _) = chat_box(&host);
+        let [x, top, _, _] = host.tree.rect(scroll);
+        host.pointer_move(Some([x + 4., top + 5.]));
+        assert!(host.wheel(-200.));
+        settle(&mut host);
+        let (_, max) = chat_box(&host);
+        let before = row_in_view(&host, scroll, "row 30");
+        assert!(host.scroll[&scroll] < max - 150., "scrolled up");
+
+        // Rows added below the view: the view does not move.
+        host.push(r#"{"rows":53}"#.into());
+        settle(&mut host);
+        assert_eq!(row_in_view(&host, scroll, "row 30"), before);
+
+        // Content added above the rows: the view keeps them where they were.
+        host.push(r#"{"above":100}"#.into());
+        settle(&mut host);
+        assert!(
+            (row_in_view(&host, scroll, "row 30") - before).abs() < 0.01,
+            "{}",
+            row_in_view(&host, scroll, "row 30")
+        );
+    }
+
+    #[test]
+    fn scroll_to_moves_a_box_to_an_edge_or_an_offset_at_once_or_as_a_glide() {
+        let mut host = chat(50);
+        settle(&mut host);
+        let (scroll, max) = chat_box(&host);
+        host.push(r#"{"to":"start"}"#.into());
+        settle(&mut host);
+        assert_eq!(host.scroll[&scroll], 0.);
+        host.push(r#"{"offset":100}"#.into());
+        settle(&mut host);
+        assert_eq!(host.scroll[&scroll], 100.);
+        host.push(r#"{"to":"end","smooth":true}"#.into());
+        settle(&mut host);
+        assert_eq!(host.scroll[&scroll], max);
+        // After the glide the box is still anchored at the bottom.
+        host.push(r#"{"rows":53}"#.into());
+        settle(&mut host);
+        let (_, max) = chat_box(&host);
+        assert_eq!(host.scroll[&scroll], max);
+    }
+
+    #[test]
+    fn a_scroll_box_calls_js_once_per_frame_and_its_columns_hold_the_offset_there() {
+        let mut host = chat(50);
+        settle(&mut host);
+        let (scroll, _) = chat_box(&host);
+        let [x, top, _, _] = host.tree.rect(scroll);
+        host.pointer_move(Some([x + 4., top + 5.]));
+        let calls = |host: &Host| -> u32 {
+            let line = texts(host)
+                .into_iter()
+                .find(|t| t.starts_with("calls "))
+                .expect("the status line");
+            line.split(' ').nth(1).unwrap().parse().unwrap()
+        };
+        let before = calls(&host);
+        assert!(host.wheel(-30.));
+        assert!(host.wheel(-30.));
+        settle(&mut host);
+        assert_eq!(
+            calls(&host),
+            before + 1,
+            "two steps before a frame make one call"
+        );
+        let offset = host.scroll[&scroll];
+        let status = texts(&host)
+            .into_iter()
+            .find(|t| t.starts_with("calls "))
+            .unwrap();
+        assert!(
+            status.ends_with(&format!("columns {}", offset as i32)),
+            "{status} against {offset}"
+        );
     }
 }
