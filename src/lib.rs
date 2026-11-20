@@ -63,6 +63,8 @@ pub mod apps {
     pub const CONTAINERS: &str = include_str!(concat!(env!("OUT_DIR"), "/containers.js"));
     /// Test app for a multi-line `TextInput`: wrapping, growing to its max height, Enter and Shift+Enter (SDK + app).
     pub const COMPOSER: &str = include_str!(concat!(env!("OUT_DIR"), "/composer.js"));
+    /// Test app for `Host::reload`: a signal, a field, an image and a scroll column (SDK + app).
+    pub const RELOAD: &str = include_str!(concat!(env!("OUT_DIR"), "/reload.js"));
 }
 
 use contract::Columns;
@@ -309,7 +311,6 @@ pub struct Event {
 /// Message from the UI to the app thread: an event, or new code for a live reload.
 enum Inbox {
     Event(Event),
-    #[cfg(feature = "examples")]
     Reload(String),
 }
 /// Ordered log from the UI to the app thread's replica.
@@ -320,6 +321,8 @@ enum Log {
 struct Bridge {
     events: SyncSender<Inbox>,
     updates: Receiver<Batch>,
+    // Outcome of each reload, sent before the batch that carries it.
+    reports: Receiver<Result<(), String>>,
     // Unbounded so the UI never blocks when it writes to the log.
     log: Sender<Log>,
 }
@@ -333,7 +336,6 @@ trait App {
     /// The view changed in these nodes (or in all of them with `None`). JS apps copy it to their columns.
     fn sync(&mut self, _view: &Tree, _ids: Option<&[u16]>) {}
     /// Replaces the app code and returns the new mount. On failure the previous app keeps running.
-    #[cfg(feature = "examples")]
     fn reload(&mut self, _js: &str) -> Result<Vec<Op>, String> {
         Err("this app does not support live reload".into())
     }
@@ -359,6 +361,7 @@ fn spawn_app(
     let (events, rx) = sync_channel::<Inbox>(MAX_PENDING.into());
     let (tx, updates) = sync_channel(MAX_PENDING.into());
     let (log, entries) = channel();
+    let (report, reports) = channel();
     thread::spawn(move || {
         let replica: Rc<RefCell<Replica>> = Rc::default();
         let start = || {
@@ -402,9 +405,9 @@ fn spawn_app(
             let ops = match message {
                 Inbox::Event(event) => app.handle(event, &replica.borrow().view),
                 // The new app replaces the old one in a single batch: remove the root, then mount.
-                #[cfg(feature = "examples")]
                 Inbox::Reload(js) => match app.reload(&js) {
                     Ok(mount) => {
+                        let _ = report.send(Ok(()));
                         let root = replica.borrow().view.root;
                         root.map(|id| Op::Remove { id })
                             .into_iter()
@@ -412,7 +415,7 @@ fn spawn_app(
                             .collect()
                     }
                     Err(e) => {
-                        eprintln!("reload rejected, the previous version keeps running: {e}");
+                        let _ = report.send(Err(e));
                         Vec::new()
                     }
                 },
@@ -440,6 +443,7 @@ fn spawn_app(
         Bridge {
             events,
             updates,
+            reports,
             log,
         },
     ))
@@ -764,6 +768,7 @@ mod tests {
                 "overlay",
                 "fill",
                 "composer",
+                "reload",
             ]);
         }
         for app in apps {

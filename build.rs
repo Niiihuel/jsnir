@@ -29,6 +29,7 @@ fn main() {
             "fill",
             "containers",
             "composer",
+            "reload",
         ]);
     }
     if apps.is_empty() {

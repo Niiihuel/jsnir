@@ -16,9 +16,9 @@ use crate::{
 use rquickjs::{Ctx, Exception, Function, function::MutFn};
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     rc::Rc,
-    sync::{Arc, mpsc::TryRecvError},
+    sync::{Arc, Mutex, mpsc::TryRecvError},
     time::{Duration, Instant},
 };
 
@@ -160,18 +160,50 @@ pub struct Frame {
     pub ime_area: Option<Rect>,
 }
 
-// The app in QuickJS: `jsnirMount` once, `jsnirEvent(callback, text)` per event.
-struct HostApp(Vm);
+// Adds the host's globals to a VM before its script runs (`jsnirRequest`).
+type Configure = Box<dyn for<'js> Fn(&Ctx<'js>) -> rquickjs::Result<()> + Send>;
+
+// The app in QuickJS: `jsnirMount` once, `jsnirEvent(callback, text)` per event. A reload makes a new VM with the
+// same replica, startup arguments and globals.
+struct HostApp {
+    vm: Vm,
+    replica: Rc<RefCell<Replica>>,
+    args: String,
+    configure: Configure,
+}
 impl App for HostApp {
     fn mount(&mut self) -> Result<Vec<Op>, String> {
-        self.0.try_call("jsnirMount", ())
+        self.vm.try_call("jsnirMount", ())
     }
     fn handle(&mut self, e: Event, _: &Tree) -> Vec<Op> {
-        or_log(self.0.try_call("jsnirEvent", (e.callback, e.text)))
+        or_log(self.vm.try_call("jsnirEvent", (e.callback, e.text)))
     }
     fn sync(&mut self, view: &Tree, ids: Option<&[u16]>) {
-        self.0.sync(view, ids)
+        self.vm.sync(view, ids)
     }
+    fn reload(&mut self, js: &str) -> Result<Vec<Op>, String> {
+        // The old VM's signals carry over to the new one. If the new script fails to load, the old one keeps running.
+        let state = self.vm.try_invoke::<String>("jsnirReloadState", ()).ok();
+        let vm = Vm::try_load_with(js, self.replica.clone(), state.as_deref(), |c| {
+            c.globals().set("__jsnirArgs", self.args.as_str())?;
+            (self.configure)(c)
+        })?;
+        let mount = vm.try_call("jsnirMount", ())?;
+        self.vm = vm;
+        Ok(mount)
+    }
+}
+
+// Where a node is in the tree: its child index at each level from the root, and its kind. A reload finds the
+// nodes it keeps again by this place.
+type Place = (Vec<usize>, std::mem::Discriminant<Node>);
+
+// Native state of the tree that a reload keeps, by place.
+struct Kept {
+    // The focused node, with its field's text and selection.
+    focused: Option<(Place, String, [u32; 2])>,
+    // Scroll offsets, including the fields' own.
+    scroll: Vec<(Place, f32)>,
 }
 
 // Something under the pointer that reacts to it, recorded while drawing: a pressable box, or the root of a
@@ -250,6 +282,10 @@ pub struct Host {
     pub keyframes_at: Option<f32>,
     // Reduced motion: infinite keyframe animations do not run, and their nodes show their base values.
     reduced_motion: bool,
+    // For each message sent to the app and not answered yet: whether it is a reload.
+    inflight: VecDeque<bool>,
+    // Outcomes of the reloads that were applied, oldest first, until `take_reload_result`.
+    reload_results: VecDeque<Result<(), String>>,
 }
 
 const HEIGHT_TRANSITION: Property = Property::Height;
@@ -274,13 +310,17 @@ impl Host {
         script: String,
         args: String,
         text: TextEngine,
-        mut handler: impl FnMut(String) -> Result<String, String> + Send + 'static,
+        handler: impl FnMut(String) -> Result<String, String> + Send + 'static,
     ) -> Result<Self, String> {
+        // Shared by every VM the app runs in, so a reloaded app keeps the same handler.
+        let handler = Arc::new(Mutex::new(handler));
         Self::start(script, args, text, move |ctx| {
+            let handler = handler.clone();
             let request = Function::new(
                 ctx.clone(),
                 MutFn::new(move |ctx: Ctx<'_>, json: String| {
-                    handler(json).map_err(|error| Exception::throw_message(&ctx, &error))
+                    let mut handler = handler.lock().expect("request handler");
+                    (*handler)(json).map_err(|error| Exception::throw_message(&ctx, &error))
                 }),
             )?;
             ctx.globals().set("jsnirRequest", request)
@@ -291,17 +331,22 @@ impl Host {
         script: String,
         args: String,
         text: TextEngine,
-        configure: impl for<'js> FnOnce(&Ctx<'js>) -> rquickjs::Result<()> + Send + 'static,
+        configure: impl for<'js> Fn(&Ctx<'js>) -> rquickjs::Result<()> + Send + 'static,
     ) -> Result<Self, String> {
         let (mount, bridge) = spawn_app(
             Duration::ZERO,
             move |replica: Rc<RefCell<Replica>>| -> Result<Box<dyn App>, String> {
-                let vm = Vm::try_load_with(&script, replica, None, |c| {
-                    c.globals().set("__jsnirArgs", args)?;
+                let vm = Vm::try_load_with(&script, replica.clone(), None, |c| {
+                    c.globals().set("__jsnirArgs", args.as_str())?;
                     configure(c)
                 })
                 .map_err(|error| format!("script failed to load: {error}"))?;
-                Ok(Box::new(HostApp(vm)))
+                Ok(Box::new(HostApp {
+                    vm,
+                    replica,
+                    args,
+                    configure: Box::new(configure),
+                }))
             },
         )?;
         let mut host = Self {
@@ -340,6 +385,8 @@ impl Host {
             hide_caret: false,
             keyframes_at: None,
             reduced_motion: false,
+            inflight: VecDeque::new(),
+            reload_results: VecDeque::new(),
         };
         host.receive(mount);
         if host.tree.root.is_none() {
@@ -364,6 +411,7 @@ impl Host {
                 .try_send(Inbox::Event(event))
                 .expect("event queue");
             self.pending += 1;
+            self.inflight.push_back(false);
         } else {
             self.backlog.push(event);
         }
@@ -375,6 +423,29 @@ impl Host {
             callback: HOST_CALLBACK,
             text,
         });
+    }
+
+    /// Replaces the app with `script` (SDK + app) without restarting: the window, the program's connection and
+    /// the native state of the tree stay. Signals keep their values where the new code creates them in the same
+    /// order with the same initial value. Focus, a field's text and selection, and scroll offsets stay on the nodes
+    /// that keep their place in the tree. Returns false when the event queue is full. The outcome is reported by
+    /// `take_reload_result` once `poll` has applied it; on failure the previous app keeps running.
+    pub fn reload(&mut self, script: String) -> bool {
+        if self.pending == MAX_PENDING {
+            return false;
+        }
+        self.bridge
+            .events
+            .try_send(Inbox::Reload(script))
+            .expect("event queue");
+        self.pending += 1;
+        self.inflight.push_back(true);
+        true
+    }
+
+    /// The outcome of the next reload that `poll` has applied: `Err` when the new code failed to load or mount.
+    pub fn take_reload_result(&mut self) -> Option<Result<(), String>> {
+        self.reload_results.pop_front()
     }
 
     /// Turns reduced motion on or off. While it is on, infinite keyframe animations do not run.
@@ -453,12 +524,96 @@ impl Host {
             match self.bridge.updates.try_recv() {
                 Ok(batch) => {
                     self.pending -= 1;
-                    self.receive(batch);
+                    if self.inflight.pop_front() == Some(true) {
+                        self.receive_reload(batch);
+                    } else {
+                        self.receive(batch);
+                    }
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => panic!("app thread disconnected"),
             }
         }
+    }
+
+    // Applies the batch of a reload. The old tree's native state is kept only if the new code loaded.
+    fn receive_reload(&mut self, batch: Batch) {
+        // The app sends the outcome before the batch that carries it.
+        let outcome = self
+            .bridge
+            .reports
+            .try_recv()
+            .unwrap_or_else(|_| Err("the app did not report the reload".into()));
+        let kept = outcome.is_ok().then(|| self.keep());
+        self.reload_results.push_back(outcome);
+        self.receive(batch);
+        if let Some(kept) = kept {
+            self.restore(kept);
+        }
+    }
+
+    // The native state of the current tree, by place.
+    fn keep(&self) -> Kept {
+        Kept {
+            // The editor holds the focused field's text; for other nodes it is ignored.
+            focused: self.focused.and_then(|id| {
+                Some((
+                    self.place(id)?,
+                    self.editor.text().into_owned(),
+                    self.editor.selection(),
+                ))
+            }),
+            scroll: self
+                .scroll
+                .iter()
+                .filter_map(|(&id, &offset)| Some((self.place(id)?, offset)))
+                .collect(),
+        }
+    }
+
+    // Puts back what `keep` saved on the nodes that now have the same place. A field's draft goes back into its
+    // text, which the app hears of through `onChange`.
+    fn restore(&mut self, kept: Kept) {
+        // A press or drag that began on the old tree ends with it.
+        self.pressed = None;
+        self.editor_dragging = false;
+        for (place, offset) in kept.scroll {
+            if let Some(id) = self.find(&place) {
+                self.scroll.insert(id, offset);
+            }
+        }
+        if let Some((place, text, selection)) = kept.focused
+            && let Some(id) = self.find(&place)
+        {
+            self.focus(Some(id));
+            if let Some(Node::Input { multiline, .. }) = self.tree.nodes.get(&id) {
+                let multiline = *multiline;
+                self.editor.reset(&text, selection, multiline);
+                self.publish(id);
+            }
+        }
+    }
+
+    fn place(&self, id: u16) -> Option<Place> {
+        let kind = std::mem::discriminant(self.tree.nodes.get(&id)?);
+        let mut path = Vec::new();
+        let mut node = id;
+        while let Some(parent) = self.tree.parent(node) {
+            path.push(self.tree.children(parent).iter().position(|&c| c == node)?);
+            node = parent;
+        }
+        (self.tree.root == Some(node)).then(|| {
+            path.reverse();
+            (path, kind)
+        })
+    }
+
+    fn find(&self, (path, kind): &Place) -> Option<u16> {
+        let mut id = self.tree.root?;
+        for &index in path {
+            id = *self.tree.children(id).get(index)?;
+        }
+        (std::mem::discriminant(self.tree.nodes.get(&id)?) == *kind).then_some(id)
     }
 
     // Applies one app batch and updates the layout, transitions, timers and focus that depend on it.
@@ -2429,6 +2584,69 @@ mod tests {
         host.push(r#"{"text":"pushed"}"#.into());
         settle(&mut host);
         assert_eq!(texts(&host), vec!["waiting".to_string()]);
+    }
+
+    // The text of the field, its selection and the id of the field.
+    fn field(host: &Host) -> (u16, String, [u32; 2]) {
+        host.tree
+            .nodes
+            .iter()
+            .find_map(|(id, n)| match n {
+                Node::Input {
+                    text, selection, ..
+                } => Some((id, text.clone(), *selection)),
+                _ => None,
+            })
+            .expect("a field")
+    }
+
+    #[test]
+    fn reload_keeps_signals_and_native_state_and_reports_failures() {
+        let v1 = crate::apps::RELOAD;
+        let mut host = Host::new(v1.into(), "{}".into(), TextEngine::default());
+        host.set_image("a".into(), vec![255; 4 * 2 * 2], [2, 2]);
+        settle(&mut host);
+        click(&mut host, "five");
+        assert!(texts(&host).contains(&"v1:5".into()));
+        host.focus_first_input();
+        host.edit(&[EditorEvent::Insert("draft".into())]);
+        settle(&mut host);
+        let row = host
+            .tree
+            .nodes
+            .iter()
+            .find(|(_, n)| matches!(n, Node::Text { text, .. } if text == "row 0"))
+            .map(|(id, _)| id)
+            .expect("row 0");
+        let [x, y, w, h] = host.tree.rect(row);
+        host.pointer_move(Some([x + w / 2., y + h / 2.]));
+        host.wheel(40.);
+        settle(&mut host);
+        let (input, draft, selection) = field(&host);
+        assert_eq!(host.focused, Some(input));
+        assert_eq!(draft, "draft");
+
+        assert!(host.reload(v1.replace("v1:", "v2:")));
+        settle(&mut host);
+        assert_eq!(host.take_reload_result(), Some(Ok(())));
+        let shown = texts(&host);
+        assert!(shown.contains(&"v2:5".into()), "{shown:?}");
+        let (input, text, kept) = field(&host);
+        assert_eq!((text.as_str(), kept), ("draft", selection));
+        assert_eq!(host.focused, Some(input), "the field keeps focus");
+        assert!(host.scroll.values().any(|&offset| offset == 40.));
+        assert!(
+            !images(&mut host).is_empty(),
+            "the image set before the reload still draws"
+        );
+
+        // A script that does not load: reported, and the app keeps running.
+        assert!(host.reload(format!("{v1}\nfunction (")));
+        settle(&mut host);
+        assert!(matches!(host.take_reload_result(), Some(Err(_))));
+        assert!(texts(&host).contains(&"v2:5".into()));
+        click(&mut host, "plus");
+        assert!(texts(&host).contains(&"v2:6".into()), "{:?}", texts(&host));
     }
 
     // The image items of the next frame.

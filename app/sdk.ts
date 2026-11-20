@@ -785,7 +785,12 @@ function mount(app: () => Element): void {
     root = app;
 }
 var hostHandler: ((message: any) => void) | undefined;
-/** Receives the messages the embedding Rust program sends with `Host::push`, parsed from JSON. The window itself sends `{"jsnirScale": n}` when it opens and whenever its scale factor changes (device pixels per logical pixel). */
+/** Sent by the embedding program (`Host::with_request_handler`): passes `json` to its handler and returns its answer. Throws when the program has no handler. Available while the app mounts. */
+declare function jsnirRequest(json: string): string;
+/**
+ * Receives the messages the embedding Rust program sends with `Host::push`, parsed from JSON. The window itself sends `{"jsnirScale": n}` when it opens and whenever its scale factor changes (device pixels per logical pixel).
+ * A live reload (`Host::reload`) gives the app a new handler, and the program is not told: a mount that needs data asks for it again, e.g. `jsnirRequest('{"cmd":"hello"}')`, and the program answers with `Host::push`.
+ */
 function onHost(handler: (message: any) => void): void {
     hostHandler = handler;
 }

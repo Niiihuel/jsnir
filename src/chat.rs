@@ -449,6 +449,11 @@ impl Chat {
         for js in fresh {
             self.reload(js);
         }
+        while let Ok(report) = self.bridge.reports.try_recv() {
+            if let Err(e) = report {
+                eprintln!("reload rejected, the previous version keeps running: {e}");
+            }
+        }
         while self.pending > 0 {
             match self.bridge.updates.try_recv() {
                 Ok(batch) => {
