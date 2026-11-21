@@ -331,6 +331,44 @@ struct VirtualList {
     delivered: Option<VirtualListId>,
     resident: HashSet<u64>,
     edited: BTreeSet<u64>,
+    reply: ListReplyGate,
+}
+
+// The existing window cursor is speculative only while `pending` is set. No
+// subsequent proposal can consume it until the batch is accepted. On failure
+// it is never reused: the caller must rebuild the VM and mount a fresh list.
+#[derive(Default)]
+struct ListReplyGate {
+    accepted: u64,
+    pending: Option<PendingListReply>,
+    failed: bool,
+    removed: BTreeSet<u64>,
+}
+
+impl ListReplyGate {
+    fn active(&self) -> bool {
+        self.accepted != 0 || self.pending.is_some() || self.failed
+    }
+}
+
+struct PendingListReply {
+    id: ListReplyId,
+    delta: ListDemand,
+    invalidated: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ListReplyId {
+    // Generations are Host-unique, including when the same mount ID is recycled.
+    list: VirtualListId,
+    vm: u64,
+    serial: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ListReplyError {
+    Stale,
+    Rebuild,
 }
 
 #[derive(Default)]
@@ -391,6 +429,7 @@ pub struct Host {
     bound_rows: HashMap<u16, (u16, u64)>,
     list_issuer: u64,
     list_generation: u64,
+    list_vm: u64,
     bridge: Bridge,
     pending: u16,
     layout: Layout,
@@ -524,6 +563,7 @@ impl Host {
             bound_rows: HashMap::new(),
             list_issuer,
             list_generation: 0,
+            list_vm: 0,
             bridge,
             pending: 0,
             layout: Layout::default(),
@@ -601,7 +641,7 @@ impl Host {
             generation,
             VirtualList {
                 rows: list,
-                delivered: entry.1.delivered,
+                delivered: entry.1.delivered.filter(|_| !entry.1.reply.active()),
                 window_dirty: true,
                 ..Default::default()
             },
@@ -811,6 +851,13 @@ impl Host {
             list.edited.insert(key);
         }
         if matches!(edit, ListMutation::Remove(_)) {
+            if list.reply.active() && list.resident.contains(&key) {
+                list.reply.removed.insert(key);
+                if let Some(pending) = &mut list.reply.pending {
+                    // A reply can refer to any resident subtree, not just those it creates.
+                    pending.invalidated = true;
+                }
+            }
             self.unbind_virtual_row(id, key);
         }
         true
@@ -821,6 +868,13 @@ impl Host {
     /// Automatic lists first report demand after a frame lays them out.
     pub fn take_list_demand(&mut self, id: VirtualListId) -> Option<ListDemand> {
         let list = self.virtual_list_mut(id)?;
+        if list.reply.active() {
+            return None;
+        }
+        Self::list_delta(list, id)
+    }
+
+    fn list_delta(list: &mut VirtualList, id: VirtualListId) -> Option<ListDemand> {
         if list.auto.as_ref().is_some_and(|auto| !auto.ready) {
             return None;
         }
@@ -833,23 +887,143 @@ impl Host {
             let mut resident = HashSet::new();
             for (key, _, _) in list.rows.visible() {
                 resident.insert(key);
-                if !list.resident.contains(&key) {
+                if !list.resident.contains(&key) || list.reply.removed.contains(&key) {
                     demand.entering.push(key);
                 }
             }
-            demand
-                .evicted
-                .extend(list.resident.difference(&resident).copied());
+            demand.evicted.extend(
+                list.resident
+                    .iter()
+                    .copied()
+                    .filter(|key| !resident.contains(key) || list.reply.removed.contains(key)),
+            );
             demand.evicted.sort_unstable();
             list.resident = resident;
         }
         demand.changed.extend(
             std::mem::take(&mut list.edited)
                 .into_iter()
-                .filter(|key| list.resident.contains(key)),
+                .filter(|key| list.resident.contains(key) && !list.reply.removed.contains(key)),
         );
+        list.reply.removed.clear();
         list.delivered = Some(id);
         (initial || demand != ListDemand::default()).then_some(demand)
+    }
+
+    // Cut A: intentionally no dispatcher yet. Only a fresh automatic list can
+    // join, and delivery must still check this scope before entering QuickJS.
+    #[allow(dead_code)]
+    fn propose_list_reply(&mut self, id: VirtualListId) -> Option<(ListReplyId, ListDemand)> {
+        let vm = self.list_vm;
+        let list = self.virtual_list_mut(id)?;
+        if list.auto.is_none()
+            || list.reply.pending.is_some()
+            || list.reply.failed
+            || !list.reply.active() && (list.delivered.is_some() || !list.bindings.is_empty())
+        {
+            return None;
+        }
+        let serial = list.reply.accepted.checked_add(1)?;
+        let delta = Self::list_delta(list, id)?;
+        let ticket = ListReplyId {
+            list: id,
+            vm,
+            serial,
+        };
+        // Only the delta, never the whole window, is copied into the pending reply.
+        let pending = PendingListReply {
+            id: ticket,
+            delta: ListDemand {
+                entering: delta.entering.clone(),
+                changed: delta.changed.clone(),
+                evicted: delta.evicted.clone(),
+                retired: delta.retired,
+            },
+            invalidated: false,
+        };
+        list.reply.pending = Some(pending);
+        Some((ticket, delta))
+    }
+
+    // The caller owns transport correlation and must stop dispatching to this VM
+    // on Rebuild. Stale tickets cannot consume or poison the current proposal.
+    #[allow(dead_code)]
+    fn accept_list_reply(
+        &mut self,
+        ticket: ListReplyId,
+        batch: Batch,
+        binds: &[(u64, u16)],
+    ) -> Result<(), ListReplyError> {
+        let id = ticket.list;
+        let Some((generation, list)) = self.virtual_lists.get(&id.node) else {
+            return Err(ListReplyError::Stale);
+        };
+        let Some(pending) = list.reply.pending.as_ref().filter(|p| p.id == ticket) else {
+            return Err(ListReplyError::Stale);
+        };
+        if ticket.vm != self.list_vm || !id.matches(self.list_issuer, *generation) {
+            return Err(ListReplyError::Stale);
+        }
+        let delta = &pending.delta;
+        let evicted: HashSet<_> = delta.evicted.iter().copied().collect();
+        let entering: HashSet<_> = delta.entering.iter().copied().collect();
+        let mut keys = HashSet::new();
+        let mut rows = HashSet::new();
+        let mut creates = HashSet::new();
+        let mut removes = HashSet::new();
+        let mut valid = !list.reply.failed && !pending.invalidated && entering.len() == binds.len();
+        let mut ancestors = HashSet::from([id.node]);
+        let mut parent = self.tree.parent(id.node);
+        while let Some(node) = parent {
+            ancestors.insert(node);
+            parent = self.tree.parent(node);
+        }
+        for op in &batch.ops {
+            match *op {
+                Op::Create {
+                    id: row,
+                    parent: Some(node),
+                    ..
+                } if node == id.node => {
+                    creates.insert(row);
+                }
+                Op::Remove { id: row } => {
+                    removes.insert(row);
+                    valid &= !ancestors.contains(&row)
+                        && self
+                            .bound_rows
+                            .get(&row)
+                            .is_none_or(|&(node, key)| node != id.node || evicted.contains(&key));
+                }
+                _ => {}
+            }
+        }
+        valid &= binds.iter().all(|&(key, row)| {
+            entering.contains(&key)
+                && keys.insert(key)
+                && rows.insert(row)
+                && creates.contains(&row)
+                && list.rows.contains(key)
+                && (!list.bindings.contains_key(&key) || evicted.contains(&key))
+                && (!self.bound_rows.contains_key(&row) || removes.contains(&row))
+        });
+        let gate = &mut self.virtual_list_mut(id).unwrap().reply;
+        let pending = gate.pending.take().unwrap();
+        if !valid {
+            let _ = self.bridge.log.send(Log::Answer(false));
+        }
+        if !valid || !self.receive(batch) {
+            self.virtual_list_mut(id).unwrap().reply.failed = true;
+            return Err(ListReplyError::Rebuild);
+        }
+        for key in pending.delta.evicted {
+            self.unbind_virtual_row(id, key);
+        }
+        for &(key, row) in binds {
+            assert!(self.bind_virtual_row(id, key, row));
+        }
+        self.virtual_list_mut(id).unwrap().reply.accepted = ticket.serial;
+        Ok(())
     }
 
     fn now(&self) -> f64 {
@@ -1003,8 +1177,11 @@ impl Host {
             .unwrap_or_else(|_| Err("the app did not report the reload".into()));
         let kept = outcome.is_ok().then(|| self.keep());
         self.reload_results.push_back(outcome);
-        self.receive(batch);
+        let accepted = self.receive(batch);
         if let Some(kept) = kept {
+            if accepted {
+                self.list_vm = self.list_vm.checked_add(1).expect("VM epochs exhausted");
+            }
             self.restore(kept);
         }
     }
@@ -1074,7 +1251,7 @@ impl Host {
     }
 
     // Applies one app batch and updates the layout, transitions, timers and focus that depend on it.
-    fn receive(&mut self, batch: Batch) {
+    fn receive(&mut self, batch: Batch) -> bool {
         let mut removed = Vec::new();
         let mut created = Vec::new();
         let mut restyled = Vec::new();
@@ -1123,7 +1300,7 @@ impl Host {
         let _ = self.bridge.log.send(Log::Answer(result.is_ok()));
         if let Err(e) = result {
             eprintln!("batch rejected ({e})");
-            return;
+            return false;
         }
         self.scroll_requests.extend(requests);
         // Nodes created and removed in the same batch are gone too.
@@ -1142,6 +1319,10 @@ impl Host {
                 && let Some((_, list)) = self.virtual_lists.get_mut(&list)
             {
                 list.bindings.remove(&key);
+                if let Some(reply) = &mut list.reply.pending {
+                    // A separate batch may recycle an ID before its reply is applied.
+                    reply.invalidated = true;
+                }
             }
             self.virtual_lists.remove(id);
             self.scroll.remove(id);
@@ -1172,6 +1353,7 @@ impl Host {
                 .into_iter()
                 .map(|(ms, callback)| (now + f64::from(ms), callback)),
         );
+        true
     }
 
     // ---------- Input ----------
@@ -1873,12 +2055,22 @@ impl Host {
             let Some((offset, extent)) = auto.preview.take() else {
                 continue;
             };
-            auto.ready = true;
+            let geometry_edited = !std::mem::replace(&mut auto.ready, true);
             if let Some(requested) = auto.requested.take() {
                 list.follow_tail = matches!(requested, ListOffset::Tail);
             }
-            if (offset, extent) != (list.rows.offset(), list.rows.extent()) {
+            let moved = (offset, extent) != (list.rows.offset(), list.rows.extent());
+            if moved {
                 list.apply_viewport(offset, extent);
+            }
+            if (moved || geometry_edited)
+                && let Some(reply) = &mut list.reply.pending
+            {
+                // Observe every committed viewport, so leaving and reentering
+                // before the reply arrives cannot revive a residency grant.
+                let mut granted = reply.delta.entering.iter().chain(&reply.delta.changed);
+                reply.invalidated |=
+                    granted.any(|&key| list.rows.visible_row_at(key, offset, extent).is_none());
             }
         }
     }
@@ -5279,6 +5471,7 @@ mod tests {
                 { op: 'create', id: 3, parent: 2, node: { kind: 'text', text: 'legacy row' } }
             ] }));
         }
+        function jsnirEvent(_, text) { jsnir.batch(text); }
     "#;
 
     fn list_host() -> Host {
@@ -5292,6 +5485,178 @@ mod tests {
             evicted: evicted.to_vec(),
             retired: None,
         })
+    }
+
+    // Test the real batch/answer boundary without introducing a delivery protocol.
+    fn reply_batch(host: &mut Host, ops: &str) -> Batch {
+        host.push(format!(r#"{{"ops":{ops}}}"#));
+        let updates = &host.bridge.updates;
+        let batch = updates.recv_timeout(Duration::from_secs(1)).unwrap();
+        host.pending -= 1;
+        assert_eq!(host.inflight.pop_front(), Some(false));
+        batch
+    }
+
+    #[test]
+    fn list_reply_gate_commits_only_delta_batches() {
+        let mut host = list_host();
+        let keys = (0..10_000).map(|n| (n, 10.));
+        let id = host.replace_auto_virtual_list(2, keys).unwrap();
+        assert!(host.propose_list_reply(id).is_none());
+        host.frame(100., 100., 1., 4096);
+        let (first, delta) = host.propose_list_reply(id).unwrap();
+        assert_eq!(Some(delta), demand(&[0, 1], &[], &[]));
+        assert!(host.propose_list_reply(id).is_none());
+        assert_eq!(host.virtual_list_mut(id).unwrap().reply.accepted, 0);
+        let ops = r#"[
+            {"op":"create","id":4,"parent":2,"node":{"kind":"text","text":"a"}},
+            {"op":"create","id":5,"parent":2,"node":{"kind":"text","text":"b"}}]"#;
+        let batch = reply_batch(&mut host, ops);
+        let result = host.accept_list_reply(first, batch, &[(0, 4), (1, 5)]);
+        assert_eq!(result, Ok(()));
+        assert_eq!(accepted(&mut host, id), first.serial);
+        assert!(host.propose_list_reply(id).is_none());
+        assert!(host.mutate_list(id, ListMutation::Update(1, 10.)));
+        let (edit, delta) = host.propose_list_reply(id).unwrap();
+        assert_eq!(Some(delta), demand(&[], &[1], &[]));
+        let batch = reply_batch(&mut host, r#"[{"op":"settext","id":5,"text":"edited"}]"#);
+        assert_eq!(host.accept_list_reply(edit, batch, &[]), Ok(()));
+        assert_eq!(host.tree.text(5), Some("edited"));
+        assert_eq!(host.bound_rows.get(&5), Some(&(2, 1)));
+        host.set_list_offset(id, ListOffset::Pixels(10.));
+        host.frame(100., 100., 1., 4096);
+        let (shift, delta) = host.propose_list_reply(id).unwrap();
+        assert_eq!(Some(delta), demand(&[2], &[], &[0]));
+        let ops = r#"[{"op":"remove","id":4},
+            {"op":"create","id":4,"parent":2,"node":{"kind":"text","text":"c"}}]"#;
+        let batch = reply_batch(&mut host, ops);
+        assert_eq!(host.accept_list_reply(shift, batch, &[(2, 4)]), Ok(()));
+        assert_eq!(host.bound_rows.get(&4), Some(&(2, 2)));
+        assert!(host.mutate_list(id, ListMutation::Remove(2)));
+        assert!(host.mutate_list(id, ListMutation::Append(2, 10.)));
+        host.set_list_offset(id, ListOffset::Tail);
+        host.frame(100., 100., 1., 4096);
+        let (bad, delta) = host.propose_list_reply(id).unwrap();
+        assert_eq!(Some(delta), demand(&[9999, 2], &[], &[1, 2]));
+        let batch = reply_batch(&mut host, "[]");
+        let result = host.accept_list_reply(bad, batch, &[]);
+        assert_eq!(result, Err(ListReplyError::Rebuild));
+        assert_eq!(accepted(&mut host, id), shift.serial);
+        assert!(host.propose_list_reply(id).is_none());
+        assert!(host.reload(LIST_APP.into()));
+        settle(&mut host);
+        assert_eq!(host.take_reload_result(), Some(Ok(())));
+        assert!(host.virtual_list_mut(id).is_none());
+    }
+
+    fn accepted(host: &mut Host, id: VirtualListId) -> u64 {
+        host.virtual_list_mut(id).unwrap().reply.accepted
+    }
+
+    #[test]
+    fn list_reply_gate_rejects_invalid_batches_and_a_recycled_scope() {
+        let invalid = r#"[{"op":"create","id":4,"parent":2,"node":{"kind":"label","value":1000}}]"#;
+        let wrong = r#"[{"op":"create","id":4,"parent":1,"node":{"kind":"label","value":1}}]"#;
+        for (ops, row) in [(invalid, 4), ("[]", 3), (wrong, 4)] {
+            let mut host = list_host();
+            let id = host.replace_auto_virtual_list(2, [(7, 10.)]).unwrap();
+            host.frame(100., 100., 1., 4096);
+            let (reply, _) = host.propose_list_reply(id).unwrap();
+            let base = host.tree.app_seq;
+            let batch = reply_batch(&mut host, ops);
+            let result = host.accept_list_reply(reply, batch, &[(7, row)]);
+            assert_eq!(result, Err(ListReplyError::Rebuild));
+            assert_eq!(host.tree.app_seq, base);
+            assert_eq!(host.tree.children(2), [3]);
+            assert!(host.bound_rows.is_empty());
+            assert_eq!(host.virtual_list_mut(id).unwrap().reply.accepted, 0);
+            assert!(host.propose_list_reply(id).is_none());
+        }
+        // This Host actually reloads and recycles node IDs in a fresh VM.
+        let mut host = list_host();
+        let id = host.replace_auto_virtual_list(2, [(7, 10.)]).unwrap();
+        host.frame(100., 100., 1., 4096);
+        let (old, _) = host.propose_list_reply(id).unwrap();
+        assert!(host.reload(LIST_APP.into()));
+        settle(&mut host);
+        assert_eq!(host.take_reload_result(), Some(Ok(())));
+        let id = host.replace_auto_virtual_list(2, []).unwrap();
+        host.frame(100., 100., 1., 4096);
+        let (fresh, delta) = host.propose_list_reply(id).unwrap();
+        assert_eq!(delta, ListDemand::default());
+        let wrong_vm = ListReplyId {
+            vm: old.vm,
+            ..fresh
+        };
+        let wrong_list = ListReplyId {
+            list: old.list,
+            ..fresh
+        };
+        for stale in [old, wrong_vm, wrong_list] {
+            let batch = Batch {
+                base: host.tree.app_seq,
+                ops: Vec::new(),
+            };
+            let result = host.accept_list_reply(stale, batch, &[]);
+            assert_eq!(result, Err(ListReplyError::Stale));
+        }
+        let batch = reply_batch(&mut host, "[]");
+        assert_eq!(host.accept_list_reply(fresh, batch, &[]), Ok(()));
+    }
+
+    #[test]
+    fn list_reply_gate_fences_residency_aba() {
+        for remove_key in [true, false] {
+            let mut host = list_host();
+            let keys = (0..6).map(|n| (n, 10.));
+            let id = host.replace_auto_virtual_list(2, keys).unwrap();
+            host.frame(100., 100., 1., 4096);
+            let (reply, _) = host.propose_list_reply(id).unwrap();
+            if remove_key {
+                assert!(host.mutate_list(id, ListMutation::Remove(0)));
+                assert!(host.mutate_list(id, ListMutation::Prepend(0, 10.)));
+                host.set_list_offset(id, ListOffset::Pixels(0.));
+            } else {
+                host.set_list_offset(id, ListOffset::Pixels(30.));
+                host.frame(100., 100., 1., 4096);
+                host.set_list_offset(id, ListOffset::Pixels(0.));
+            }
+            host.frame(100., 100., 1., 4096);
+            let ops = r#"[
+                {"op":"create","id":4,"parent":2,"node":{"kind":"label","value":1}},
+                {"op":"create","id":5,"parent":2,"node":{"kind":"label","value":2}}]"#;
+            let batch = reply_batch(&mut host, ops);
+            let result = host.accept_list_reply(reply, batch, &[(0, 4), (1, 5)]);
+            assert_eq!(result, Err(ListReplyError::Rebuild));
+            assert_eq!(host.tree.children(2), [3]);
+            assert!(host.bound_rows.is_empty());
+            assert_eq!(host.virtual_list_mut(id).unwrap().reply.accepted, 0);
+            assert!(host.propose_list_reply(id).is_none());
+        }
+    }
+
+    #[test]
+    fn list_reply_gate_does_not_apply_a_change_to_a_recycled_row() {
+        let mut host = list_host();
+        let id = host.replace_auto_virtual_list(2, [(7, 10.)]).unwrap();
+        host.frame(100., 100., 1., 4096);
+        let (first, _) = host.propose_list_reply(id).unwrap();
+        let create = r#"[{"op":"create","id":4,"parent":2,"node":{"kind":"text","text":"old"}}]"#;
+        let batch = reply_batch(&mut host, create);
+        assert_eq!(host.accept_list_reply(first, batch, &[(7, 4)]), Ok(()));
+        assert!(host.mutate_list(id, ListMutation::Update(7, 10.)));
+        let (edit, delta) = host.propose_list_reply(id).unwrap();
+        assert_eq!(Some(delta), demand(&[], &[7], &[]));
+        let recycle = r#"[{"op":"remove","id":4},
+            {"op":"create","id":4,"parent":2,"node":{"kind":"text","text":"new"}}]"#;
+        let batch = reply_batch(&mut host, recycle);
+        assert!(host.receive(batch));
+        let edit_ops = r#"[{"op":"settext","id":4,"text":"stale"}]"#;
+        let batch = reply_batch(&mut host, edit_ops);
+        let result = host.accept_list_reply(edit, batch, &[]);
+        assert_eq!(result, Err(ListReplyError::Rebuild));
+        assert_eq!(host.tree.text(4), Some("new"));
+        assert_eq!(accepted(&mut host, id), first.serial);
     }
 
     #[test]
