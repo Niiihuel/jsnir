@@ -78,6 +78,8 @@ type Operation =
     | { op: "setdisabled"; id: number; disabled: boolean }
     | { op: "remove"; id: number }
     | { op: "after"; ms: number; callback: number }
+    | { op: "virtuallist"; id: number; name: string }
+    | { op: "callbackguard"; callback: number; token?: string | undefined }
     | { op: "scrollto"; id: number; offset?: number | undefined; to?: ScrollEdge | undefined; smooth?: boolean };
 /** An app batch. Rust fills in the base. */
 type Batch = { ops: Operation[] };

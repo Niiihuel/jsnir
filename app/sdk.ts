@@ -48,6 +48,12 @@ interface Scope {
     effects: Effect[];
     callbacks: number[];
     children: Scope[];
+    // Virtual rows are transient: neither payloads nor local signals belong in reload state.
+    ids?: number[];
+    cleanup?: Array<() => void>;
+}
+function childScope(transient = currentScope.ids !== undefined): Scope {
+    return { effects: [], callbacks: [], children: [], ids: transient ? [] : undefined };
 }
 var currentScope: Scope = { effects: [], callbacks: [], children: [] };
 function inScope<T>(scope: Scope, body: () => T): T {
@@ -61,8 +67,16 @@ function inScope<T>(scope: Scope, body: () => T): T {
 }
 function dispose(scope: Scope): void {
     for (var i = 0; i < scope.effects.length; i++) scope.effects[i].disposed = true;
-    for (var j = 0; j < scope.callbacks.length; j++) unregister(scope.callbacks[j]);
+    for (var j = 0; j < scope.callbacks.length; j++) {
+        var id = scope.callbacks[j];
+        var guarded = rowCallbacks.get(id);
+        if (guarded === undefined || guarded.scope === scope) unregister(id);
+    }
     for (var k = 0; k < scope.children.length; k++) dispose(scope.children[k]);
+    scope.cleanup?.forEach(run => run());
+    scope.ids?.forEach(id => freeIds.push(id));
+    scope.ids = undefined;
+    scope.cleanup = undefined;
     scope.effects = [];
     scope.callbacks = [];
     scope.children = [];
@@ -88,7 +102,7 @@ interface Signal<T> {
 type Source<T> = T | Signal<T> | (() => T);
 
 function signal<T>(initial: T): Signal<T> {
-    var current: T = restore(initial, function () {
+    var current: T = currentScope.ids !== undefined ? initial : restore(initial, function () {
         return current;
     });
     var subscribers: Effect[] = [];
@@ -207,24 +221,40 @@ type Children = Child | Children[];
 var nextId = 1;
 var freeIds: number[] = [];
 function newId(): number {
-    if (freeIds.length > 0) return freeIds.pop() as number;
-    if (nextId > 65535) throw new RangeError("JSNIR supports up to 65,535 live nodes");
-    return nextId++;
+    if (freeIds.length === 0 && nextId > 65535) throw new RangeError("JSNIR supports up to 65,535 live nodes");
+    var id = freeIds.length > 0 ? freeIds.pop() as number : nextId++;
+    currentScope.ids?.push(id);
+    return id;
 }
 var handlers: Array<((text: string) => void) | undefined> = [];
 var freeCallbacks: number[] = [];
 var placementTokens: { [callback: number]: string | undefined } = {};
 declare var __jsnirPlacementEpoch: string | undefined;
 var nextPlacementToken = 1;
+var nextCallbackToken = 1;
+var rowCallbacks = new Map<number, { token: string; scope: Scope }>();
 function register(handler: (text: string) => void): number {
     var id = freeCallbacks.length > 0 ? (freeCallbacks.pop() as number) : handlers.length + 1;
     handlers[id - 1] = handler;
     currentScope.callbacks.push(id);
+    if (currentScope.ids !== undefined) {
+        var token = (typeof __jsnirPlacementEpoch === "string" ? __jsnirPlacementEpoch : "0")
+            + ":" + nextCallbackToken++;
+        rowCallbacks.set(id, { token, scope: currentScope });
+        send([{ op: "callbackguard", callback: id, token }]);
+    }
     return id;
 }
 function unregister(id: number): void {
     if (handlers[id - 1] === undefined) return;
     handlers[id - 1] = undefined;
+    var guarded = rowCallbacks.get(id);
+    if (guarded !== undefined) {
+        rowCallbacks.delete(id);
+        var callbacks = guarded.scope.callbacks;
+        callbacks[callbacks.indexOf(id)] = 0; // do not unregister a future owner of this id
+        send([{ op: "callbackguard", callback: id }]);
+    }
     if (placementTokens[id] !== undefined) delete placementTokens[id];
     freeCallbacks.push(id);
 }
@@ -249,8 +279,10 @@ interface Mounted {
 }
 /** Mounts `element` under `parent` in its own scope and sends it as one batch, before the sibling `before` if given. */
 function mountInto(parent: number, element: Element, before?: number): Mounted {
-    var scope: Scope = { effects: [], callbacks: [], children: [] };
-    currentScope.children.push(scope);
+    var owner = currentScope;
+    var scope = childScope();
+    var transient = scope.ids !== undefined;
+    owner.children.push(scope);
     var ops: Operation[] = [];
     inScope(scope, function () {
         element.mount(parent, ops);
@@ -259,12 +291,13 @@ function mountInto(parent: number, element: Element, before?: number): Mounted {
     if (first === undefined || first.op !== "create") throw new Error("mountInto: the element created no node");
     if (before !== undefined) first.before = before;
     var id = first.id;
-    var created = ops.filter((op) => op.op === "create").map((op) => (op as { id: number }).id);
+    var created = transient ? [] : ops.filter((op) => op.op === "create").map((op) => (op as { id: number }).id);
     send(ops);
     return {
         id: id,
         remove() {
             dispose(scope);
+            if (transient) owner.children.splice(owner.children.indexOf(scope), 1);
             send([{ op: "remove", id: id }]);
             for (var i = 0; i < created.length; i++) freeIds.push(created[i]);
         },
@@ -396,6 +429,69 @@ function List<T>(props: { items: ListSignal<T>; style?: Style; children: (item: 
         },
     };
 }
+type VirtualPayload = {
+    node: number;
+    mount: string;
+    entering: [string, unknown][];
+    changed: [string, unknown][];
+    evicted: string[];
+};
+var virtualMounts = new Map<number, (delta: VirtualPayload) => [string, number][]>();
+
+/** Rust-indexed scrolling list. The embedder connects `name`; a row reads its latest payload via `item()`. */
+function VirtualList<T>(props: { name: string; style?: Style; children: (key: string, item: () => T) => Element }): Element {
+    return {
+        mount(parent, ops) {
+            var id = newId();
+            var mount: string | undefined;
+            var rows = new Map<string, KeyedRow<T>>();
+            ops.push({ op: "create", id, parent, node: { kind: "list", style: props.style } });
+            ops.push({ op: "virtuallist", id, name: props.name });
+            (currentScope.cleanup ??= []).push(() => {
+                virtualMounts.delete(id);
+                rows.forEach(row => dispose(row.scope));
+                rows.clear();
+            });
+            virtualMounts.set(id, delta => {
+                if (mount !== undefined && mount !== delta.mount) throw new Error("stale virtual List mount");
+                mount = delta.mount;
+                var bindings: [string, number][] = [];
+                delta.evicted.forEach(key => {
+                    var row = rows.get(key);
+                    if (row === undefined) throw new Error("cannot evict a nonresident virtual row");
+                    row.mounted.remove();
+                    dispose(row.scope);
+                    rows.delete(key);
+                });
+                delta.entering.forEach(([key, value]) => {
+                    if (rows.has(key)) throw new Error("duplicate virtual row");
+                    var scope = childScope(true);
+                    var row = inScope(scope, () => {
+                        var payload = signal(value as T);
+                        var mounted = mountInto(id, props.children(key, () => payload.value));
+                        return { signal: payload, mounted, scope };
+                    });
+                    rows.set(key, row);
+                    bindings.push([key, row.mounted.id]);
+                });
+                delta.changed.forEach(([key, value]) => {
+                    var row = rows.get(key);
+                    if (row === undefined) throw new Error("cannot update a nonresident virtual row");
+                    row.signal.value = value as T;
+                });
+                return bindings;
+            });
+        },
+    };
+}
+
+function jsnirVirtualList(json: string): string {
+    var delta = JSON.parse(json) as VirtualPayload;
+    const deliver = virtualMounts.get(delta.node);
+    if (deliver === undefined) throw new Error("unknown virtual List mount");
+    return JSON.stringify(runEvent(() => deliver(delta)));
+}
+
 function Text(props: {
     style?: Style;
     font?: Font;
@@ -627,7 +723,7 @@ function For<T>({
             var order: number[] = [];
             var mountRow = function (item: T, before: number | undefined): KeyedRow<T> {
                 var s = signal(item);
-                var rowScope: Scope = { effects: [], callbacks: [], children: [] };
+                var rowScope = childScope();
                 currentScope.children.push(rowScope);
                 var mounted = inScope(rowScope, function () {
                     return mountInto(id, children(function () {
@@ -845,19 +941,26 @@ function jsnirMount(): void {
 function jsnirPlacement(text: string): void {
     var event = JSON.parse(text) as PopoverPlacement & { callback: number; token: string };
     if (placementTokens[event.callback] !== event.token) return;
-    jsnirEvent(event.callback, JSON.stringify({ side: event.side, anchorOffset: event.anchorOffset }));
+    jsnirEvent(event.callback, JSON.stringify({ side: event.side, anchorOffset: event.anchorOffset }), rowCallbacks.get(event.callback)?.token);
 }
-function jsnirEvent(callback: number, text: string): void {
-    var handler = callback === 0 ? hostEvent : handlers[callback - 1];
+function jsnirEvent(callback: number, text: string, guard?: string): void {
+    const row = rowCallbacks.get(callback);
+    if (row?.token !== guard) return;
+    const handler = callback === 0 ? hostEvent : handlers[callback - 1];
     // A press can arrive after its node was removed: there is nothing left to do.
     if (handler === undefined) return;
+    runEvent(() => row === undefined ? handler(text) : inScope(row.scope, () => handler(text)));
+}
+function runEvent<T>(body: () => T): T {
     var previous = batching;
     batching = true;
+    var result: T;
     try {
-        handler(text);
+        result = body();
     } finally {
         batching = previous;
     }
     flush();
     mountPending();
+    return result;
 }

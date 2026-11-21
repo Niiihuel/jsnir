@@ -2,7 +2,7 @@
 //! handles pointer, focus and text input, runs transitions and timers, and turns the tree into a list
 //! of drawing items that any backend can paint. JS never runs on this thread.
 use crate::{
-    App, Bridge, Event, HOST_CALLBACK, Inbox, Log, MAX_PENDING, Vm,
+    App, Bridge, Event, HOST_CALLBACK, Inbox, ListBindings, Log, MAX_PENDING, Vm,
     editor::{EditorBitmapKey, EditorEvent, EditorFrame, EditorOutput, LineEditor, PointSelection},
     layout::Layout,
     list::List,
@@ -194,6 +194,27 @@ impl App for HostApp {
         }
         or_log(self.vm.try_call("jsnirEvent", (e.callback, e.text)))
     }
+    fn guarded(&mut self, e: Event, guard: String) -> Vec<Op> {
+        or_log(self.vm.try_call("jsnirEvent", (e.callback, e.text, guard)))
+    }
+    fn list(&mut self, delta: String) -> Result<(ListBindings, Vec<Op>), String> {
+        let (reply, ops) = self
+            .vm
+            .try_call_with::<String>("jsnirVirtualList", (delta,))?;
+        let pairs =
+            serde_json::from_str::<Vec<(String, u16)>>(&reply).map_err(|e| e.to_string())?;
+        let bindings = pairs
+            .into_iter()
+            .map(|(key, row)| {
+                let number = key.parse::<u64>().map_err(|_| "invalid virtual row key")?;
+                if number.to_string() != key {
+                    return Err("invalid virtual row key");
+                }
+                Ok((number, row))
+            })
+            .collect::<Result<_, _>>()?;
+        Ok((bindings, ops))
+    }
     fn sync(&mut self, view: &Tree, ids: Option<&[u16]>) {
         self.vm.sync(view, ids)
     }
@@ -321,8 +342,11 @@ pub struct ListDemand {
     pub retired: Option<VirtualListId>,
 }
 
+type RowProvider = Box<dyn FnMut(u64) -> Result<serde_json::Value, String> + Send>;
+
 #[derive(Default)]
 struct VirtualList {
+    provider: Option<RowProvider>,
     rows: List,
     bindings: HashMap<u64, u16>,
     follow_tail: bool,
@@ -423,8 +447,17 @@ impl VirtualList {
     }
 }
 
+struct QueuedEvent {
+    event: Event,
+    guard: Option<String>,
+}
+
 pub struct Host {
     pub tree: Tree,
+    list_mounts: HashMap<u16, String>,
+    list_ticket: Option<ListReplyId>,
+    list_error: Option<String>,
+    callback_guards: HashMap<u16, String>,
     virtual_lists: HashMap<u16, (u64, VirtualList)>,
     bound_rows: HashMap<u16, (u16, u64)>,
     list_issuer: u64,
@@ -437,9 +470,9 @@ pub struct Host {
     motion: Motion,
     clock: Instant,
     // Timers from `after` operations: deadline in ms on `clock`, and the callback.
-    timers: Vec<(f64, u16)>,
+    timers: Vec<(f64, QueuedEvent)>,
     // Events that did not fit in the queue, sent on the next poll.
-    backlog: Vec<Event>,
+    backlog: Vec<QueuedEvent>,
     pointer: Option<[f32; 2]>,
     hovered: Option<u16>,
     pressed: Option<u16>,
@@ -559,6 +592,10 @@ impl Host {
         )?;
         let mut host = Self {
             tree: Tree::default(),
+            list_mounts: HashMap::new(),
+            list_ticket: None,
+            list_error: None,
+            callback_guards: HashMap::new(),
             virtual_lists: HashMap::new(),
             bound_rows: HashMap::new(),
             list_issuer,
@@ -611,6 +648,44 @@ impl Host {
         Ok(host)
     }
 
+    /// Connects a uniquely named SDK `VirtualList` mount to an indexed Rust history.
+    /// `provide` runs on the Host thread and must be cheap and nonblocking. It is called only
+    /// for visible entering or edited keys. Reconnect with the current index after a remount.
+    pub fn connect_virtual_list(
+        &mut self,
+        name: &str,
+        rows: impl IntoIterator<Item = (u64, f32)>,
+        provide: impl FnMut(u64) -> Result<serde_json::Value, String> + Send + 'static,
+    ) -> Result<VirtualListId, String> {
+        if let Some(error) = &self.list_error {
+            return Err(error.clone());
+        }
+        let mut nodes = self
+            .list_mounts
+            .iter()
+            .filter(|(_, mounted)| *mounted == name);
+        let node = *nodes
+            .next()
+            .ok_or_else(|| format!("no virtual List mounted as {name:?}"))?
+            .0;
+        if nodes.next().is_some() || self.virtual_lists.contains_key(&node) {
+            return Err(format!(
+                "virtual List {name:?} is ambiguous or already connected"
+            ));
+        }
+        let id = self
+            .replace_auto_virtual_list(node, rows)
+            .ok_or_else(|| format!("invalid index for virtual List {name:?}"))?;
+        self.virtual_list_mut(id).unwrap().provider = Some(Box::new(provide));
+        Ok(id)
+    }
+
+    /// A failed wire reply freezes app events. Recover with a successful reload and reconnect
+    /// the new mounts. An unsuccessful reload does not clear the error.
+    pub fn virtual_list_error(&self) -> Option<&str> {
+        self.list_error.as_deref()
+    }
+
     /// Opts an existing List node into Rust-side demand, or replaces its input sequence.
     /// Duplicate keys or invalid heights reject the entire replacement. The new viewport starts
     /// empty and old row bindings are dropped. Only bound children contribute to its frame.
@@ -620,7 +695,12 @@ impl Host {
         node: u16,
         rows: impl IntoIterator<Item = (u64, f32)>,
     ) -> Option<VirtualListId> {
-        if !matches!(self.tree.nodes.get(&node), Some(Node::List { .. })) {
+        if !matches!(self.tree.nodes.get(&node), Some(Node::List { .. }))
+            || self
+                .virtual_lists
+                .get(&node)
+                .is_some_and(|(_, list)| list.provider.is_some())
+        {
             return None;
         }
         let mut list = List::default();
@@ -868,7 +948,7 @@ impl Host {
     /// Automatic lists first report demand after a frame lays them out.
     pub fn take_list_demand(&mut self, id: VirtualListId) -> Option<ListDemand> {
         let list = self.virtual_list_mut(id)?;
-        if list.reply.active() {
+        if list.reply.active() || list.provider.is_some() {
             return None;
         }
         Self::list_delta(list, id)
@@ -910,9 +990,7 @@ impl Host {
         (initial || demand != ListDemand::default()).then_some(demand)
     }
 
-    // Cut A: intentionally no dispatcher yet. Only a fresh automatic list can
-    // join, and delivery must still check this scope before entering QuickJS.
-    #[allow(dead_code)]
+    // Only a fresh automatic list can join the accepted-reply path.
     fn propose_list_reply(&mut self, id: VirtualListId) -> Option<(ListReplyId, ListDemand)> {
         let vm = self.list_vm;
         let list = self.virtual_list_mut(id)?;
@@ -947,7 +1025,6 @@ impl Host {
 
     // The caller owns transport correlation and must stop dispatching to this VM
     // on Rebuild. Stale tickets cannot consume or poison the current proposal.
-    #[allow(dead_code)]
     fn accept_list_reply(
         &mut self,
         ticket: ListReplyId,
@@ -1035,16 +1112,36 @@ impl Host {
         self.pending > 0 || !self.timers.is_empty() || !self.backlog.is_empty()
     }
 
+    fn queued_event(&self, event: Event) -> QueuedEvent {
+        QueuedEvent {
+            guard: self.callback_guards.get(&event.callback).cloned(),
+            event,
+        }
+    }
+
     fn send(&mut self, event: Event) {
-        if self.pending < MAX_PENDING {
-            self.bridge
-                .events
-                .try_send(Inbox::Event(event))
-                .expect("event queue");
+        self.send_queued(self.queued_event(event));
+    }
+
+    fn send_queued(&mut self, queued: QueuedEvent) {
+        if self.list_error.is_some()
+            || self.callback_guards.get(&queued.event.callback) != queued.guard.as_ref()
+        {
+            return;
+        }
+        if self.pending < MAX_PENDING
+            && self.list_ticket.is_none()
+            && (self.list_mounts.is_empty() || !self.inflight.contains(&true))
+        {
+            let message = match queued.guard {
+                Some(guard) => Inbox::Guarded(queued.event, guard),
+                None => Inbox::Event(queued.event),
+            };
+            self.bridge.events.try_send(message).expect("event queue");
             self.pending += 1;
             self.inflight.push_back(false);
         } else {
-            self.backlog.push(event);
+            self.backlog.push(queued);
         }
     }
 
@@ -1062,7 +1159,11 @@ impl Host {
     /// that keep their place in the tree. Returns false when the event queue is full. The outcome is reported by
     /// `take_reload_result` once `poll` has applied it; on failure the previous app keeps running.
     pub fn reload(&mut self, script: String) -> bool {
-        if self.pending == MAX_PENDING {
+        if self.pending == MAX_PENDING
+            || self.list_ticket.is_some()
+            || (!self.list_mounts.is_empty()
+                && (!self.backlog.is_empty() || self.inflight.contains(&true)))
+        {
             return false;
         }
         self.bridge
@@ -1138,18 +1239,19 @@ impl Host {
     /// Fires due timers and applies the batches that arrived.
     pub fn poll(&mut self) {
         let now = self.now();
-        let (due, waiting): (Vec<_>, Vec<_>) =
-            self.timers.drain(..).partition(|(at, _)| *at <= now);
+        let guards = &self.callback_guards;
+        let (due, waiting): (Vec<_>, Vec<_>) = self
+            .timers
+            .drain(..)
+            .filter(|(_, event)| guards.get(&event.event.callback) == event.guard.as_ref())
+            .partition(|(at, _)| *at <= now);
         self.timers = waiting;
         let backlog = std::mem::take(&mut self.backlog);
-        for event in backlog {
-            self.send(event);
-        }
-        for (_, callback) in due {
-            self.send(Event {
-                callback,
-                text: String::new(),
-            });
+        for event in backlog
+            .into_iter()
+            .chain(due.into_iter().map(|(_, event)| event))
+        {
+            self.send_queued(event);
         }
         while self.pending > 0 {
             match self.bridge.updates.try_recv() {
@@ -1157,6 +1259,8 @@ impl Host {
                     self.pending -= 1;
                     if self.inflight.pop_front() == Some(true) {
                         self.receive_reload(batch);
+                    } else if let Some(ticket) = self.list_ticket.take() {
+                        self.receive_list_reply(ticket, batch);
                     } else {
                         self.receive(batch);
                     }
@@ -1179,11 +1283,20 @@ impl Host {
         if kept.is_some() {
             // The app has already installed the new VM, even if its tree batch fails.
             self.list_vm = self.list_vm.checked_add(1).expect("VM epochs exhausted");
+            self.callback_guards.clear();
+            self.timers.retain(|(_, event)| event.guard.is_none());
         }
         self.reload_results.push_back(outcome);
         let accepted = self.receive(batch);
         if let Some(kept) = kept {
-            if !accepted {
+            if accepted {
+                self.list_error = None;
+            } else {
+                if !self.list_mounts.is_empty() {
+                    self.fail_list(
+                        "reload replaced the VM but its mount batch was rejected".into(),
+                    );
+                }
                 for (_, list) in self.virtual_lists.values_mut() {
                     if list.reply.active() {
                         // The surviving tree belongs to the retired VM. Do not
@@ -1268,7 +1381,7 @@ impl Host {
         let mut created = Vec::new();
         let mut restyled = Vec::new();
         let mut texts = Vec::new();
-        let mut timers = Vec::new();
+        let mut list_metadata = Vec::new();
         let mut requests = Vec::new();
         // Parents whose children were placed out of order, and moved nodes (their parent is known after the apply).
         let mut reordered = Vec::new();
@@ -1303,7 +1416,9 @@ impl Host {
                 }
                 Op::SetStyle { id, .. } => restyled.push(*id),
                 Op::SetText { id, .. } | Op::SetSpans { id, .. } => texts.push(*id),
-                Op::After { ms, callback } => timers.push((*ms, *callback)),
+                Op::After { .. } | Op::VirtualList { .. } | Op::CallbackGuard { .. } => {
+                    list_metadata.push(op.clone());
+                }
                 Op::ScrollTo {
                     id,
                     offset,
@@ -1357,6 +1472,7 @@ impl Host {
                 }
             }
             self.virtual_lists.remove(id);
+            self.list_mounts.remove(id);
             self.scroll.remove(id);
             self.scroll_requests.remove(id);
             self.anchors.remove(id);
@@ -1380,11 +1496,33 @@ impl Host {
             self.layout.text_changed(id);
         }
         let now = self.now();
-        self.timers.extend(
-            timers
-                .into_iter()
-                .map(|(ms, callback)| (now + f64::from(ms), callback)),
-        );
+        for op in list_metadata {
+            match op {
+                Op::After { ms, callback } => {
+                    let event = self.queued_event(Event {
+                        callback,
+                        text: String::new(),
+                    });
+                    self.timers.push((now + f64::from(ms), event));
+                }
+                Op::VirtualList { id, name } if self.tree.nodes.get(&id).is_some() => {
+                    self.list_mounts.insert(id, name);
+                }
+                Op::CallbackGuard {
+                    callback,
+                    token: Some(token),
+                } => {
+                    self.callback_guards.insert(callback, token);
+                }
+                Op::CallbackGuard {
+                    callback,
+                    token: None,
+                } => {
+                    self.callback_guards.remove(&callback);
+                }
+                _ => {}
+            }
+        }
         true
     }
 
@@ -2078,7 +2216,93 @@ impl Host {
         }
         self.commit_list_viewports();
         self.publish_placements(placements);
+        self.publish_list_delta();
         frame
+    }
+
+    fn publish_list_delta(&mut self) {
+        // Start only at the head of the ordered lane. Until the answer is applied,
+        // later callbacks stay on the UI side and cannot observe speculative state.
+        if self.pending != 0 || !self.backlog.is_empty() || self.list_error.is_some() {
+            return;
+        }
+        let ids: Vec<_> = self
+            .virtual_lists
+            .iter()
+            .filter_map(|(&node, &(generation, ref list))| {
+                list.provider.is_some().then_some(VirtualListId {
+                    issuer: self.list_issuer,
+                    node,
+                    generation,
+                })
+            })
+            .collect();
+        for id in ids {
+            let Some((ticket, delta)) = self.propose_list_reply(id) else {
+                continue;
+            };
+            let provide = self
+                .virtual_list_mut(id)
+                .unwrap()
+                .provider
+                .as_mut()
+                .unwrap();
+            let mut rows = |keys: Vec<u64>| -> Result<Vec<_>, String> {
+                keys.into_iter()
+                    .map(|key| Ok((key.to_string(), provide(key)?)))
+                    .collect()
+            };
+            let payload = (|| -> Result<_, String> {
+                Ok(serde_json::json!({
+                    "node": id.node,
+                    "mount": id.generation.to_string(),
+                    "entering": rows(delta.entering)?,
+                    "changed": rows(delta.changed)?,
+                    "evicted": delta.evicted.into_iter().map(|key| key.to_string()).collect::<Vec<_>>(),
+                }).to_string())
+            })();
+            match payload {
+                Ok(payload) => {
+                    self.bridge
+                        .events
+                        .try_send(Inbox::List(payload))
+                        .expect("event queue");
+                    self.pending += 1;
+                    self.inflight.push_back(false);
+                    self.list_ticket = Some(ticket);
+                }
+                Err(error) => self.fail_list(format!("virtual List payload: {error}")),
+            }
+            break;
+        }
+    }
+
+    fn receive_list_reply(&mut self, ticket: ListReplyId, batch: Batch) {
+        match self
+            .bridge
+            .list_replies
+            .try_recv()
+            .expect("list reply precedes batch")
+        {
+            Ok(binds) => {
+                if let Err(error) = self.accept_list_reply(ticket, batch, &binds) {
+                    if error == ListReplyError::Stale {
+                        let _ = self.bridge.log.send(Log::Answer(false));
+                    }
+                    self.fail_list(format!("virtual List reply rejected: {error:?}"));
+                }
+            }
+            Err(error) => {
+                let _ = self.bridge.log.send(Log::Answer(false));
+                self.fail_list(format!("virtual List callback: {error}"));
+            }
+        }
+    }
+
+    fn fail_list(&mut self, error: String) {
+        self.list_error = Some(error);
+        self.backlog.clear();
+        self.timers.clear();
     }
 
     fn commit_list_viewports(&mut self) {
@@ -2209,7 +2433,7 @@ impl Host {
                 if self.backlog.is_empty() {
                     self.send(event);
                 } else {
-                    self.backlog.push(event);
+                    self.backlog.push(self.queued_event(event));
                 }
             }
             self.placements.insert(id, placement);
@@ -5508,6 +5732,109 @@ mod tests {
 
     fn list_host() -> Host {
         Host::new(LIST_APP.into(), "{}".into(), TextEngine::default())
+    }
+
+    fn virtual_list_script() -> String {
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                std::fs::remove_dir_all(&self.0).expect("clean compiled fixture");
+            }
+        }
+        let out = std::process::Command::new("mktemp")
+            .arg("-d")
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let dir = Scratch(String::from_utf8(out.stdout).unwrap().trim().into());
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let output = std::process::Command::new(crate::typescript::compiler(root))
+            .current_dir(root)
+            .args([
+                "--ignoreConfig",
+                "--strict",
+                "--target",
+                "es2020",
+                "--lib",
+                "es2020",
+                "--types",
+                "./app/jsnir.d.ts",
+                "--jsx",
+                "react",
+                "--jsxFactory",
+                "h",
+                "app/sdk.ts",
+                "app/virtual-list.tsx",
+                "--outDir",
+            ])
+            .arg(&dir.0)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::fs::read_to_string(dir.0.join("sdk.js")).unwrap()
+            + &std::fs::read_to_string(dir.0.join("virtual-list.js")).unwrap()
+    }
+
+    #[test]
+    fn sdk_virtual_list_delivers_only_visible_rows_and_keeps_resident_controls() {
+        const KEY: u64 = 9_007_199_254_740_993;
+        let script = virtual_list_script();
+        let mut host = Host::new(script.clone(), "{}".into(), TextEngine::default());
+        let lookups = Arc::new(Mutex::new(Vec::new()));
+        let content = Arc::new(Mutex::new(HashMap::from([(KEY + 1, "before")])));
+        let index = (KEY..KEY + 10_000).map(|key| (key, 24.));
+        let id = host.connect_virtual_list("messages", index, {
+            let (lookups, content) = (lookups.clone(), content.clone());
+            move |key| {
+                lookups.lock().unwrap().push(key);
+                let content = content.lock().unwrap();
+                Ok(serde_json::json!({"author":"Ada", "body":content.get(&key).unwrap_or(&"message")}))
+            }
+        }).unwrap();
+        host.set_image("attachment".into(), vec![255; 4], [1, 1]);
+        assert!(lookups.lock().unwrap().is_empty());
+        settle(&mut host);
+        assert_eq!(*lookups.lock().unwrap(), [KEY, KEY + 1]);
+        let label = format!("react {}: 0", KEY + 1);
+        let control = |host: &Host, label: &str| {
+            host.tree
+                .nodes
+                .iter()
+                .find_map(|(id, _)| (host.tree.text(id) == Some(label)).then_some(id))
+                .unwrap()
+        };
+        let control_id = control(&host, &label);
+        click(&mut host, &label);
+        let label = format!("react {}: 1", KEY + 1);
+        assert_eq!(control(&host, &label), control_id);
+        assert!(host.set_list_offset(id, ListOffset::Pixels(24.)));
+        settle(&mut host);
+        assert_eq!(control(&host, &label), control_id);
+        assert_eq!(*lookups.lock().unwrap(), [KEY, KEY + 1, KEY + 2]);
+        assert!(host.mutate_list(id, ListMutation::Prepend(KEY - 1, 24.)));
+        settle(&mut host);
+        assert_eq!(host.list_offset(id), Some(48.));
+        assert_eq!(*lookups.lock().unwrap(), [KEY, KEY + 1, KEY + 2]);
+        content.lock().unwrap().insert(KEY + 1, "edited");
+        assert!(host.mutate_list(id, ListMutation::Update(KEY + 9999, 24.)));
+        assert!(host.mutate_list(id, ListMutation::Update(KEY + 1, 24.)));
+        settle(&mut host);
+        assert!(texts(&host).contains(&"Ada edited".into()));
+        assert_eq!(control(&host, &label), control_id);
+        assert_eq!(*lookups.lock().unwrap(), [KEY, KEY + 1, KEY + 2, KEY + 1]);
+        assert!(host.mutate_list(id, ListMutation::Remove(KEY + 1)));
+        settle(&mut host);
+        assert!(!texts(&host).contains(&label));
+        assert_eq!(host.virtual_list_error(), None);
+        assert!(host.reload(script));
+        settle(&mut host);
+        assert_eq!(host.take_reload_result(), Some(Ok(())));
+        assert!(!host.set_list_offset(id, ListOffset::Tail));
     }
 
     fn demand(entering: &[u64], changed: &[u64], evicted: &[u64]) -> Option<ListDemand> {

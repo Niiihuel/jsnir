@@ -227,10 +227,17 @@ impl Vm {
     /// Calls a global app function and collects the operations it emitted through `jsnir`.
     /// If the function throws, the operations it already emitted are dropped: a batch is all or nothing.
     fn try_call(&self, name: &str, args: impl for<'js> IntoArgs<'js>) -> Result<Vec<Op>, String> {
+        self.try_call_with::<()>(name, args).map(|((), ops)| ops)
+    }
+    fn try_call_with<R: for<'js> rquickjs::FromJs<'js>>(
+        &self,
+        name: &str,
+        args: impl for<'js> IntoArgs<'js>,
+    ) -> Result<(R, Vec<Op>), String> {
         self.ops.borrow_mut().clear();
-        let result = self.try_invoke::<()>(name, args);
+        let result = self.try_invoke::<R>(name, args);
         let ops = std::mem::take(&mut *self.ops.borrow_mut());
-        result.map(|()| ops)
+        result.map(|value| (value, ops))
     }
     #[cfg(all(test, feature = "examples"))]
     fn call(&self, name: &str, args: impl for<'js> IntoArgs<'js>) -> Vec<Op> {
@@ -315,6 +322,8 @@ pub struct Event {
 /// Message from the UI to the app thread: an event, or new code for a live reload.
 enum Inbox {
     Event(Event),
+    Guarded(Event, String),
+    List(String),
     Reload(String),
 }
 /// Ordered log from the UI to the app thread's replica.
@@ -322,11 +331,14 @@ enum Log {
     Answer(bool),
     Ui(Batch),
 }
+type ListBindings = Vec<(u64, u16)>;
+
 struct Bridge {
     events: SyncSender<Inbox>,
     updates: Receiver<Batch>,
     // Outcome of each reload, sent before the batch that carries it.
     reports: Receiver<Result<(), String>>,
+    list_replies: Receiver<Result<ListBindings, String>>,
     // Unbounded so the UI never blocks when it writes to the log.
     log: Sender<Log>,
 }
@@ -337,6 +349,12 @@ const MAX_PENDING: u16 = 64;
 trait App {
     fn mount(&mut self) -> Result<Vec<Op>, String>;
     fn handle(&mut self, event: Event, view: &Tree) -> Vec<Op>;
+    fn guarded(&mut self, _event: Event, _guard: String) -> Vec<Op> {
+        Vec::new()
+    }
+    fn list(&mut self, _delta: String) -> Result<(ListBindings, Vec<Op>), String> {
+        Err("this app does not implement virtual List".into())
+    }
     /// The view changed in these nodes (or in all of them with `None`). JS apps copy it to their columns.
     fn sync(&mut self, _view: &Tree, _ids: Option<&[u16]>) {}
     /// Replaces the app code and returns the new mount. On failure the previous app keeps running.
@@ -366,6 +384,7 @@ fn spawn_app(
     let (tx, updates) = sync_channel(MAX_PENDING.into());
     let (log, entries) = channel();
     let (report, reports) = channel();
+    let (list_reply, list_replies) = channel();
     thread::spawn(move || {
         let replica: Rc<RefCell<Replica>> = Rc::default();
         let start = || {
@@ -389,7 +408,7 @@ fn spawn_app(
             return;
         }
         for message in rx {
-            if matches!(message, Inbox::Event(_)) {
+            if matches!(message, Inbox::Event(_) | Inbox::Guarded(..)) {
                 thread::sleep(delay);
             }
             // Catch up with the log. JS is not running, so the columns can be written.
@@ -406,8 +425,20 @@ fn spawn_app(
             if all || !ids.is_empty() {
                 app.sync(&replica.borrow().view, (!all).then_some(&ids));
             }
+            let list_delivery = matches!(message, Inbox::List(_));
             let ops = match message {
                 Inbox::Event(event) => app.handle(event, &replica.borrow().view),
+                Inbox::Guarded(event, guard) => app.guarded(event, guard),
+                Inbox::List(delta) => match app.list(delta) {
+                    Ok((binds, ops)) => {
+                        let _ = list_reply.send(Ok(binds));
+                        ops
+                    }
+                    Err(error) => {
+                        let _ = list_reply.send(Err(error));
+                        Vec::new()
+                    }
+                },
                 // The new app replaces the old one in a single batch: remove the root, then mount.
                 Inbox::Reload(js) => match app.reload(&js) {
                     Ok(mount) => {
@@ -428,10 +459,22 @@ fn spawn_app(
                 base: replica.borrow().view.app_seq,
                 ops,
             };
-            let produced = replica.borrow_mut().produced(&batch);
-            // Removing nodes changes many ids at once: resync all columns.
+            // The list lane knows the exact evicted subtrees, so it need not republish
+            // columns for untouched resident rows on every scroll.
             let removed = batch.ops.iter().any(|op| matches!(op, Op::Remove { .. }));
+            let list_ids = list_delivery.then(|| {
+                let mut ids = touched(&batch.ops);
+                let state = replica.borrow();
+                for op in &batch.ops {
+                    if let Op::Remove { id } = op {
+                        ids.extend(state.view.subtree(*id));
+                    }
+                }
+                ids
+            });
+            let produced = replica.borrow_mut().produced(&batch);
             match produced {
+                Ok(()) if let Some(ids) = list_ids => app.sync(&replica.borrow().view, Some(&ids)),
                 Ok(()) if removed => app.sync(&replica.borrow().view, None),
                 Ok(()) => app.sync(&replica.borrow().view, Some(&touched(&batch.ops))),
                 Err(e) => eprintln!("invalid batch from the app ({e}): the UI will reject it"),
@@ -448,6 +491,7 @@ fn spawn_app(
             events,
             updates,
             reports,
+            list_replies,
             log,
         },
     ))

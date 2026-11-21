@@ -602,6 +602,10 @@ contract_enum! {
         Remove { id: u16 },
         /// Calls `callback` once after `ms` milliseconds. It touches no node.
         After { ms: f32, callback: u16 },
+        /// Declares the name of an SDK virtual List mount. The embedder supplies its rows separately.
+        VirtualList { id: u16, name: String },
+        /// Guards callbacks from resident row scopes against ID reuse.
+        CallbackGuard { callback: u16, (default) token: Option<String> },
         /// UI only: an app batch that contains it is rejected.
         (ui) SetInput { id: u16, text: String, selection: [u32; 2] },
         /// UI only: rectangle computed by the layout (x, y, width, height).
@@ -732,7 +736,10 @@ impl Op {
             | Op::SetScroll { id, .. }
             | Op::Move { id, .. }
             | Op::Remove { id } => [Some(*id), None],
-            Op::After { .. } | Op::ScrollTo { .. } => [None, None],
+            Op::After { .. }
+            | Op::ScrollTo { .. }
+            | Op::VirtualList { .. }
+            | Op::CallbackGuard { .. } => [None, None],
         }
     }
 }
@@ -848,6 +855,17 @@ impl Tree {
         let mut has_root = self.root.is_some();
         for op in ops {
             match (op, ui) {
+                (Op::VirtualList { id, name }, false) => {
+                    if name.is_empty() || !matches!(created.get(id), Some(Some(Node::List { .. })))
+                    {
+                        return Err("invalid_virtual_list_mount");
+                    }
+                }
+                (Op::CallbackGuard { callback, .. }, false) => {
+                    if *callback == 0 {
+                        return Err("invalid_callback_guard");
+                    }
+                }
                 (Op::SetInput { id, .. }, true) => {
                     if !matches!(self.nodes.get(id), Some(Node::Input { .. })) {
                         return Err("invalid_node");
@@ -1128,7 +1146,7 @@ impl Tree {
                         *disabled = new;
                     }
                 }
-                Op::After { .. } => {}
+                Op::After { .. } | Op::VirtualList { .. } | Op::CallbackGuard { .. } => {}
                 Op::SetRect { id, rect } => {
                     let i = id as usize;
                     if self.rects.len() <= i {
