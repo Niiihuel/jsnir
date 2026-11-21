@@ -312,15 +312,15 @@ impl List {
         self.keys.contains_key(&key)
     }
 
-    /// Look up one key in the same half-open window as `visible`, additionally capped by the list box.
-    pub(crate) fn visible_row(&self, key: u64, limit: f64) -> Option<(f64, f64)> {
-        let end = self.offset + self.extent.min(limit);
-        if end <= self.offset {
+    /// Look up one key in a half-open window, which may be a tentative layout viewport.
+    pub(crate) fn visible_row_at(&self, key: u64, offset: f64, extent: f64) -> Option<(f64, f64)> {
+        let end = offset + extent;
+        if end <= offset {
             return None;
         }
         let root = self.root.as_ref()?;
         let (top, bottom, height) = root.span_at((0., root.total), *self.keys.get(&key)?);
-        (top < bottom && top < end && bottom > self.offset).then_some((top, height))
+        (top < bottom && top < end && bottom > offset).then_some((top, height))
     }
 
     fn clamp(&self, offset: f64) -> f64 {

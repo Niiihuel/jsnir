@@ -32,8 +32,12 @@ The first priorities are keeping the UI responsive when the app VM fails, preser
    intersection of the supplied viewport and the list box are laid out and drawn, using their indexed
    heights and offsets. Paint and pointer hits are clipped to that viewport; fixed descendants stay
    inside it rather than becoming window overlays. Legacy lists are unchanged.
-   Next: derive demand from layout and scrolling, send it to QuickJS, and mount only demanded rows in
-   the SDK. Host bindings do not implement any of those steps.
+   `replace_auto_virtual_list` instead takes the List box's logical height from the completed Host frame.
+   `set_list_offset` queues a pixel or tail position without supplying an extent. Wheel input scrolls
+   under the pointer and pins at the end; a pixel request or upward wheel movement unpins it. The
+   automatic mode moves directly even for line wheels; legacy scroll glides are unchanged. Demand
+   starts after the first layout; unchanged visible keys produce no repeat demand.
+   Next: bridge the demand and row bindings to QuickJS and mount only demanded rows in the SDK.
 7. **Layout:** percentages, min/max sizes, wrapping, grid, z-order. **Text:** ellipsis, alignment, rich spans,
    font loading from the app, system font fallback. **Images.**
 8. **Rendering:** rounded clipping, rotation, backdrop blur, a glyph atlas instead of one texture per text,

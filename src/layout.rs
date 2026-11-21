@@ -380,7 +380,7 @@ impl Layout {
         width: f32,
         height: f32,
     ) -> Vec<(u16, [f32; 4])> {
-        self.compute_with_rows(tree, text, width, height, |_, _| Vec::new())
+        self.compute_with_rows(tree, text, width, height, |_, _| None)
     }
 
     pub(crate) fn compute_with_rows(
@@ -389,7 +389,7 @@ impl Layout {
         text: &mut TextEngine,
         width: f32,
         height: f32,
-        mut rows: impl FnMut(u16, f32) -> Vec<(u16, f32, f32)>,
+        mut rows: impl FnMut(u16, f32) -> Option<Vec<(u16, f32, f32)>>,
     ) -> Vec<(u16, [f32; 4])> {
         self.visible_rows.clear();
         let Some(root) = self.root else {
@@ -531,16 +531,20 @@ impl Layout {
             {
                 follows.push((id, target));
             }
-            if let Some(s) = tree
-                .nodes
-                .get(&id)
-                .and_then(Node::style)
-                .filter(|s| s.scroll)
+            let is_list = matches!(tree.nodes.get(&id), Some(Node::List { .. }));
+            let indexed_rows = is_list.then(|| rows(id, rect[3])).flatten();
+            // Indexed lists measure content in the index, not by walking the tree children.
+            if indexed_rows.is_none()
+                && let Some(s) = tree
+                    .nodes
+                    .get(&id)
+                    .and_then(Node::style)
+                    .filter(|s| s.scroll)
             {
                 scrolls.push((id, s.padding.sides()[2]));
             }
-            if matches!(tree.nodes.get(&id), Some(Node::List { .. })) {
-                for (row, top, height) in rows(id, rect[3]) {
+            if is_list {
+                for (row, top, height) in indexed_rows.into_iter().flatten() {
                     let Some(node) = self.get(row) else { continue };
                     let size = (rect[2], height);
                     if self.row_sizes.insert(row, size) != Some(size) {

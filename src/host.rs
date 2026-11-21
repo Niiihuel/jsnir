@@ -266,6 +266,13 @@ struct Scroll {
     view: f32,
     // Track and thumb of its scrollbar on screen, if it has one.
     bar: Option<(Rect, Rect)>,
+    // Automatic Lists use indexed f64 coordinates rather than the legacy columns above.
+    list_generation: Option<u64>,
+}
+
+enum WheelOffset {
+    Legacy(f32),
+    Virtual(ListOffset),
 }
 
 /// Identifies one input sequence on the Host that issued it. Replacement invalidates the old handle.
@@ -319,10 +326,63 @@ struct VirtualList {
     rows: List,
     bindings: HashMap<u64, u16>,
     follow_tail: bool,
+    auto: Option<AutoViewport>,
     window_dirty: bool,
     delivered: Option<VirtualListId>,
     resident: HashSet<u64>,
     edited: BTreeSet<u64>,
+}
+
+#[derive(Default)]
+struct AutoViewport {
+    ready: bool,
+    requested: Option<ListOffset>,
+    // Scratch geometry for this render pass; commit only after the final pass.
+    preview: Option<(f64, f64)>,
+}
+
+impl VirtualList {
+    fn max_offset(&self, extent: f64) -> f64 {
+        (self.rows.total() - extent).max(0.)
+    }
+
+    fn offset_for(&self, requested: Option<ListOffset>, extent: f64) -> f64 {
+        let max = self.max_offset(extent);
+        match requested {
+            Some(ListOffset::Tail) => max,
+            Some(ListOffset::Pixels(pixels)) => pixels.clamp(0., max),
+            None if self.follow_tail => max,
+            None => self.rows.offset().min(max),
+        }
+    }
+
+    fn preview_layout(&mut self, height: f32) -> (f64, f64) {
+        let extent = f64::from(height);
+        let preview = self
+            .auto
+            .as_ref()
+            .map(|auto| (self.offset_for(auto.requested, extent), extent));
+        if let Some(auto) = &mut self.auto {
+            auto.preview = preview;
+        }
+        self.frame_viewport(height)
+    }
+
+    fn frame_viewport(&self, height: f32) -> (f64, f64) {
+        self.auto.as_ref().and_then(|auto| auto.preview).unwrap_or((
+            self.rows.offset(),
+            self.rows.extent().min(f64::from(height)),
+        ))
+    }
+
+    fn apply_viewport(&mut self, pixels: f64, extent: f64) -> bool {
+        let before = (self.rows.offset(), self.rows.extent());
+        if !self.rows.set_viewport(pixels, extent) {
+            return false;
+        }
+        self.window_dirty |= before != (self.rows.offset(), self.rows.extent());
+        true
+    }
 }
 
 pub struct Host {
@@ -553,6 +613,35 @@ impl Host {
         })
     }
 
+    /// Like `replace_virtual_list`, but the completed frame supplies the List box height.
+    /// Starts at the top. Wheel input affects the next frame; reaching the end by wheel pins it.
+    /// Both pixel and line wheels move this mode directly, without a legacy scroll glide.
+    pub fn replace_auto_virtual_list(
+        &mut self,
+        node: u16,
+        rows: impl IntoIterator<Item = (u64, f32)>,
+    ) -> Option<VirtualListId> {
+        let id = self.replace_virtual_list(node, rows)?;
+        self.virtual_list_mut(id)?.auto = Some(AutoViewport::default());
+        Some(id)
+    }
+
+    /// Queues an offset for the next laid-out frame of an automatic list. A pixel request
+    /// unpins the tail even if it clamps to the end. Invalid values and other handles are ignored.
+    pub fn set_list_offset(&mut self, id: VirtualListId, offset: ListOffset) -> bool {
+        if matches!(offset, ListOffset::Pixels(pixels) if !pixels.is_finite()) {
+            return false;
+        }
+        let Some(auto) = self
+            .virtual_list_mut(id)
+            .and_then(|list| list.auto.as_mut())
+        else {
+            return false;
+        };
+        auto.requested = Some(offset);
+        true
+    }
+
     /// Binds an existing direct child to an indexed key, one child per key and one key per child.
     /// Repeating the same binding is a no-op. Binding does not change demand or tree ownership.
     pub fn bind_virtual_row(&mut self, id: VirtualListId, key: u64, row: u16) -> bool {
@@ -633,12 +722,11 @@ impl Host {
         }
         while let Some(parent) = self.tree.parent(child) {
             if let Some((_, list)) = self.virtual_lists.get(&parent) {
-                let height = f64::from(self.tree.rect(parent)[3]);
-                if !self
-                    .bound_rows
-                    .get(&child)
-                    .is_some_and(|&(_, key)| list.rows.visible_row(key, height).is_some())
-                {
+                let height = self.tree.rect(parent)[3];
+                let (offset, extent) = list.frame_viewport(height);
+                if !self.bound_rows.get(&child).is_some_and(|&(_, key)| {
+                    list.rows.visible_row_at(key, offset, extent).is_some()
+                }) {
                     return false;
                 }
                 // Old hit rectangles retain all last-frame clips. Also apply the current
@@ -647,7 +735,7 @@ impl Host {
                     let Some(mut clip) = self.screen.get(parent as usize).copied().flatten() else {
                         return false;
                     };
-                    clip[3] *= (list.rows.extent().min(height) / height) as f32;
+                    clip[3] *= (extent / f64::from(height)) as f32;
                     if !contains(clip, point) {
                         return false;
                     }
@@ -663,7 +751,7 @@ impl Host {
         id.matches(self.list_issuer, *generation).then_some(list)
     }
 
-    /// Supplies the viewport in logical pixels. Invalid values and stale handles are ignored.
+    /// Supplies the viewport of a manual list in logical pixels. Invalid values and other handles are ignored.
     pub fn set_list_viewport(
         &mut self,
         id: VirtualListId,
@@ -673,16 +761,17 @@ impl Host {
         let Some(list) = self.virtual_list_mut(id) else {
             return false;
         };
-        let before = (list.rows.offset(), list.rows.extent());
+        if list.auto.is_some() {
+            return false;
+        }
         let pixels = match offset {
             ListOffset::Pixels(pixels) => pixels,
             ListOffset::Tail => list.rows.total(),
         };
-        if !list.rows.set_viewport(pixels, extent) {
+        if !list.apply_viewport(pixels, extent) {
             return false;
         }
         list.follow_tail = matches!(offset, ListOffset::Tail);
-        list.window_dirty |= before != (list.rows.offset(), list.rows.extent());
         true
     }
 
@@ -713,6 +802,9 @@ impl Host {
                 .set_viewport(list.rows.total(), list.rows.extent());
         }
         list.window_dirty |= geometry_changed;
+        if geometry_changed && let Some(auto) = &mut list.auto {
+            auto.ready = false;
+        }
         // A removal followed by reinsertion of the same resident key before delivery
         // also invalidates that row. Never accumulate edits for offscreen keys.
         if list.resident.contains(&key) {
@@ -726,8 +818,12 @@ impl Host {
 
     /// Takes the initial demand (even if empty), then only visible-key changes. No overscan.
     /// A clean viewport is not traversed, and content-only edits do not reselect the window.
+    /// Automatic lists first report demand after a frame lays them out.
     pub fn take_list_demand(&mut self, id: VirtualListId) -> Option<ListDemand> {
         let list = self.virtual_list_mut(id)?;
+        if list.auto.as_ref().is_some_and(|auto| !auto.ready) {
+            return None;
+        }
         let initial = list.delivered != Some(id);
         let mut demand = ListDemand {
             retired: list.delivered.filter(|_| initial),
@@ -1113,25 +1209,38 @@ impl Host {
     }
 
     /// Scrolls the innermost scroll node under the pointer that can still move, by `delta_y` logical pixels
-    /// (positive moves the content up), at once. Returns whether an offset changed.
+    /// (positive moves the content up). Returns whether the input moved or queued an offset.
     pub fn wheel(&mut self, delta_y: f32) -> bool {
         let Some((id, next)) = self.scroll_step(delta_y, false) else {
             return false;
         };
-        self.motion.release(id, Channel::Scroll);
-        self.scroll.insert(id, next);
+        match next {
+            WheelOffset::Legacy(next) => {
+                self.motion.release(id, Channel::Scroll);
+                self.scroll.insert(id, next);
+            }
+            WheelOffset::Virtual(next) => self.queue_list_wheel(id, next),
+        }
         self.hover_frozen_until = self.now() + SCROLL_HOVER_IDLE_MS;
         true
     }
 
     /// Like `wheel`, but the offset glides to its new target over 150 ms, and repeated calls add up. For the
     /// line deltas of a mouse wheel; exact pixel deltas from a touchpad go through `wheel`.
+    /// Automatic Lists instead queue a direct offset for the next frame.
     pub fn wheel_smooth(&mut self, delta_y: f32) -> bool {
         let Some((id, next)) = self.scroll_step(delta_y, true) else {
             return false;
         };
         let now = self.now();
         self.hover_frozen_until = now + SCROLL_HOVER_IDLE_MS;
+        let next = match next {
+            WheelOffset::Legacy(next) => next,
+            WheelOffset::Virtual(next) => {
+                self.queue_list_wheel(id, next);
+                return true;
+            }
+        };
         let transition = ease_out(Property::Y);
         // A glide in progress continues from where it is on screen.
         let from = match self.motion.target(id, Channel::Scroll) {
@@ -1152,9 +1261,19 @@ impl Host {
         true
     }
 
+    fn queue_list_wheel(&mut self, id: u16, offset: ListOffset) {
+        if let Some(auto) = self
+            .virtual_lists
+            .get_mut(&id)
+            .and_then(|(_, list)| list.auto.as_mut())
+        {
+            auto.requested = Some(offset);
+        }
+    }
+
     // The innermost scroll node under the pointer that can still move by `delta_y`, and the offset it reaches.
-    // A smooth wheel adds to a glide's target; an immediate one moves from the offset on screen.
-    fn scroll_step(&self, delta_y: f32, smooth: bool) -> Option<(u16, f32)> {
+    // A smooth legacy wheel adds to a glide's target; an automatic List wheel adds to its queued offset.
+    fn scroll_step(&self, delta_y: f32, smooth: bool) -> Option<(u16, WheelOffset)> {
         let point = self.pointer?;
         let top = self.top_hit(point);
         self.scrolls.iter().rev().find_map(|s| {
@@ -1165,12 +1284,38 @@ impl Host {
             {
                 return None;
             }
+            if let Some(generation) = s.list_generation {
+                let (current, list) = self.virtual_lists.get(&s.id)?;
+                let auto = list.auto.as_ref()?;
+                if *current != generation || !delta_y.is_finite() {
+                    return None;
+                }
+                let extent = list.rows.extent();
+                let max = list.max_offset(extent);
+                let base = list.offset_for(auto.requested, extent);
+                let next = (base + f64::from(delta_y) / f64::from(s.k)).clamp(0., max);
+                return (next != base).then_some((
+                    s.id,
+                    WheelOffset::Virtual(if next == max {
+                        ListOffset::Tail
+                    } else {
+                        ListOffset::Pixels(next)
+                    }),
+                ));
+            }
+            if self
+                .virtual_lists
+                .get(&s.id)
+                .is_some_and(|(_, list)| list.auto.is_some())
+            {
+                return None;
+            }
             let base = match self.motion.target(s.id, Channel::Scroll) {
                 Some(target) if smooth => target.number(),
                 _ => self.scroll.get(&s.id).copied().unwrap_or(0.),
             };
             let next = (base + delta_y / s.k).clamp(0., s.max);
-            (next != base).then_some((s.id, next))
+            (next != base).then_some((s.id, WheelOffset::Legacy(next)))
         })
     }
 
@@ -1717,8 +1862,25 @@ impl Host {
             // placements from the provisional pass.
             (frame, placements) = self.render(width, height, scale, max_side, now);
         }
+        self.commit_list_viewports();
         self.publish_placements(placements);
         frame
+    }
+
+    fn commit_list_viewports(&mut self) {
+        for (_, list) in self.virtual_lists.values_mut() {
+            let Some(auto) = &mut list.auto else { continue };
+            let Some((offset, extent)) = auto.preview.take() else {
+                continue;
+            };
+            auto.ready = true;
+            if let Some(requested) = auto.requested.take() {
+                list.follow_tail = matches!(requested, ListOffset::Tail);
+            }
+            if (offset, extent) != (list.rows.offset(), list.rows.extent()) {
+                list.apply_viewport(offset, extent);
+            }
+        }
     }
 
     fn render(
@@ -1836,6 +1998,9 @@ impl Host {
         let mut ops = Vec::new();
         let mut events = Vec::new();
         for s in &self.scrolls {
+            if s.list_generation.is_some() {
+                continue;
+            }
             let scroll = [s.top, s.max + s.view, s.view];
             let before = self.tree.scroll(s.id);
             if before == scroll {
@@ -2031,38 +2196,54 @@ impl Host {
                 (transition.is_some() || variant || keyed).then_some((id, transition))
             })
             .collect();
-        let lists = &self.virtual_lists;
-        let compute = |layout: &mut Layout, tree: &Tree, text: &mut TextEngine| {
+        let compute = |layout: &mut Layout,
+                       tree: &Tree,
+                       text: &mut TextEngine,
+                       lists: &mut HashMap<u16, (u64, VirtualList)>| {
             if lists.is_empty() {
                 layout.compute(tree, text, width, height)
             } else {
+                for (_, list) in lists.values_mut() {
+                    if let Some(auto) = &mut list.auto {
+                        auto.preview = None;
+                    }
+                }
                 layout.compute_with_rows(tree, text, width, height, |id, height| {
-                    let Some((_, list)) = lists.get(&id) else {
-                        return Vec::new();
-                    };
+                    let (_, list) = lists.get_mut(&id)?;
+                    let (offset, extent) = list.preview_layout(height);
                     let mut rows: Vec<_> = list
                         .bindings
                         .iter()
                         .filter_map(|(&key, &row)| {
-                            let (top, pixels) = list.rows.visible_row(key, f64::from(height))?;
+                            let (top, pixels) = list.rows.visible_row_at(key, offset, extent)?;
                             Some((row, top, pixels))
                         })
                         .collect();
                     // Restore visual order before narrowing offsets to f32.
                     rows.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
-                    rows.into_iter()
-                        .map(|(row, top, pixels)| {
-                            (row, (top - list.rows.offset()) as f32, pixels as f32)
-                        })
-                        .collect()
+                    Some(
+                        rows.into_iter()
+                            .map(|(row, top, pixels)| (row, (top - offset) as f32, pixels as f32))
+                            .collect(),
+                    )
                 })
             }
         };
         let mut changed = if sized.is_empty() {
-            compute(&mut self.layout, &self.tree, &mut self.text)
+            compute(
+                &mut self.layout,
+                &self.tree,
+                &mut self.text,
+                &mut self.virtual_lists,
+            )
         } else {
             self.layout.pin_heights(&self.tree, &HashMap::new());
-            let natural = compute(&mut self.layout, &self.tree, &mut self.text);
+            let natural = compute(
+                &mut self.layout,
+                &self.tree,
+                &mut self.text,
+                &mut self.virtual_lists,
+            );
             let natural_height = |id: u16| {
                 natural
                     .iter()
@@ -2110,7 +2291,12 @@ impl Host {
             } else {
                 self.layout.pin_heights(&self.tree, &pins);
                 // Relative to the tree's rectangles, which still hold the previous frame.
-                compute(&mut self.layout, &self.tree, &mut self.text)
+                compute(
+                    &mut self.layout,
+                    &self.tree,
+                    &mut self.text,
+                    &mut self.virtual_lists,
+                )
             }
         };
         changed.retain(|(id, rect)| self.tree.rect(*id) != *rect);
@@ -2903,6 +3089,7 @@ impl Walker<'_> {
                             max: (frame.content_height - view).max(0.),
                             view,
                             bar: None,
+                            list_generation: None,
                         });
                     }
                     if text.is_empty() && !host.editor.composing() {
@@ -2960,6 +3147,7 @@ impl Walker<'_> {
                         max,
                         view,
                         bar: None,
+                        list_generation: None,
                     });
                     self.items.push(Item::Text {
                         rect: [
@@ -3018,10 +3206,22 @@ impl Walker<'_> {
                 child.round_clip = Some((screen, radius));
             }
         }
-        let virtual_list = host
-            .virtual_lists
-            .get(&id)
-            .map(|(_, list)| list.rows.extent());
+        let virtual_list = host.virtual_lists.get(&id).map(|&(generation, ref list)| {
+            if list.auto.is_some() {
+                self.scrolls.push(Scroll {
+                    id,
+                    layer: self.layer,
+                    rect: intersect(screen, clip),
+                    k: inner.k,
+                    top: 0.,
+                    max: 0.,
+                    view: layout_rect[3],
+                    bar: None,
+                    list_generation: Some(generation),
+                });
+            }
+            list.frame_viewport(layout_rect[3]).1
+        });
         // A scrollbar and its opacity this frame, drawn over the content.
         let mut bar = None;
         if virtual_list.is_none() && node.style().is_some_and(|s| s.scroll) {
@@ -3078,6 +3278,7 @@ impl Walker<'_> {
                 max,
                 view: layout_rect[3],
                 bar: rects,
+                list_generation: None,
             });
         }
         if let Some(extent) = virtual_list {
@@ -5223,12 +5424,107 @@ mod tests {
         assert_eq!(host.tree.children(2), [3]);
         assert_eq!(host.tree.rect(2)[3], 20.);
         assert_eq!(host.tree.rect(3), [0.; 4]);
+        host.pointer_move(Some([5., 5.]));
+        assert!(!host.wheel(10.));
+        assert!(!host.wheel_smooth(10.));
         assert!(
             !frame
                 .items
                 .iter()
                 .any(|item| matches!(item, Item::Text { .. }))
         );
+    }
+
+    #[test]
+    fn auto_virtual_list_uses_completed_hover_layout_and_is_clean_between_frames() {
+        use crate::list::INDEX_VISITS;
+        let mut host = column_host(true);
+        add(
+            &mut host,
+            r#"[
+                {"op":"create","id":2,"parent":1,"node":{"kind":"box","press":12,
+                    "style":{"height":10},"paint":{"hover":{"height":30}}}},
+                {"op":"create","id":3,"parent":1,"node":{"kind":"list","style":{"grow":1}}}
+            ]"#,
+        );
+        let list = host
+            .replace_auto_virtual_list(3, (0..10_000).map(|key| (key, 10.)))
+            .unwrap();
+        assert_eq!(host.take_list_demand(list), None);
+        assert!(!host.set_list_viewport(list, ListOffset::Tail, 20.));
+        host.pointer_move(Some([5., 5.]));
+        host.frame(100., 60., 1., 4096);
+        assert_eq!(host.tree.rect(3)[3], 30.);
+        assert_eq!(host.take_list_demand(list), demand(&[0, 1, 2], &[], &[]));
+        INDEX_VISITS.with(|n| n.set(0));
+        host.frame(100., 61., 1., 4096);
+        assert_eq!(host.tree.rect(3)[3], 31.);
+        assert_eq!(host.take_list_demand(list), demand(&[3], &[], &[]));
+        host.frame(100., 62., 1., 4096);
+        assert_eq!(host.take_list_demand(list), None);
+        INDEX_VISITS.with(|n| n.set(0));
+        host.frame(100., 62., 1., 4096);
+        assert_eq!(host.take_list_demand(list), None);
+        assert_eq!(INDEX_VISITS.with(|n| n.get()), 0);
+    }
+
+    #[test]
+    fn auto_virtual_list_offsets_anchor_and_wheel_can_repin_tail() {
+        let mut host = column_host(true);
+        add(
+            &mut host,
+            r#"[
+                {"op":"create","id":2,"parent":1,"node":{"kind":"list","style":{"width":50,"grow":1}}},
+                {"op":"create","id":3,"parent":2,"node":{"kind":"box","press":12}}
+            ]"#,
+        );
+        let list = host
+            .replace_auto_virtual_list(2, (0..10).map(|key| (key, 10.)))
+            .unwrap();
+        assert!(host.set_list_offset(list, ListOffset::Tail));
+        assert!(host.bind_virtual_row(list, 9, 3));
+        host.frame(100., 20., 1., 4096);
+        assert_eq!(host.list_offset(list), Some(80.));
+        assert_eq!(host.take_list_demand(list), demand(&[8, 9], &[], &[]));
+        assert_eq!(host.pointer_move(Some([5., 15.])), Cursor::Pointer);
+        host.pointer_move(Some([55., 15.]));
+        assert!(!host.wheel(-1.));
+        host.pointer_move(Some([5., 15.]));
+        assert!(host.wheel(-25.));
+        assert!(!host.wheel(f32::NAN));
+        assert_eq!(host.take_list_demand(list), None);
+        host.frame(100., 20., 1., 4096);
+        assert_eq!(host.list_offset(list), Some(55.));
+        assert_eq!(
+            host.take_list_demand(list),
+            demand(&[5, 6, 7], &[], &[8, 9])
+        );
+        assert_eq!(host.pointer_move(Some([5., 15.])), Cursor::Default);
+        assert!(host.mutate_list(list, ListMutation::Prepend(100, 10.)));
+        host.frame(100., 25., 1., 4096);
+        assert_eq!(host.list_offset(list), Some(65.));
+        assert_eq!(host.take_list_demand(list), None);
+        assert!(host.set_list_offset(list, ListOffset::Pixels(65.5)));
+        assert!(!host.set_list_offset(list, ListOffset::Pixels(f64::NAN)));
+        host.frame(100., 25., 1., 4096);
+        assert_eq!(host.list_offset(list), Some(65.5));
+        assert_eq!(host.take_list_demand(list), demand(&[8], &[], &[]));
+        assert!(host.wheel_smooth(100.));
+        host.frame(100., 25., 1., 4096);
+        assert_eq!(host.list_offset(list), Some(85.));
+        assert_eq!(host.take_list_demand(list), demand(&[9], &[], &[5, 6]));
+        assert!(host.mutate_list(list, ListMutation::Append(10, 10.)));
+        assert_eq!(host.take_list_demand(list), None);
+        host.frame(100., 20., 1., 4096);
+        assert_eq!(host.list_offset(list), Some(100.));
+        assert_eq!(host.take_list_demand(list), demand(&[10], &[], &[7, 8]));
+        assert!(host.set_list_offset(list, ListOffset::Pixels(100.)));
+        host.frame(100., 20., 1., 4096);
+        assert_eq!(host.take_list_demand(list), None);
+        assert!(host.mutate_list(list, ListMutation::Append(11, 10.)));
+        host.frame(100., 20., 1., 4096);
+        assert_eq!(host.list_offset(list), Some(100.));
+        assert_eq!(host.take_list_demand(list), None);
     }
 
     #[test]
