@@ -9,8 +9,9 @@ use crate::{
     or_log, spawn_app,
     text::{Mark, TextBitmap, TextEngine, TextStyle, WRAP_SLACK, node_spans, plain_text},
     tree::{
-        Anchor, AnchorAlign, Batch, Easing, Icon, Node, Op, Paint, Position, Property, Replica,
-        ScrollAnchor, ScrollEdge, Scrollbar, Shadow, Side, Span, Transition, Tree, Variant,
+        Anchor, AnchorAlign, Batch, Easing, Icon, Node, Op, Paint, PlacementSubscription, Position,
+        Property, Replica, ScrollAnchor, ScrollEdge, Scrollbar, Shadow, Side, Span, Transition,
+        Tree, Variant,
     },
 };
 use rquickjs::{Ctx, Exception, Function, function::MutFn};
@@ -163,6 +164,10 @@ pub struct Frame {
 // Adds the host's globals to a VM before its script runs (`jsnirRequest`).
 type Configure = Box<dyn for<'js> Fn(&Ctx<'js>) -> rquickjs::Result<()> + Send>;
 
+// The bridge carries placement on the host-message channel with a prefix that cannot start a JSON message.
+// It must not enter the ordinary callback dispatcher before its mount token has been checked.
+const PLACEMENT_PREFIX: &str = "\0placement:";
+
 // The app in QuickJS: `jsnirMount` once, `jsnirEvent(callback, text)` per event. A reload makes a new VM with the
 // same replica, startup arguments and globals.
 struct HostApp {
@@ -170,12 +175,18 @@ struct HostApp {
     replica: Rc<RefCell<Replica>>,
     args: String,
     configure: Configure,
+    placement_epoch: u64,
 }
 impl App for HostApp {
     fn mount(&mut self) -> Result<Vec<Op>, String> {
         self.vm.try_call("jsnirMount", ())
     }
     fn handle(&mut self, e: Event, _: &Tree) -> Vec<Op> {
+        if e.callback == HOST_CALLBACK
+            && let Some(text) = e.text.strip_prefix(PLACEMENT_PREFIX)
+        {
+            return or_log(self.vm.try_call("jsnirPlacement", (text,)));
+        }
         or_log(self.vm.try_call("jsnirEvent", (e.callback, e.text)))
     }
     fn sync(&mut self, view: &Tree, ids: Option<&[u16]>) {
@@ -184,12 +195,16 @@ impl App for HostApp {
     fn reload(&mut self, js: &str) -> Result<Vec<Op>, String> {
         // The old VM's signals carry over to the new one. If the new script fails to load, the old one keeps running.
         let state = self.vm.try_invoke::<String>("jsnirReloadState", ()).ok();
+        let placement_epoch = self.placement_epoch + 1;
         let vm = Vm::try_load_with(js, self.replica.clone(), state.as_deref(), |c| {
             c.globals().set("__jsnirArgs", self.args.as_str())?;
+            c.globals()
+                .set("__jsnirPlacementEpoch", placement_epoch.to_string())?;
             (self.configure)(c)
         })?;
         let mount = vm.try_call("jsnirMount", ())?;
         self.vm = vm;
+        self.placement_epoch = placement_epoch;
         Ok(mount)
     }
 }
@@ -285,6 +300,7 @@ pub struct Host {
     published: (String, [u32; 2]),
     hits: Vec<Hit>,
     scrolls: Vec<Scroll>,
+    placements: HashMap<u16, Placement>,
     // Offset of each scroll node in logical pixels; a node without an entry is at its top.
     scroll: HashMap<u16, f32>,
     // `scrollTo` ops that the next frame drawing their node applies.
@@ -367,6 +383,7 @@ impl Host {
                     replica,
                     args,
                     configure: Box::new(configure),
+                    placement_epoch: 0,
                 }))
             },
         )?;
@@ -398,6 +415,7 @@ impl Host {
             published: Default::default(),
             hits: Vec::new(),
             scrolls: Vec::new(),
+            placements: HashMap::new(),
             scroll: HashMap::new(),
             scroll_requests: HashMap::new(),
             anchors: HashMap::new(),
@@ -704,6 +722,7 @@ impl Host {
             self.scroll.remove(id);
             self.scroll_requests.remove(id);
             self.anchors.remove(id);
+            self.placements.remove(id);
         }
         self.motion.forget(&removed);
         if self.focused.is_some_and(|f| removed.contains(&f)) {
@@ -1342,7 +1361,7 @@ impl Host {
     /// Lays out the tree for the window and returns what to draw.
     pub fn frame(&mut self, width: f32, height: f32, scale: f32, max_side: usize) -> Frame {
         let now = self.now();
-        let mut frame = self.render(width, height, scale, max_side, now);
+        let (mut frame, mut placements) = self.render(width, height, scale, max_side, now);
         // A glide keeps hover frozen until it has been over for SCROLL_HOVER_IDLE_MS.
         if self.motion.animating_on(Channel::Scroll, now) {
             self.hover_frozen_until = now + SCROLL_HOVER_IDLE_MS;
@@ -1350,17 +1369,23 @@ impl Host {
         if now < self.hover_frozen_until {
             // Keeps drawing until the idle time is over, so hover is then recomputed.
             frame.animating = true;
-            return frame;
+        } else if self.refresh_hover() {
+            // A layout change may have moved what is under the pointer. Draw changed hover at once and discard
+            // placements from the provisional pass.
+            (frame, placements) = self.render(width, height, scale, max_side, now);
         }
-        // A layout change may have moved what is under the pointer: hover follows it, and a changed hover is
-        // drawn at once.
-        if self.refresh_hover() {
-            return self.render(width, height, scale, max_side, now);
-        }
+        self.publish_placements(placements);
         frame
     }
 
-    fn render(&mut self, width: f32, height: f32, scale: f32, max_side: usize, now: f64) -> Frame {
+    fn render(
+        &mut self,
+        width: f32,
+        height: f32,
+        scale: f32,
+        max_side: usize,
+        now: f64,
+    ) -> (Frame, Vec<(u16, Placement)>) {
         self.lay_out(width, height, now);
         let mut items = Vec::new();
         let mut hits = std::mem::take(&mut self.hits);
@@ -1375,6 +1400,7 @@ impl Host {
         dismissers.clear();
         let mut ime_area = None;
         let mut looping = false;
+        let mut placements = Vec::new();
         self.screen.clear();
         self.screen.resize(self.tree.nodes.end(), None);
         if let Some(root) = self.tree.root {
@@ -1400,6 +1426,7 @@ impl Host {
                 layer: 0,
                 layer_root: None,
                 deferred: Vec::new(),
+                placements: &mut placements,
                 queued: 0,
                 looping: false,
             };
@@ -1413,10 +1440,45 @@ impl Host {
         self.group_rects = groups;
         self.hover_rects = hovers;
         self.dismiss_rects = dismissers;
-        Frame {
-            items,
-            animating: self.motion.animating(now) || looping,
-            ime_area,
+        (
+            Frame {
+                items,
+                animating: self.motion.animating(now) || looping,
+                ime_area,
+            },
+            placements,
+        )
+    }
+
+    fn publish_placements(&mut self, placements: Vec<(u16, Placement)>) {
+        let mut before = std::mem::take(&mut self.placements);
+        // The walker collected these in layer and document order. Missing panels forget their last placement.
+        for (id, placement) in placements {
+            if before.remove(&id).as_ref() != Some(&placement) {
+                let side = match placement.side {
+                    Side::Top => "top",
+                    Side::Right => "right",
+                    Side::Bottom => "bottom",
+                    Side::Left => "left",
+                };
+                let payload = serde_json::json!({
+                    "callback": placement.subscription.callback,
+                    "token": placement.subscription.token,
+                    "side": side,
+                    "anchorOffset": placement.anchor_offset,
+                });
+                let event = Event {
+                    callback: HOST_CALLBACK,
+                    text: format!("{PLACEMENT_PREFIX}{payload}"),
+                };
+                // A poll can free slots after trying the backlog. Do not jump ahead of older placements.
+                if self.backlog.is_empty() {
+                    self.send(event);
+                } else {
+                    self.backlog.push(event);
+                }
+            }
+            self.placements.insert(id, placement);
         }
     }
 
@@ -1757,7 +1819,12 @@ const WINDOW_MARGIN: f32 = 8.;
 // Where a node of `size` goes next to the on-screen rectangle of its anchor, in the window: on the anchor's side at
 // its gap, aligned along the other axis. It flips to the opposite side when its side overflows the window and the
 // opposite side fits. Then it is kept inside the window, `WINDOW_MARGIN` from its edges (top-left first).
-fn place(anchor: &Anchor, [ax, ay, aw, ah]: Rect, [w, h]: [f32; 2], window: Rect) -> [f32; 2] {
+fn place(
+    anchor: &Anchor,
+    [ax, ay, aw, ah]: Rect,
+    [w, h]: [f32; 2],
+    window: Rect,
+) -> ([f32; 2], Side) {
     let [wx, wy, ww, wh] = window;
     let gap = anchor.gap;
     let fits = |side: Side| match side {
@@ -1788,10 +1855,20 @@ fn place(anchor: &Anchor, [ax, ay, aw, ah]: Rect, [w, h]: [f32; 2], window: Rect
         Side::Left => [ax - gap - w, along(ay, ah, h)],
         Side::Right => [ax + aw + gap, along(ay, ah, h)],
     };
-    [
-        x.min(wx + ww - WINDOW_MARGIN - w).max(wx + WINDOW_MARGIN),
-        y.min(wy + wh - WINDOW_MARGIN - h).max(wy + WINDOW_MARGIN),
-    ]
+    (
+        [
+            x.min(wx + ww - WINDOW_MARGIN - w).max(wx + WINDOW_MARGIN),
+            y.min(wy + wh - WINDOW_MARGIN - h).max(wy + WINDOW_MARGIN),
+        ],
+        side,
+    )
+}
+
+#[derive(PartialEq)]
+struct Placement {
+    subscription: PlacementSubscription,
+    side: Side,
+    anchor_offset: f32,
 }
 
 // What a node inherits from its ancestors: a uniform scale `k` and offset, group opacity, brightness and clip.
@@ -1842,6 +1919,7 @@ struct Walker<'a> {
     layer_root: Option<u16>,
     // Layered nodes waiting for their turn, and how many were ever queued: their order within a layer.
     deferred: Vec<Deferred>,
+    placements: &'a mut Vec<(u16, Placement)>,
     queued: usize,
     // Set when a drawn node runs a keyframe animation: the window keeps drawing.
     looping: bool,
@@ -2034,11 +2112,34 @@ impl Walker<'_> {
 
     // The context a fixed node is drawn in: its origin is where it is placed this frame. None while its anchor is not
     // on screen, which hides it.
-    fn fixed_context(&self, host: &Host, id: u16) -> Option<Context> {
+    fn fixed_context(&mut self, host: &Host, id: u16) -> Option<Context> {
         let style = host.tree.nodes.get(&id)?.style()?;
         let [_, _, w, h] = host.tree.rect(id);
         let [x, y] = match &style.anchor {
-            Some(anchor) => place(anchor, host.screen_rect(anchor.node)?, [w, h], self.window),
+            Some(anchor) => {
+                let rect = host.screen_rect(anchor.node)?;
+                let (offset, side) = place(anchor, rect, [w, h], self.window);
+                if let Some(subscription) = &anchor.placement
+                    && subscription.callback != 0
+                {
+                    let axis = match side {
+                        Side::Top | Side::Bottom => 0,
+                        Side::Left | Side::Right => 1,
+                    };
+                    let anchor_offset = rect[axis] + rect[axis + 2] / 2. - offset[axis];
+                    if anchor_offset.is_finite() {
+                        self.placements.push((
+                            id,
+                            Placement {
+                                subscription: subscription.clone(),
+                                side,
+                                anchor_offset,
+                            },
+                        ));
+                    }
+                }
+                offset
+            }
             None => [style.left.unwrap_or(0.), style.top.unwrap_or(0.)],
         };
         Some(Context {
@@ -4225,6 +4326,145 @@ mod tests {
         assert!(near_rect(clip, [0., 0., 640., 560.]), "clip {clip:?}");
     }
 
+    fn placement_fixture(args: &str) -> (Host, Arc<Mutex<Vec<String>>>) {
+        let script = format!(
+            "{}\n{}",
+            crate::apps::OVERLAY,
+            r#"
+            mount(function () {
+                var open = signal(true);
+                var anchor;
+                onHost(function (message) {
+                    open.value = message.open;
+                });
+                return Box({children: [
+                    Box({ref: function (id) { anchor = id; }, onPress: function () {},
+                         paint: {hover: {y: 5}, transitions: []},
+                         style: {position: "absolute", left: 80, top: 80, width: 20, height: 20}}),
+                    Popover({open: open, anchor: function () { return anchor; }, side: "right", layer: 2,
+                             align: "center", style: {width: 60, height: 50}, children: h(Text, null, "placement panel"),
+                             onPlacement: function (p) { jsnirRequest(JSON.stringify(p)); }}),
+                    args().multiple ? Popover({open: open, anchor: function () { return anchor; }, side: "right",
+                             align: "center", style: {width: 60, height: 40}, children: h(Text, null, "second panel"),
+                             onPlacement: function (p) { jsnirRequest(JSON.stringify(p)); }}) : null
+                ]});
+            });
+            "#,
+        );
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let received = events.clone();
+        let host =
+            Host::with_request_handler(script, args.into(), TextEngine::default(), move |text| {
+                received.lock().unwrap().push(text);
+                Ok("null".into())
+            })
+            .unwrap();
+        (host, events)
+    }
+
+    fn poll_placement_fixture(host: &mut Host) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while host.busy() {
+            assert!(Instant::now() < deadline, "the app did not answer");
+            host.poll();
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn popover_placement_reports_center_flip_and_cross_axis_clamp_in_logical_pixels() {
+        let (mut host, events) = placement_fixture("{}");
+        for (width, height, scale, rect) in [
+            (200., 180., 1., [108., 65., 60., 50.]),
+            (200., 180., 2., [108., 65., 60., 50.]),
+            (130., 180., 2., [12., 65., 60., 50.]),
+            (130., 110., 2., [12., 52., 60., 50.]),
+        ] {
+            assert!(!host.frame(width, height, scale, 4096).animating);
+            assert_eq!(
+                host.screen_rect(box_of(&host, "placement panel")),
+                Some(rect)
+            );
+            poll_placement_fixture(&mut host);
+        }
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                r#"{"side":"right","anchorOffset":25}"#,
+                r#"{"side":"left","anchorOffset":25}"#,
+                r#"{"side":"left","anchorOffset":38}"#,
+            ]
+        );
+        host.push(r#"{"open":false}"#.into());
+        host.push(r#"{"open":true}"#.into());
+        poll_placement_fixture(&mut host);
+        assert!(!host.frame(130., 110., 2., 4096).animating);
+        poll_placement_fixture(&mut host);
+        assert_eq!(
+            &events.lock().unwrap()[3..],
+            [r#"{"side":"left","anchorOffset":38}"#]
+        );
+    }
+
+    #[test]
+    fn placements_use_the_final_hover_pass_in_layer_order() {
+        let (mut host, events) = placement_fixture(r#"{"multiple":true}"#);
+        // No hit exists until the first render. The second pass draws the anchor 5 px lower.
+        host.pointer_move(Some([90., 90.]));
+        assert!(!host.frame(130., 110., 1., 4096).animating);
+        poll_placement_fixture(&mut host);
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                r#"{"side":"left","anchorOffset":33}"#,
+                r#"{"side":"left","anchorOffset":43}"#,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_placement_does_not_overtake_an_older_placement_in_the_backlog() {
+        let (mut host, events) = placement_fixture("{}");
+        for _ in 0..MAX_PENDING {
+            host.push(r#"{"open":true}"#.into());
+        }
+        host.frame(200., 180., 1., 4096);
+
+        // The first poll with an available reply tries the backlog before freeing an event slot.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while host.pending == MAX_PENDING {
+            assert!(Instant::now() < deadline, "the app did not answer");
+            host.poll();
+            std::thread::yield_now();
+        }
+        host.frame(130., 110., 1., 4096);
+        poll_placement_fixture(&mut host);
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                r#"{"side":"right","anchorOffset":25}"#,
+                r#"{"side":"left","anchorOffset":38}"#,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_queued_placement_cannot_reach_a_recycled_callback() {
+        let (mut host, events) = placement_fixture("{}");
+        // JS handles the remount before the queued placement for the original panel.
+        host.push(r#"{"open":false}"#.into());
+        host.push(r#"{"open":true}"#.into());
+        host.frame(200., 180., 1., 4096);
+        poll_placement_fixture(&mut host);
+        assert!(events.lock().unwrap().is_empty());
+        host.frame(200., 180., 1., 4096);
+        poll_placement_fixture(&mut host);
+        assert_eq!(
+            *events.lock().unwrap(),
+            [r#"{"side":"right","anchorOffset":25}"#]
+        );
+    }
+
     #[test]
     fn a_popover_flips_at_the_window_edge_and_clamps_at_the_bottom() {
         let mut host = overlay();
@@ -4452,7 +4692,7 @@ mod tests {
         host.receive(Batch { base, ops });
     }
     fn render_at(host: &mut Host, now: f64) -> Frame {
-        host.render(640., 560., 1., 4096, now)
+        host.render(640., 560., 1., 4096, now).0
     }
     fn layers(frame: &Frame) -> Vec<f32> {
         frame

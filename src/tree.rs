@@ -35,6 +35,13 @@ contract_strings! {
     pub enum AnchorAlign as "AnchorAlign" { Start, Center, End }
 }
 contract_struct! {
+    /// A placement callback and its mount identity, so a queued event cannot reach a recycled callback.
+    pub struct PlacementSubscription as "PlacementSubscription" {
+        callback: u16,
+        token: String,
+    }
+}
+contract_struct! {
     /// Places a `fixed` node next to the on-screen rectangle of another node, recomputed every frame. `gap` is
     /// the distance from that rectangle. If `flip` and the node would overflow the window on `side` while the
     /// opposite side fits, it goes on the opposite side. Then it is clamped inside the window, 8 px from its edges.
@@ -45,6 +52,10 @@ contract_struct! {
         align: AnchorAlign,
         gap: f32,
         flip: bool,
+        /// Placement notifications after the final frame pass: the resolved side and `anchorOffset` from the
+        /// placed panel's start to the anchor center along the cross axis, in logical pixels before panel paint
+        /// transforms. The offset is not itself clamped. Omit to receive no notifications.
+        placement: Option<PlacementSubscription>,
     }
 }
 contract_strings! {
@@ -619,6 +630,7 @@ pub(crate) fn ts_decls() -> String {
         ScrollEdge::ts_decl(),
         Side::ts_decl(),
         AnchorAlign::ts_decl(),
+        PlacementSubscription::ts_decl(),
         Anchor::ts_decl(),
         Style::ts_decl(),
         Property::ts_decl(),

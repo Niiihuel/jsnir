@@ -213,6 +213,9 @@ function newId(): number {
 }
 var handlers: Array<((text: string) => void) | undefined> = [];
 var freeCallbacks: number[] = [];
+var placementTokens: { [callback: number]: string | undefined } = {};
+declare var __jsnirPlacementEpoch: string | undefined;
+var nextPlacementToken = 1;
 function register(handler: (text: string) => void): number {
     var id = freeCallbacks.length > 0 ? (freeCallbacks.pop() as number) : handlers.length + 1;
     handlers[id - 1] = handler;
@@ -222,6 +225,7 @@ function register(handler: (text: string) => void): number {
 function unregister(id: number): void {
     if (handlers[id - 1] === undefined) return;
     handlers[id - 1] = undefined;
+    if (placementTokens[id] !== undefined) delete placementTokens[id];
     freeCallbacks.push(id);
 }
 function send(ops: Operation[]): void {
@@ -683,6 +687,8 @@ function For<T>({
 
 // ---------- Overlays ----------
 
+type PopoverPlacement = { side: Side; anchorOffset: number };
+
 /** A panel on top of the page, placed beside the node `anchor()` returns while `open` is true, 8 px from it. Escape or
  *  a press outside closes it (sets `open` to false); a press on the anchor does not, so the opener toggles it:
  *  `onPress={() => { open.value = !open.value; }}`. It is mounted in the element it is written in, so an anchor the
@@ -695,6 +701,11 @@ function Popover(props: {
     layer?: number;
     style?: Style;
     paint?: Source<Paint>;
+    /** After the final frame pass, when the resolved side or offset changes (including first placement).
+     *  `side` is the side of the anchor. `anchorOffset` is the anchor center measured from the placed panel's
+     *  left edge for top/bottom, or top edge for left/right, in logical pixels before panel paint transforms.
+     *  The offset can fall outside the panel; clamp it against your panel size if the indicator needs clearance. */
+    onPlacement?: (placement: PopoverPlacement) => void;
     children: Element;
 }): Element {
     return {
@@ -707,14 +718,26 @@ function Popover(props: {
                 var anchor: Anchor = { node: node, side: props.side ?? "bottom", align: props.align ?? "start", gap: 8, flip: true };
                 current = mountInto(
                     parent as number,
-                    Box({
-                        style: { ...props.style, position: "fixed", layer: props.layer ?? 1, anchor: anchor },
-                        paint: props.paint,
-                        onDismiss: function () {
-                            props.open.value = false;
+                    {
+                        mount(parent, ops) {
+                            const onPlacement = props.onPlacement;
+                            if (onPlacement !== undefined) {
+                                var token = (typeof __jsnirPlacementEpoch === "string" ? __jsnirPlacementEpoch : "0")
+                                    + ":" + nextPlacementToken++;
+                                var callback = register(function (text) { onPlacement(JSON.parse(text)); });
+                                placementTokens[callback] = token;
+                                anchor.placement = { callback: callback, token: token };
+                            }
+                            Box({
+                                style: { ...props.style, position: "fixed", layer: props.layer ?? 1, anchor: anchor },
+                                paint: props.paint,
+                                onDismiss: function () {
+                                    props.open.value = false;
+                                },
+                                children: props.children,
+                            }).mount(parent, ops);
                         },
-                        children: props.children,
-                    }),
+                    },
                 );
             };
             var first = true;
@@ -817,6 +840,12 @@ function jsnirMount(): void {
     root().mount(undefined, ops);
     send(ops);
     mountPending();
+}
+// Unlike other events, placement is unsolicited and may already be queued when a panel closes or reloads.
+function jsnirPlacement(text: string): void {
+    var event = JSON.parse(text) as PopoverPlacement & { callback: number; token: string };
+    if (placementTokens[event.callback] !== event.token) return;
+    jsnirEvent(event.callback, JSON.stringify({ side: event.side, anchorOffset: event.anchorOffset }));
 }
 function jsnirEvent(callback: number, text: string): void {
     var handler = callback === 0 ? hostEvent : handlers[callback - 1];

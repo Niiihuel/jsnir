@@ -31,6 +31,12 @@ The first priorities are keeping the UI responsive when the app VM fails, preser
    and the input-method surrounding-text protocol (winit 0.30 lacks it; Wayland text-input v3 has it).
 10. **Accessibility:** expose the node tree through AccessKit. This is the largest gap against egui and GPUI.
 
+**Anchored overlays:** `Popover` can opt in to `onPlacement({ side, anchorOffset })` to position a pointer after
+flip and clamp. `side` is the resolved side of the anchor; `anchorOffset` is the anchor center measured in logical
+pixels from the placed panel's left edge (top/bottom) or top edge (left/right), before panel paint transforms.
+The offset is not clipped to the panel. Use the panel's own dimensions if its corners require clearance.
+The callback fires on first placement and when either value changes, not on every frame.
+
 ## Measure: the proposal's decision criteria
 
 11. **Input → presented frame** on the GPU host with `wp_presentation`, using the egui results as a baseline. [egui presentation measurements](../metrics/presentation-02)

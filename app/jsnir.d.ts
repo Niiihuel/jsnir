@@ -39,7 +39,8 @@ type ScrollAnchor = "start" | "end";
 type ScrollEdge = "start" | "end";
 type Side = "top" | "right" | "bottom" | "left";
 type AnchorAlign = "start" | "center" | "end";
-interface Anchor { node?: number; side?: Side; align?: AnchorAlign; gap?: number; flip?: boolean }
+interface PlacementSubscription { callback?: number; token?: string }
+interface Anchor { node?: number; side?: Side; align?: AnchorAlign; gap?: number; flip?: boolean; placement?: PlacementSubscription | undefined }
 interface Style { width?: number | undefined; height?: number | undefined; grow?: number; shrink?: number | undefined; basis?: number | undefined; padding?: number | [number, number, number, number]; margin?: number | [number, number, number, number]; gap?: number; direction?: Axis; align?: Align | undefined; justify?: Justify; position?: Position; left?: number | undefined; top?: number | undefined; clip?: boolean; scroll?: boolean; scrollAnchor?: ScrollAnchor; group?: boolean; follow?: number | undefined; layer?: number | undefined; anchor?: Anchor | undefined; minWidth?: number | undefined; minHeight?: number | undefined; maxWidth?: number | undefined; maxHeight?: number | undefined }
 type Property = "opacity" | "x" | "y" | "scale" | "brightness" | "background" | "edge" | "color" | "draw" | "left" | "width" | "height";
 type Easing = "linear" | "ease" | "easeOut" | "easeInOut" | "spring" | "bezier";
