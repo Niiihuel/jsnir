@@ -20,7 +20,11 @@ use std::{
     cell::RefCell,
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
     rc::Rc,
-    sync::{Arc, Mutex, mpsc::TryRecvError},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+        mpsc::TryRecvError,
+    },
     time::{Duration, Instant},
 };
 
@@ -267,8 +271,15 @@ struct Scroll {
 /// Identifies one input sequence on the Host that issued it. Replacement invalidates the old handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VirtualListId {
+    issuer: u64,
     node: u16,
     generation: u64,
+}
+
+impl VirtualListId {
+    fn matches(self, issuer: u64, generation: u64) -> bool {
+        self.issuer == issuer && self.generation == generation
+    }
 }
 
 /// A requested scroll position in logical pixels.
@@ -316,6 +327,7 @@ struct VirtualList {
 pub struct Host {
     pub tree: Tree,
     virtual_lists: HashMap<u16, (u64, VirtualList)>,
+    list_issuer: u64,
     list_generation: u64,
     bridge: Bridge,
     pending: u16,
@@ -422,6 +434,11 @@ impl Host {
         text: TextEngine,
         configure: impl for<'js> Fn(&Ctx<'js>) -> rquickjs::Result<()> + Send + 'static,
     ) -> Result<Self, String> {
+        // Never recycle issuers: a handle may outlive its Host. Only uniqueness needs synchronization.
+        static NEXT_LIST_ISSUER: AtomicU64 = AtomicU64::new(0);
+        let list_issuer = NEXT_LIST_ISSUER
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .map_err(|_| "virtual list issuer IDs exhausted".to_owned())?;
         let (mount, bridge) = spawn_app(
             Duration::ZERO,
             move |replica: Rc<RefCell<Replica>>| -> Result<Box<dyn App>, String> {
@@ -442,6 +459,7 @@ impl Host {
         let mut host = Self {
             tree: Tree::default(),
             virtual_lists: HashMap::new(),
+            list_issuer,
             list_generation: 0,
             bridge,
             pending: 0,
@@ -520,12 +538,16 @@ impl Host {
                 ..Default::default()
             },
         );
-        Some(VirtualListId { node, generation })
+        Some(VirtualListId {
+            issuer: self.list_issuer,
+            node,
+            generation,
+        })
     }
 
     fn virtual_list_mut(&mut self, id: VirtualListId) -> Option<&mut VirtualList> {
         let (generation, list) = self.virtual_lists.get_mut(&id.node)?;
-        (*generation == id.generation).then_some(list)
+        id.matches(self.list_issuer, *generation).then_some(list)
     }
 
     /// Supplies the viewport in logical pixels. Invalid values and stale handles are ignored.
@@ -554,7 +576,8 @@ impl Host {
     /// The clamped or anchored logical offset of the current generation.
     pub fn list_offset(&self, id: VirtualListId) -> Option<f64> {
         let (generation, list) = self.virtual_lists.get(&id.node)?;
-        (*generation == id.generation).then(|| list.rows.offset())
+        id.matches(self.list_issuer, *generation)
+            .then(|| list.rows.offset())
     }
 
     /// Applies a keyed edit. Invalid edits and stale handles leave the list and demand unchanged.
@@ -4879,6 +4902,31 @@ mod tests {
             evicted: evicted.to_vec(),
             retired: None,
         })
+    }
+
+    #[test]
+    fn list_host_handle_is_confined_to_issuing_host() {
+        let mut a = list_host();
+        let mut b = list_host();
+        let foreign = a.replace_virtual_list(2, [(1, 4.)]).unwrap();
+        let local = b.replace_virtual_list(2, [(1, 4.), (2, 4.)]).unwrap();
+        assert!(b.set_list_viewport(local, ListOffset::Pixels(1.), 1.));
+        assert_eq!(b.list_offset(local), Some(1.));
+
+        assert_eq!(
+            (
+                b.list_offset(foreign),
+                b.set_list_viewport(foreign, ListOffset::Tail, 1.),
+                b.mutate_list(foreign, ListMutation::Remove(1)),
+                b.take_list_demand(foreign),
+            ),
+            (None, false, false, None)
+        );
+        assert_eq!(b.list_offset(local), Some(1.));
+        assert_eq!(b.take_list_demand(local), demand(&[1], &[], &[]));
+        assert!(b.mutate_list(local, ListMutation::Update(1, 4.)));
+        assert_eq!(b.take_list_demand(local), demand(&[], &[1], &[]));
+        assert_eq!(a.list_offset(foreign), Some(0.));
     }
 
     #[test]
