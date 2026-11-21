@@ -623,18 +623,35 @@ impl Host {
         }
     }
 
-    fn row_can_receive(&self, mut child: u16) -> bool {
+    fn row_can_receive(&self, child: u16) -> bool {
+        self.row_input_at(child, None)
+    }
+
+    fn row_input_at(&self, mut child: u16, point: Option<[f32; 2]>) -> bool {
         if self.virtual_lists.is_empty() {
             return true;
         }
         while let Some(parent) = self.tree.parent(child) {
-            if let Some((_, list)) = self.virtual_lists.get(&parent)
-                && !self.bound_rows.get(&child).is_some_and(|&(_, key)| {
-                    list.rows
-                        .intersects(key, f64::from(self.tree.rect(parent)[3]))
-                })
-            {
-                return false;
+            if let Some((_, list)) = self.virtual_lists.get(&parent) {
+                let height = f64::from(self.tree.rect(parent)[3]);
+                if !self
+                    .bound_rows
+                    .get(&child)
+                    .is_some_and(|&(_, key)| list.rows.visible_row(key, height).is_some())
+                {
+                    return false;
+                }
+                // Old hit rectangles retain all last-frame clips. Also apply the current
+                // viewport in the last-drawn list coordinates, even before another frame.
+                if let Some(point) = point {
+                    let Some(mut clip) = self.screen.get(parent as usize).copied().flatten() else {
+                        return false;
+                    };
+                    clip[3] *= (list.rows.extent().min(height) / height) as f32;
+                    if !contains(clip, point) {
+                        return false;
+                    }
+                }
             }
             child = parent;
         }
@@ -1068,7 +1085,7 @@ impl Host {
         self.hits
             .iter()
             .rev()
-            .find(|h| contains(h.rect, point) && self.row_can_receive(h.id))
+            .find(|h| contains(h.rect, point) && self.row_input_at(h.id, Some(point)))
             .map(|h| (h.id, h.layer))
     }
 
@@ -1143,7 +1160,7 @@ impl Host {
         self.scrolls.iter().rev().find_map(|s| {
             if s.k <= 0.
                 || !contains(s.rect, point)
-                || !self.row_can_receive(s.id)
+                || !self.row_input_at(s.id, Some(point))
                 || self.covered(top, s.layer, s.id)
             {
                 return None;
@@ -1285,7 +1302,7 @@ impl Host {
             let (track, thumb) = s.bar?;
             (contains(s.rect, point)
                 && contains(track, point)
-                && self.row_can_receive(s.id)
+                && self.row_input_at(s.id, Some(point))
                 && !self.covered(top, s.layer, s.id))
             .then_some((s.id, s.view, s.max, thumb))
         }) else {
@@ -1853,8 +1870,8 @@ impl Host {
 
     // Whether the pointer is in `rect` and nothing on a higher layer covers it: what a group or a hover box reacts to.
     fn pointed(&self, top: Option<(u16, i32)>, rect: Rect, layer: i32, id: u16) -> bool {
-        self.pointer.is_some_and(|p| contains(rect, p))
-            && self.row_can_receive(id)
+        self.pointer
+            .is_some_and(|p| contains(rect, p) && self.row_input_at(id, Some(p)))
             && !self.covered(top, layer, id)
     }
 
@@ -2023,18 +2040,19 @@ impl Host {
                     let Some((_, list)) = lists.get(&id) else {
                         return Vec::new();
                     };
-                    if list.bindings.is_empty() {
-                        return Vec::new();
-                    }
-                    list.rows
-                        .visible_within(f64::from(height))
-                        .into_iter()
-                        .filter_map(|(key, top, height)| {
-                            Some((
-                                *list.bindings.get(&key)?,
-                                (top - list.rows.offset()) as f32,
-                                height as f32,
-                            ))
+                    let mut rows: Vec<_> = list
+                        .bindings
+                        .iter()
+                        .filter_map(|(&key, &row)| {
+                            let (top, pixels) = list.rows.visible_row(key, f64::from(height))?;
+                            Some((row, top, pixels))
+                        })
+                        .collect();
+                    // Restore visual order before narrowing offsets to f32.
+                    rows.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
+                    rows.into_iter()
+                        .map(|(row, top, pixels)| {
+                            (row, (top - list.rows.offset()) as f32, pixels as f32)
                         })
                         .collect()
                 })
@@ -5211,6 +5229,48 @@ mod tests {
                 .iter()
                 .any(|item| matches!(item, Item::Text { .. }))
         );
+    }
+
+    #[test]
+    fn virtual_list_host_frame_work_scales_with_bindings_not_visible_keys() {
+        use crate::list::INDEX_VISITS;
+        let mut host = list_host();
+        let list = host
+            .replace_virtual_list(2, (0..60_000).map(|key| (key, 0.01)))
+            .unwrap();
+        assert!(host.set_list_viewport(list, ListOffset::Pixels(0.), 560.));
+        assert!(host.bind_virtual_row(list, 1234, 3));
+        INDEX_VISITS.with(|n| n.set(0));
+        let frame = host.frame(640., 560., 1., 4096);
+        let visits = INDEX_VISITS.with(|n| n.get());
+        assert_eq!(host.layout.visible_rows(2), [3]);
+        assert!((host.tree.rect(3)[1] - 12.34).abs() < 0.001);
+        assert!(matches!(&frame.items[..], [Item::Text { text, .. }] if text == "legacy row"));
+        assert!(
+            (1..=32).contains(&visits),
+            "one binding visited {visits} index nodes"
+        );
+    }
+
+    #[test]
+    fn virtual_list_host_shrinking_viewport_clips_hits_before_the_next_frame() {
+        let mut host = column_host(true);
+        add(
+            &mut host,
+            r#"[
+            {"op":"create","id":2,"parent":1,"node":{"kind":"list","style":{"width":100,"height":40}}},
+            {"op":"create","id":3,"parent":2,"node":{"kind":"box","press":12}}
+        ]"#,
+        );
+        let list = host.replace_virtual_list(2, [(1, 20.), (2, 20.)]).unwrap();
+        assert!(host.bind_virtual_row(list, 1, 3));
+        assert!(host.set_list_viewport(list, ListOffset::Pixels(0.), 40.));
+        host.frame(640., 560., 1., 4096);
+        assert_eq!(host.pointer_move(Some([5., 15.])), Cursor::Pointer);
+        assert!(host.set_list_viewport(list, ListOffset::Pixels(0.), 10.));
+        assert_eq!(host.pointer_move(Some([5., 15.])), Cursor::Default);
+        assert_eq!(host.pointer_move(Some([5., 10.])), Cursor::Default);
+        assert_eq!(host.pointer_move(Some([5., 5.])), Cursor::Pointer);
     }
 
     #[test]

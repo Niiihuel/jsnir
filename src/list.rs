@@ -6,6 +6,11 @@ use std::collections::BTreeMap;
 type Order = i128;
 type Link = Option<Box<Row>>;
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static INDEX_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 struct Row {
     key: u64,
     order: Order,
@@ -152,7 +157,9 @@ impl Row {
         }
     }
 
-    fn span_at(&self, span: (f64, f64), order: Order) -> (f64, f64) {
+    fn span_at(&self, span: (f64, f64), order: Order) -> (f64, f64, f64) {
+        #[cfg(test)]
+        INDEX_VISITS.with(|n| n.set(n.get() + 1));
         let (top, bottom) = self.edges(span);
         if order < self.order {
             self.child[0]
@@ -165,11 +172,13 @@ impl Row {
                 .unwrap()
                 .span_at((bottom, span.1), order)
         } else {
-            (top, bottom)
+            (top, bottom, self.pixels)
         }
     }
 
     fn collect(&self, span: (f64, f64), window: (f64, f64), rows: &mut Vec<(u64, f64, f64)>) {
+        #[cfg(test)]
+        INDEX_VISITS.with(|n| n.set(n.get() + 1));
         if span.0 >= span.1 || span.0 >= window.1 || span.1 <= window.0 {
             return;
         }
@@ -289,12 +298,8 @@ impl List {
     /// (key, content-relative top, logical height) for rows intersecting the
     /// half-open viewport. A zero extent has no visible rows.
     pub(crate) fn visible(&self) -> Vec<(u64, f64, f64)> {
-        self.visible_within(self.extent)
-    }
-
-    pub(crate) fn visible_within(&self, limit: f64) -> Vec<(u64, f64, f64)> {
         let mut rows = Vec::new();
-        let end = self.offset + self.extent.min(limit);
+        let end = self.offset + self.extent;
         if end > self.offset
             && let Some(root) = &self.root
         {
@@ -307,15 +312,15 @@ impl List {
         self.keys.contains_key(&key)
     }
 
-    pub(crate) fn intersects(&self, key: u64, limit: f64) -> bool {
+    /// Look up one key in the same half-open window as `visible`, additionally capped by the list box.
+    pub(crate) fn visible_row(&self, key: u64, limit: f64) -> Option<(f64, f64)> {
         let end = self.offset + self.extent.min(limit);
-        self.keys
-            .get(&key)
-            .zip(self.root.as_ref())
-            .is_some_and(|(&order, root)| {
-                let (top, bottom) = root.span_at((0., root.total), order);
-                end > self.offset && top < bottom && top < end && bottom > self.offset
-            })
+        if end <= self.offset {
+            return None;
+        }
+        let root = self.root.as_ref()?;
+        let (top, bottom, height) = root.span_at((0., root.total), *self.keys.get(&key)?);
+        (top < bottom && top < end && bottom > self.offset).then_some((top, height))
     }
 
     fn clamp(&self, offset: f64) -> f64 {
@@ -330,7 +335,7 @@ impl List {
     fn restore(&mut self, anchor: Option<(Order, f64)>) {
         let offset = match (anchor, &self.root) {
             (Some((order, intra)), Some(root)) => {
-                let (top, bottom) = root.span_at((0., root.total), order);
+                let (top, bottom, _) = root.span_at((0., root.total), order);
                 if top + intra < bottom {
                     top + intra
                 } else {
