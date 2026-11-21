@@ -1176,11 +1176,22 @@ impl Host {
             .try_recv()
             .unwrap_or_else(|_| Err("the app did not report the reload".into()));
         let kept = outcome.is_ok().then(|| self.keep());
+        if kept.is_some() {
+            // The app has already installed the new VM, even if its tree batch fails.
+            self.list_vm = self.list_vm.checked_add(1).expect("VM epochs exhausted");
+        }
         self.reload_results.push_back(outcome);
         let accepted = self.receive(batch);
         if let Some(kept) = kept {
-            if accepted {
-                self.list_vm = self.list_vm.checked_add(1).expect("VM epochs exhausted");
+            if !accepted {
+                for (_, list) in self.virtual_lists.values_mut() {
+                    if list.reply.active() {
+                        // The surviving tree belongs to the retired VM. Do not
+                        // use its baseline to propose to the replacement VM.
+                        list.reply.pending = None;
+                        list.reply.failed = true;
+                    }
+                }
             }
             self.restore(kept);
         }
@@ -1253,6 +1264,7 @@ impl Host {
     // Applies one app batch and updates the layout, transitions, timers and focus that depend on it.
     fn receive(&mut self, batch: Batch) -> bool {
         let mut removed = Vec::new();
+        let mut affected_lists = HashSet::new();
         let mut created = Vec::new();
         let mut restyled = Vec::new();
         let mut texts = Vec::new();
@@ -1263,7 +1275,20 @@ impl Host {
         let mut moved = Vec::new();
         for op in &batch.ops {
             match op {
-                Op::Remove { id } => removed.extend(self.tree.subtree(*id)),
+                Op::Remove { id } => {
+                    removed.extend(self.tree.subtree(*id));
+                    if !self.bound_rows.is_empty() {
+                        // Read ownership before the batch can recycle the ID, walking
+                        // only the removed subtree root's old ancestor chain.
+                        let mut parent = self.tree.parent(*id);
+                        while let Some(node) = parent {
+                            if let Some(&(list, _)) = self.bound_rows.get(&node) {
+                                affected_lists.insert(list);
+                            }
+                            parent = self.tree.parent(node);
+                        }
+                    }
+                }
                 Op::Create {
                     id, parent, before, ..
                 } => {
@@ -1301,6 +1326,13 @@ impl Host {
         if let Err(e) = result {
             eprintln!("batch rejected ({e})");
             return false;
+        }
+        for id in affected_lists {
+            if let Some((_, list)) = self.virtual_lists.get_mut(&id)
+                && let Some(reply) = &mut list.reply.pending
+            {
+                reply.invalidated = true;
+            }
         }
         self.scroll_requests.extend(requests);
         // Nodes created and removed in the same batch are gone too.
@@ -5605,6 +5637,49 @@ mod tests {
     }
 
     #[test]
+    fn list_reply_gate_fences_vm_swap_even_when_reload_batch_is_rejected() {
+        let mut host = list_host();
+        let id = host.replace_auto_virtual_list(2, []).unwrap();
+        host.frame(100., 100., 1., 4096);
+        let (old, _) = host.propose_list_reply(id).unwrap();
+        let base = host.tree.app_seq;
+        let script = r#"
+            function jsnirMount() {
+                jsnir.batch('{"ops":[{"op":"create","id":1,"node":{"kind":"label","value":1000}}]}');
+            }
+        "#;
+        assert!(host.reload(script.into()));
+        settle(&mut host);
+        assert_eq!(host.take_reload_result(), Some(Ok(())));
+        assert_eq!(host.tree.app_seq, base);
+        assert_eq!(host.tree.children(2), [3]);
+        let batch = Batch { base, ops: vec![] };
+        let result = host.accept_list_reply(old, batch, &[]);
+        assert_eq!(result, Err(ListReplyError::Stale));
+        assert_eq!(host.tree.app_seq, base);
+        assert_eq!(accepted(&mut host, id), 0);
+        assert!(host.propose_list_reply(id).is_none());
+    }
+
+    #[test]
+    fn list_reply_gate_preserves_ticket_when_reload_never_swaps_vm() {
+        let mut host = list_host();
+        let id = host.replace_auto_virtual_list(2, []).unwrap();
+        host.frame(100., 100., 1., 4096);
+        let (ticket, _) = host.propose_list_reply(id).unwrap();
+        for script in [
+            "function (",
+            "function jsnirMount() { throw Error('mount'); }",
+        ] {
+            assert!(host.reload(script.into()));
+            settle(&mut host);
+            assert!(host.take_reload_result().unwrap().is_err());
+        }
+        let batch = reply_batch(&mut host, "[]");
+        assert_eq!(host.accept_list_reply(ticket, batch, &[]), Ok(()));
+    }
+
+    #[test]
     fn list_reply_gate_fences_residency_aba() {
         for remove_key in [true, false] {
             let mut host = list_host();
@@ -5657,6 +5732,44 @@ mod tests {
         assert_eq!(result, Err(ListReplyError::Rebuild));
         assert_eq!(host.tree.text(4), Some("new"));
         assert_eq!(accepted(&mut host, id), first.serial);
+    }
+
+    #[test]
+    fn list_reply_gate_fences_recycled_descendants_only_in_the_bound_scope() {
+        for (child, parent, expected) in [(3, 2, Ok(())), (6, 5, Err(ListReplyError::Rebuild))] {
+            let mut host = list_host();
+            let id = host.replace_auto_virtual_list(2, [(7, 10.)]).unwrap();
+            host.frame(100., 100., 1., 4096);
+            let (first, _) = host.propose_list_reply(id).unwrap();
+            let create = r#"[
+                {"op":"create","id":4,"parent":2,"node":{"kind":"column"}},
+                {"op":"create","id":5,"parent":4,"node":{"kind":"column"}},
+                {"op":"create","id":6,"parent":5,"node":{"kind":"text","text":"old"}}]"#;
+            let batch = reply_batch(&mut host, create);
+            assert_eq!(host.accept_list_reply(first, batch, &[(7, 4)]), Ok(()));
+            assert!(host.mutate_list(id, ListMutation::Update(7, 10.)));
+            let (edit, delta) = host.propose_list_reply(id).unwrap();
+            assert_eq!(Some(delta), demand(&[], &[7], &[]));
+            let recycle = format!(
+                r#"[{{"op":"remove","id":{child}}},
+                {{"op":"create","id":{child},"parent":{parent},"node":{{"kind":"text","text":"new"}}}}]"#
+            );
+            let batch = reply_batch(&mut host, &recycle);
+            assert!(host.receive(batch));
+            let base = host.tree.app_seq;
+            let batch = reply_batch(&mut host, r#"[{"op":"settext","id":6,"text":"edited"}]"#);
+            assert_eq!(batch.base, base);
+            assert_eq!(host.accept_list_reply(edit, batch, &[]), expected);
+            assert_eq!(host.bound_rows.get(&4), Some(&(2, 7)));
+            if expected.is_err() {
+                assert_eq!(host.tree.app_seq, base);
+                assert_eq!(host.tree.text(6), Some("new"));
+                assert_eq!(accepted(&mut host, id), first.serial);
+            } else {
+                assert_eq!(host.tree.text(6), Some("edited"));
+                assert_eq!(accepted(&mut host, id), edit.serial);
+            }
+        }
     }
 
     #[test]
