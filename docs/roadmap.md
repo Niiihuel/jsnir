@@ -27,9 +27,13 @@ The first priorities are keeping the UI responsive when the app VM fails, preser
    `take_list_demand`. The consumer supplies a logical viewport and gets only entering, edited, and evicted
    keys (no overscan or repeat snapshot). Same-height content edits do not reselect the window; geometry
    edits can reconcile the visible window. The handle is valid on the issuing Host only, until input
-   replacement or node removal. This does not yet mount or draw virtual rows or send demand to QuickJS.
-   Next: drive demand from actual list layout and scroll, and wire a bounded resident row renderer through
-   the SDK without changing legacy List behavior.
+   replacement or node removal. The embedder can `bind_virtual_row` an existing direct child subtree to
+   a key and `unbind_virtual_row` it without removing it from the app tree. Only bound rows in the
+   intersection of the supplied viewport and the list box are laid out and drawn, using their indexed
+   heights and offsets. Paint and pointer hits are clipped to that viewport; fixed descendants stay
+   inside it rather than becoming window overlays. Legacy lists are unchanged.
+   Next: derive demand from layout and scrolling, send it to QuickJS, and mount only demanded rows in
+   the SDK. Host bindings do not implement any of those steps.
 7. **Layout:** percentages, min/max sizes, wrapping, grid, z-order. **Text:** ellipsis, alignment, rich spans,
    font loading from the app, system font fallback. **Images.**
 8. **Rendering:** rounded clipping, rotation, backdrop blur, a glyph atlas instead of one texture per text,

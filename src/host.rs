@@ -317,6 +317,7 @@ pub struct ListDemand {
 #[derive(Default)]
 struct VirtualList {
     rows: List,
+    bindings: HashMap<u64, u16>,
     follow_tail: bool,
     window_dirty: bool,
     delivered: Option<VirtualListId>,
@@ -327,6 +328,7 @@ struct VirtualList {
 pub struct Host {
     pub tree: Tree,
     virtual_lists: HashMap<u16, (u64, VirtualList)>,
+    bound_rows: HashMap<u16, (u16, u64)>,
     list_issuer: u64,
     list_generation: u64,
     bridge: Bridge,
@@ -459,6 +461,7 @@ impl Host {
         let mut host = Self {
             tree: Tree::default(),
             virtual_lists: HashMap::new(),
+            bound_rows: HashMap::new(),
             list_issuer,
             list_generation: 0,
             bridge,
@@ -510,7 +513,7 @@ impl Host {
 
     /// Opts an existing List node into Rust-side demand, or replaces its input sequence.
     /// Duplicate keys or invalid heights reject the entire replacement. The new viewport starts
-    /// empty. This does not change the node's legacy children, layout, or painting.
+    /// empty and old row bindings are dropped. Only bound children contribute to its frame.
     /// Removing the node (including by reload) ends its residency and invalidates the handle.
     pub fn replace_virtual_list(
         &mut self,
@@ -528,6 +531,11 @@ impl Host {
         }
         let generation = self.list_generation.checked_add(1)?;
         self.list_generation = generation;
+        if let Some((_, list)) = self.virtual_lists.get_mut(&node) {
+            for row in std::mem::take(&mut list.bindings).into_values() {
+                self.detach_virtual_row(row);
+            }
+        }
         let entry = self.virtual_lists.entry(node).or_default();
         *entry = (
             generation,
@@ -543,6 +551,94 @@ impl Host {
             node,
             generation,
         })
+    }
+
+    /// Binds an existing direct child to an indexed key, one child per key and one key per child.
+    /// Repeating the same binding is a no-op. Binding does not change demand or tree ownership.
+    pub fn bind_virtual_row(&mut self, id: VirtualListId, key: u64, row: u16) -> bool {
+        if self.tree.parent(row) != Some(id.node) {
+            return false;
+        }
+        let already_bound = self.bound_rows.contains_key(&row);
+        let Some(list) = self.virtual_list_mut(id) else {
+            return false;
+        };
+        if let Some(&bound) = list.bindings.get(&key) {
+            return bound == row;
+        }
+        if already_bound || !list.rows.contains(key) {
+            return false;
+        }
+        list.bindings.insert(key, row);
+        self.bound_rows.insert(row, (id.node, key));
+        self.layout.attach_row(&self.tree, row);
+        true
+    }
+
+    /// Drops the binding without removing the child from the app's tree.
+    pub fn unbind_virtual_row(&mut self, id: VirtualListId, key: u64) -> bool {
+        let Some(row) = self
+            .virtual_list_mut(id)
+            .and_then(|list| list.bindings.remove(&key))
+        else {
+            return false;
+        };
+        self.detach_virtual_row(row);
+        true
+    }
+
+    fn detach_virtual_row(&mut self, row: u16) {
+        self.bound_rows.remove(&row);
+        self.layout.detach_row(&self.tree, row);
+        self.forget_row_input(&self.tree.subtree(row));
+    }
+
+    // A new binding must not inherit the previous binding's last-frame pointer geometry.
+    fn forget_row_input(&mut self, ids: &[u16]) {
+        let ids: HashSet<_> = ids.iter().copied().collect();
+        for &id in &ids {
+            if let Some(rect) = self.screen.get_mut(id as usize) {
+                *rect = None;
+            }
+        }
+        self.hits.retain(|hit| !ids.contains(&hit.id));
+        self.scrolls.retain(|scroll| !ids.contains(&scroll.id));
+        for rects in [
+            &mut self.group_rects,
+            &mut self.hover_rects,
+            &mut self.dismiss_rects,
+        ] {
+            rects.retain(|(id, _, _)| !ids.contains(id));
+        }
+        for active in [&mut self.focused, &mut self.pressed, &mut self.hovered] {
+            if active.is_some_and(|id| ids.contains(&id)) {
+                *active = None;
+            }
+        }
+        self.hovered_groups.retain(|id| !ids.contains(id));
+        self.pressed_groups.retain(|id| !ids.contains(id));
+        self.hovered_boxes.retain(|id| !ids.contains(id));
+        if self.drag.is_some_and(|(id, _)| ids.contains(&id)) {
+            self.drag = None;
+        }
+    }
+
+    fn row_can_receive(&self, mut child: u16) -> bool {
+        if self.virtual_lists.is_empty() {
+            return true;
+        }
+        while let Some(parent) = self.tree.parent(child) {
+            if let Some((_, list)) = self.virtual_lists.get(&parent)
+                && !self.bound_rows.get(&child).is_some_and(|&(_, key)| {
+                    list.rows
+                        .intersects(key, f64::from(self.tree.rect(parent)[3]))
+                })
+            {
+                return false;
+            }
+            child = parent;
+        }
+        true
     }
 
     fn virtual_list_mut(&mut self, id: VirtualListId) -> Option<&mut VirtualList> {
@@ -604,6 +700,9 @@ impl Host {
         // also invalidates that row. Never accumulate edits for offscreen keys.
         if list.resident.contains(&key) {
             list.edited.insert(key);
+        }
+        if matches!(edit, ListMutation::Remove(_)) {
+            self.unbind_virtual_row(id, key);
         }
         true
     }
@@ -922,7 +1021,15 @@ impl Host {
                 .filter(|id| self.tree.nodes.get(id).is_none()),
         );
         self.layout.removed(&removed);
+        if !removed.is_empty() && !self.bound_rows.is_empty() {
+            self.forget_row_input(&removed);
+        }
         for id in &removed {
+            if let Some((list, key)) = self.bound_rows.remove(id)
+                && let Some((_, list)) = self.virtual_lists.get_mut(&list)
+            {
+                list.bindings.remove(&key);
+            }
             self.virtual_lists.remove(id);
             self.scroll.remove(id);
             self.scroll_requests.remove(id);
@@ -961,7 +1068,7 @@ impl Host {
         self.hits
             .iter()
             .rev()
-            .find(|h| contains(h.rect, point))
+            .find(|h| contains(h.rect, point) && self.row_can_receive(h.id))
             .map(|h| (h.id, h.layer))
     }
 
@@ -1034,7 +1141,11 @@ impl Host {
         let point = self.pointer?;
         let top = self.top_hit(point);
         self.scrolls.iter().rev().find_map(|s| {
-            if s.k <= 0. || !contains(s.rect, point) || self.covered(top, s.layer, s.id) {
+            if s.k <= 0.
+                || !contains(s.rect, point)
+                || !self.row_can_receive(s.id)
+                || self.covered(top, s.layer, s.id)
+            {
                 return None;
             }
             let base = match self.motion.target(s.id, Channel::Scroll) {
@@ -1172,8 +1283,11 @@ impl Host {
         let top = self.top_hit(point);
         let Some((id, view, max, thumb)) = self.scrolls.iter().rev().find_map(|s| {
             let (track, thumb) = s.bar?;
-            (contains(s.rect, point) && contains(track, point) && !self.covered(top, s.layer, s.id))
-                .then_some((s.id, s.view, s.max, thumb))
+            (contains(s.rect, point)
+                && contains(track, point)
+                && self.row_can_receive(s.id)
+                && !self.covered(top, s.layer, s.id))
+            .then_some((s.id, s.view, s.max, thumb))
         }) else {
             return false;
         };
@@ -1197,6 +1311,7 @@ impl Host {
         self.pointer = point;
         self.refresh_hover();
         if let (Some((id, grab)), Some(p)) = (self.drag, point)
+            && self.row_can_receive(id)
             && let Some(s) = self.scrolls.iter().find(|s| s.id == id)
             && let Some((track, thumb)) = s.bar
             && thumb[3] < track[3]
@@ -1349,7 +1464,8 @@ impl Host {
     }
 
     fn dismiss(&mut self, id: u16) {
-        if let Some(Node::Box { dismiss, .. }) = self.tree.nodes.get(&id)
+        if self.row_can_receive(id)
+            && let Some(Node::Box { dismiss, .. }) = self.tree.nodes.get(&id)
             && *dismiss != 0
         {
             let callback = *dismiss;
@@ -1362,11 +1478,16 @@ impl Host {
 
     /// Where a node was drawn in the last frame, unclipped, in window logical pixels. None if it was not drawn.
     pub fn screen_rect(&self, id: u16) -> Option<Rect> {
-        self.screen.get(id as usize).copied().flatten()
+        self.screen
+            .get(id as usize)
+            .copied()
+            .flatten()
+            .filter(|_| self.row_can_receive(id))
     }
 
     /// Moves keyboard focus to a field, or clears it.
     pub fn focus(&mut self, id: Option<u16>) {
+        let id = id.filter(|&id| self.row_can_receive(id));
         if self.focused == id {
             return;
         }
@@ -1398,17 +1519,17 @@ impl Host {
 
     /// Whether a field has focus: the backend enables the platform's input method only then.
     pub fn focused(&self) -> bool {
-        self.focused.is_some()
+        self.focused.is_some_and(|id| self.row_can_receive(id))
     }
 
     pub fn composing(&self) -> bool {
-        self.focused.is_some() && self.editor.composing()
+        self.focused() && self.editor.composing()
     }
 
     /// Keyboard and input-method events for the focused field.
     pub fn edit(&mut self, events: &[EditorEvent]) -> EditorOutput {
         let mut output = EditorOutput::default();
-        let Some(id) = self.focused else {
+        let Some(id) = self.focused.filter(|&id| self.row_can_receive(id)) else {
             return output;
         };
         let composing = self.editor.composing()
@@ -1592,6 +1713,10 @@ impl Host {
         now: f64,
     ) -> (Frame, Vec<(u16, Placement)>) {
         self.lay_out(width, height, now);
+        if self.focused.is_some() && !self.focused() {
+            self.focused = None;
+            self.editor_dragging = false;
+        }
         let mut items = Vec::new();
         let mut hits = std::mem::take(&mut self.hits);
         hits.clear();
@@ -1617,6 +1742,7 @@ impl Host {
                 brightness: 1.,
                 clip: window,
                 round_clip: None,
+                in_row: false,
             };
             let mut walker = Walker {
                 items: &mut items,
@@ -1727,7 +1853,9 @@ impl Host {
 
     // Whether the pointer is in `rect` and nothing on a higher layer covers it: what a group or a hover box reacts to.
     fn pointed(&self, top: Option<(u16, i32)>, rect: Rect, layer: i32, id: u16) -> bool {
-        self.pointer.is_some_and(|p| contains(rect, p)) && !self.covered(top, layer, id)
+        self.pointer.is_some_and(|p| contains(rect, p))
+            && self.row_can_receive(id)
+            && !self.covered(top, layer, id)
     }
 
     // Recomputes what the pointer is over, from the last frame: the hovered node, the group nodes and the boxes with
@@ -1886,14 +2014,37 @@ impl Host {
                 (transition.is_some() || variant || keyed).then_some((id, transition))
             })
             .collect();
+        let lists = &self.virtual_lists;
+        let compute = |layout: &mut Layout, tree: &Tree, text: &mut TextEngine| {
+            if lists.is_empty() {
+                layout.compute(tree, text, width, height)
+            } else {
+                layout.compute_with_rows(tree, text, width, height, |id, height| {
+                    let Some((_, list)) = lists.get(&id) else {
+                        return Vec::new();
+                    };
+                    if list.bindings.is_empty() {
+                        return Vec::new();
+                    }
+                    list.rows
+                        .visible_within(f64::from(height))
+                        .into_iter()
+                        .filter_map(|(key, top, height)| {
+                            Some((
+                                *list.bindings.get(&key)?,
+                                (top - list.rows.offset()) as f32,
+                                height as f32,
+                            ))
+                        })
+                        .collect()
+                })
+            }
+        };
         let mut changed = if sized.is_empty() {
-            self.layout
-                .compute(&self.tree, &mut self.text, width, height)
+            compute(&mut self.layout, &self.tree, &mut self.text)
         } else {
             self.layout.pin_heights(&self.tree, &HashMap::new());
-            let natural = self
-                .layout
-                .compute(&self.tree, &mut self.text, width, height);
+            let natural = compute(&mut self.layout, &self.tree, &mut self.text);
             let natural_height = |id: u16| {
                 natural
                     .iter()
@@ -1941,8 +2092,7 @@ impl Host {
             } else {
                 self.layout.pin_heights(&self.tree, &pins);
                 // Relative to the tree's rectangles, which still hold the previous frame.
-                self.layout
-                    .compute(&self.tree, &mut self.text, width, height)
+                compute(&mut self.layout, &self.tree, &mut self.text)
             }
         };
         changed.retain(|(id, rect)| self.tree.rect(*id) != *rect);
@@ -2086,6 +2236,7 @@ struct Context {
     clip: Rect,
     // Rounded rectangle and corner radius of the innermost rounded clip; None for none.
     round_clip: Option<(Rect, Corners)>,
+    in_row: bool,
 }
 impl Context {
     fn rect(&self, [x, y, w, h]: Rect) -> Rect {
@@ -2277,6 +2428,7 @@ impl Walker<'_> {
         let style = host.tree.nodes.get(&id).and_then(Node::style);
         let fixed = style.is_some_and(|s| s.position == Position::Fixed);
         let layer = style.and_then(|s| s.layer.or(fixed.then_some(1)));
+        let fixed = fixed && !ctx.in_row;
         if let Some(layer) = layer
             && (fixed || layer != self.layer)
         {
@@ -2354,6 +2506,7 @@ impl Walker<'_> {
             brightness: 1.,
             clip: self.window,
             round_clip: None,
+            in_row: false,
         })
     }
 
@@ -2847,9 +3000,13 @@ impl Walker<'_> {
                 child.round_clip = Some((screen, radius));
             }
         }
+        let virtual_list = host
+            .virtual_lists
+            .get(&id)
+            .map(|(_, list)| list.rows.extent());
         // A scrollbar and its opacity this frame, drawn over the content.
         let mut bar = None;
-        if node.style().is_some_and(|s| s.scroll) {
+        if virtual_list.is_none() && node.style().is_some_and(|s| s.scroll) {
             // The offset is clamped to this frame's content, so it stays valid when the content shrinks.
             let content = host.layout.content_height(id);
             let max = (content - layout_rect[3]).max(0.);
@@ -2905,7 +3062,21 @@ impl Walker<'_> {
                 bar: rects,
             });
         }
-        if !matches!(node, Node::List { .. }) {
+        if let Some(extent) = virtual_list {
+            let view = [
+                screen[0],
+                screen[1],
+                screen[2],
+                screen[3].min(extent as f32 * inner.k),
+            ];
+            child.clip = intersect(child.clip, view);
+            child.in_row = true;
+            if child.clip[2] > 0. && child.clip[3] > 0. {
+                for row in host.layout.visible_rows(id).to_vec() {
+                    self.node(host, row, child, scale, max_side);
+                }
+            }
+        } else if !matches!(node, Node::List { .. }) {
             for &c in host.tree.children(id).to_vec().iter() {
                 self.node(host, c, child, scale, max_side);
             }
@@ -5040,6 +5211,95 @@ mod tests {
                 .iter()
                 .any(|item| matches!(item, Item::Text { .. }))
         );
+    }
+
+    #[test]
+    fn virtual_list_host_lays_out_and_clips_only_bound_visible_subtrees() {
+        let mut host = Host::new(r#"
+            function jsnirMount() {
+                jsnir.batch(JSON.stringify({ops: [
+                    {op:'create', id:1, node:{kind:'column'}},
+                    {op:'create', id:2, parent:1, node:{kind:'list', style:{width:100, height:40}}},
+                    {op:'create', id:3, parent:2, node:{kind:'box'}},
+                    {op:'create', id:4, parent:3, node:{kind:'box', press:12,
+                        style:{width:100, height:40, position:'fixed', top:0}, paint:{background:4294967295}}},
+                    {op:'create', id:5, parent:4, node:{kind:'text', text:'rich row', spans:[{text:'rich row'}]}},
+                    {op:'create', id:6, parent:2, node:{kind:'text', text:'offscreen'}},
+                    {op:'create', id:7, parent:2, node:{kind:'text', text:'unbound'}}
+                ]}));
+            }
+            function jsnirEvent(callback) {
+                if (callback === 12) jsnir.batch(JSON.stringify({ops:[{op:'settext', id:7, text:'clicked'}]}));
+            }
+        "#.into(), "{}".into(), TextEngine::default());
+        let id = host
+            .replace_virtual_list(2, (0..10_000).map(|key| (key, 40.)))
+            .unwrap();
+        host.set_list_viewport(id, ListOffset::Pixels(240_010.), 20.);
+        let frame = render_at(&mut host, 0.);
+        assert!(frame.items.is_empty());
+        assert!(host.bind_virtual_row(id, 6000, 3));
+        assert!(host.bind_virtual_row(id, 6010, 6));
+        assert!(!host.bind_virtual_row(id, 6000, 7));
+        assert!(!host.bind_virtual_row(id, 6001, 3));
+        assert!(!host.bind_virtual_row(id, 10000, 7));
+        assert!(!host.bind_virtual_row(id, 6001, 5));
+        let frame = render_at(&mut host, 0.);
+        assert_eq!(host.tree.rect(3), [0., -10., 100., 40.]);
+        assert!(host.tree.rect(5)[3] > 0.);
+        assert_eq!(host.tree.rect(6), [0.; 4]);
+        assert_eq!(host.tree.rect(7), [0.; 4]);
+        assert_eq!(host.layout.visible_rows(2), [3]);
+        assert_eq!(frame.items.len(), 2);
+        assert!(
+            matches!(&frame.items[1], Item::Text { spans: Some(spans), clip, .. }
+            if spans[0].text == "rich row" && *clip == [0., 0., 100., 20.])
+        );
+        assert_eq!(host.pointer_move(Some([5., 5.])), Cursor::Pointer);
+        for point in [[5., 20.], [101., 5.], [5., -1.]] {
+            assert_eq!(host.pointer_move(Some(point)), Cursor::Default);
+            host.pointer_down(PointSelection::Place);
+            host.pointer_up();
+        }
+        assert!(!host.busy());
+        host.pointer_move(Some([5., 5.]));
+        host.pointer_down(PointSelection::Place);
+        host.pointer_up();
+        settle(&mut host);
+        assert!(texts(&host).contains(&"clicked".to_owned()));
+        // Even a large requested extent cannot lay out the prefetched row outside the list box.
+        host.set_list_viewport(id, ListOffset::Pixels(240_015.), 100_000.);
+        render_at(&mut host, 0.);
+        assert_eq!(host.tree.rect(3)[1], -15.);
+        assert_eq!(host.tree.rect(6), [0.; 4]);
+        assert_eq!(host.hit([5., 5.]), Some(4));
+        assert_eq!(host.hit([5., 40.]), None);
+        host.set_list_viewport(id, ListOffset::Pixels(240_040.), 20.);
+        assert_eq!(host.hit([5., 5.]), None);
+        assert!(render_at(&mut host, 0.).items.is_empty());
+        host.set_list_viewport(id, ListOffset::Pixels(240_015.), 20.);
+        render_at(&mut host, 0.);
+        assert!(host.unbind_virtual_row(id, 6000));
+        assert_eq!(host.hit([5., 5.]), None);
+        assert!(render_at(&mut host, 0.).items.is_empty());
+        assert!(host.bind_virtual_row(id, 6000, 3));
+        render_at(&mut host, 0.);
+        let next = host.replace_virtual_list(2, [(6000, 40.)]).unwrap();
+        assert!(!host.bind_virtual_row(id, 6000, 3));
+        host.set_list_viewport(next, ListOffset::Pixels(0.), 20.);
+        assert_eq!(host.hit([5., 5.]), None);
+        assert!(render_at(&mut host, 0.).items.is_empty());
+        assert!(host.bind_virtual_row(next, 6000, 3));
+        render_at(&mut host, 0.);
+        assert!(host.mutate_list(next, ListMutation::Remove(6000)));
+        assert!(host.mutate_list(next, ListMutation::Append(6000, 40.)));
+        assert_eq!(host.hit([5., 5.]), None);
+        assert!(render_at(&mut host, 0.).items.is_empty());
+        assert!(host.bind_virtual_row(next, 6000, 3));
+        render_at(&mut host, 0.);
+        add(&mut host, r#"[{"op":"remove","id":3}]"#);
+        assert_eq!(host.hit([5., 5.]), None);
+        assert!(render_at(&mut host, 0.).items.is_empty());
     }
 
     // A host whose app mounts a root column (id 1); tests add nodes with batches.

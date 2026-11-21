@@ -152,22 +152,20 @@ impl Row {
         }
     }
 
-    fn position(&self, span: (f64, f64), order: Order, intra: f64) -> f64 {
+    fn span_at(&self, span: (f64, f64), order: Order) -> (f64, f64) {
         let (top, bottom) = self.edges(span);
         if order < self.order {
             self.child[0]
                 .as_ref()
                 .unwrap()
-                .position((span.0, top), order, intra)
+                .span_at((span.0, top), order)
         } else if order > self.order {
             self.child[1]
                 .as_ref()
                 .unwrap()
-                .position((bottom, span.1), order, intra)
-        } else if top + intra < bottom {
-            top + intra
+                .span_at((bottom, span.1), order)
         } else {
-            top // The anchor row shrank past the old intra-row point.
+            (top, bottom)
         }
     }
 
@@ -291,14 +289,33 @@ impl List {
     /// (key, content-relative top, logical height) for rows intersecting the
     /// half-open viewport. A zero extent has no visible rows.
     pub(crate) fn visible(&self) -> Vec<(u64, f64, f64)> {
+        self.visible_within(self.extent)
+    }
+
+    pub(crate) fn visible_within(&self, limit: f64) -> Vec<(u64, f64, f64)> {
         let mut rows = Vec::new();
-        let end = self.offset + self.extent;
+        let end = self.offset + self.extent.min(limit);
         if end > self.offset
             && let Some(root) = &self.root
         {
             root.collect((0., root.total), (self.offset, end), &mut rows);
         }
         rows
+    }
+
+    pub(crate) fn contains(&self, key: u64) -> bool {
+        self.keys.contains_key(&key)
+    }
+
+    pub(crate) fn intersects(&self, key: u64, limit: f64) -> bool {
+        let end = self.offset + self.extent.min(limit);
+        self.keys
+            .get(&key)
+            .zip(self.root.as_ref())
+            .is_some_and(|(&order, root)| {
+                let (top, bottom) = root.span_at((0., root.total), order);
+                end > self.offset && top < bottom && top < end && bottom > self.offset
+            })
     }
 
     fn clamp(&self, offset: f64) -> f64 {
@@ -312,7 +329,14 @@ impl List {
 
     fn restore(&mut self, anchor: Option<(Order, f64)>) {
         let offset = match (anchor, &self.root) {
-            (Some((order, intra)), Some(root)) => root.position((0., root.total), order, intra),
+            (Some((order, intra)), Some(root)) => {
+                let (top, bottom) = root.span_at((0., root.total), order);
+                if top + intra < bottom {
+                    top + intra
+                } else {
+                    top
+                }
+            }
             _ => self.offset,
         };
         self.offset = self.clamp(offset);

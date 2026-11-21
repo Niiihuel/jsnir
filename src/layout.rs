@@ -2,9 +2,8 @@
 //! changed rectangles leave as a UI batch (`setrect`) and reach JS through the `x`, `y`, `width` and
 //! `height` columns.
 //!
-//! List items do not go through Taffy: the list is a leaf that lays out its own rows, and the backend
-//! draws only the visible ones. Per Taffy's benchmark, layout costs ≈ 0.25–0.47 µs per node; 10,000
-//! rows would take more than half a frame at 120 Hz.
+//! Lists are leaves in the main flex tree. Opt-in rows are independent flex roots: only the
+//! indexed window's materialized rows are computed and walked.
 use crate::{
     text::{TextEngine, TextStyle, WRAP_SLACK, node_spans},
     tree::{Align, Axis, Justify, Node, Position, Tree},
@@ -26,6 +25,8 @@ pub struct Layout {
     pinned: HashMap<u16, f32>,
     // Content height of each scroll node in the last computed layout.
     content: HashMap<u16, f32>,
+    row_sizes: HashMap<u16, (f32, f32)>,
+    visible_rows: HashMap<u16, Vec<u16>>,
 }
 impl Default for Layout {
     fn default() -> Self {
@@ -40,6 +41,8 @@ impl Default for Layout {
             viewport: None,
             pinned: HashMap::new(),
             content: HashMap::new(),
+            row_sizes: HashMap::new(),
+            visible_rows: HashMap::new(),
         }
     }
 }
@@ -150,12 +153,71 @@ impl Layout {
     fn get(&self, id: u16) -> Option<NodeId> {
         *self.nodes.get(id as usize)?
     }
-    /// Adds a newly created node to the layout. Descendants of a list stay out.
+    fn in_row(&self, tree: &Tree, mut id: u16) -> bool {
+        loop {
+            if self.row_sizes.contains_key(&id) {
+                return true;
+            }
+            let Some(parent) = tree.parent(id) else {
+                return false;
+            };
+            id = parent;
+        }
+    }
+    fn detached(&self, tree: &Tree, id: u16) -> bool {
+        detached(tree, id) && !self.in_row(tree, id)
+    }
+    fn style(&self, tree: &Tree, id: u16, node: &Node) -> taffy::Style {
+        let mut style = taffy_style(node, in_scroll(tree, id));
+        if let Some(&(w, h)) = self.row_sizes.get(&id) {
+            style.size = Size {
+                width: length(w),
+                height: length(h),
+            };
+            style.min_size = Size {
+                width: length(w),
+                height: length(h),
+            };
+            style.max_size = style.min_size;
+        } else if is_fixed(node) && self.in_row(tree, id) {
+            let s = node.style().unwrap();
+            style.position = taffy::Position::Absolute;
+            style.inset.left = s.left.map_or(auto(), LengthPercentageAuto::length);
+            style.inset.top = s.top.map_or(auto(), LengthPercentageAuto::length);
+        }
+        style
+    }
+    pub(crate) fn attach_row(&mut self, tree: &Tree, row: u16) {
+        self.row_sizes.insert(row, (0., 0.));
+        let mut stack = vec![row];
+        while let Some(id) = stack.pop() {
+            self.created(tree, id, tree.parent(id));
+            if !matches!(tree.nodes.get(&id), Some(Node::List { .. })) {
+                stack.extend(tree.children(id).iter().rev());
+            }
+        }
+    }
+    pub(crate) fn detach_row(&mut self, tree: &Tree, row: u16) {
+        let mut stack = vec![row];
+        while let Some(id) = stack.pop() {
+            self.removed(&[id]);
+            if !matches!(tree.nodes.get(&id), Some(Node::List { .. })) {
+                stack.extend(tree.children(id));
+            }
+        }
+    }
+    pub(crate) fn visible_rows(&self, list: u16) -> &[u16] {
+        self.visible_rows.get(&list).map_or(&[], Vec::as_slice)
+    }
+    /// Adds a newly created node to the layout. Only explicitly attached rows join the layout.
     pub fn created(&mut self, tree: &Tree, id: u16, parent: Option<u16>) {
         let Some(node) = tree.nodes.get(&id) else {
             return;
         };
+        let row = self.row_sizes.contains_key(&id);
+        let is_root = parent.is_none();
         let parent = match parent {
+            _ if row => None,
             None => None,
             Some(p) if matches!(tree.nodes.get(&p), Some(Node::List { .. })) => return,
             Some(p) => match self.get(p) {
@@ -163,7 +225,7 @@ impl Layout {
                 None => return,
             },
         };
-        let style = taffy_style(node, in_scroll(tree, id));
+        let style = self.style(tree, id, node);
         let t = if matches!(
             node,
             Node::Text { .. }
@@ -183,9 +245,10 @@ impl Layout {
         }
         self.nodes[i] = Some(t);
         match parent {
-            Some(_) if is_fixed(node) => {}
+            Some(_) if self.detached(tree, id) => {}
             Some(p) => self.taffy.add_child(p, t).expect("taffy: child"),
-            None => self.root = Some(id),
+            None if is_root => self.root = Some(id),
+            None => {}
         }
     }
     /// Lays out a whole tree, for when its structure changed (for example, after an app reload).
@@ -208,6 +271,7 @@ impl Layout {
                 let _ = self.taffy.remove(node);
             }
             self.pinned.remove(&id);
+            self.row_sizes.remove(&id);
             if self.root == Some(id) {
                 self.root = None;
                 self.viewport = None;
@@ -225,7 +289,7 @@ impl Layout {
         let children: Vec<NodeId> = tree
             .children(parent)
             .iter()
-            .filter(|c| !detached(tree, **c))
+            .filter(|c| !self.detached(tree, **c))
             .filter_map(|c| self.get(*c))
             .collect();
         self.taffy
@@ -248,7 +312,7 @@ impl Layout {
     }
     fn restyle(&mut self, tree: &Tree, id: u16) {
         if let (Some(node), Some(t)) = (tree.nodes.get(&id), self.get(id)) {
-            let mut style = taffy_style(node, in_scroll(tree, id));
+            let mut style = self.style(tree, id, node);
             if Some(id) == self.root
                 && let Some((width, height)) = self.viewport
             {
@@ -278,7 +342,7 @@ impl Layout {
             self.restyled(tree, id);
         }
         for (&id, &height) in heights {
-            if self.pinned.get(&id) == Some(&height) {
+            if self.row_sizes.contains_key(&id) || self.pinned.get(&id) == Some(&height) {
                 continue;
             }
             if let Some(t) = self.get(id) {
@@ -316,6 +380,18 @@ impl Layout {
         width: f32,
         height: f32,
     ) -> Vec<(u16, [f32; 4])> {
+        self.compute_with_rows(tree, text, width, height, |_, _| Vec::new())
+    }
+
+    pub(crate) fn compute_with_rows(
+        &mut self,
+        tree: &Tree,
+        text: &mut TextEngine,
+        width: f32,
+        height: f32,
+        mut rows: impl FnMut(u16, f32) -> Vec<(u16, f32, f32)>,
+    ) -> Vec<(u16, [f32; 4])> {
+        self.visible_rows.clear();
         let Some(root) = self.root else {
             return Vec::new();
         };
@@ -349,8 +425,8 @@ impl Layout {
             };
             roots.push((self.get(id).expect("fixed node in the layout"), space));
         }
-        for (node, space) in roots {
-            self.taffy
+        let mut compute = |taffy: &mut TaffyTree<u16>, node, space| {
+            taffy
                 .compute_layout_with_measure(node, space, |input, _, id, style| {
                     taffy::compute_leaf_layout(
                         input,
@@ -417,6 +493,9 @@ impl Layout {
                     )
                 })
                 .expect("taffy: layout");
+        };
+        for (node, space) in roots {
+            compute(&mut self.taffy, node, space);
         }
         // Taffy gives each position relative to the parent: accumulate from each root.
         let mut rects: HashMap<u16, [f32; 4]> = HashMap::new();
@@ -432,18 +511,23 @@ impl Layout {
                 .taffy
                 .layout(self.get(id).expect("node in the layout"))
                 .expect("taffy: result");
-            let rect = [
-                px + l.location.x,
-                py + l.location.y,
-                l.size.width,
-                l.size.height,
-            ];
+            let rect = if let Some(&(w, h)) = self.row_sizes.get(&id) {
+                [px, py, w, h]
+            } else {
+                [
+                    px + l.location.x,
+                    py + l.location.y,
+                    l.size.width,
+                    l.size.height,
+                ]
+            };
             rects.insert(id, rect);
             if let Some(target) = tree
                 .nodes
                 .get(&id)
                 .and_then(Node::style)
                 .and_then(|s| s.follow)
+                && !self.row_sizes.contains_key(&id)
             {
                 follows.push((id, target));
             }
@@ -455,11 +539,29 @@ impl Layout {
             {
                 scrolls.push((id, s.padding.sides()[2]));
             }
-            if !matches!(tree.nodes.get(&id), Some(Node::List { .. })) {
+            if matches!(tree.nodes.get(&id), Some(Node::List { .. })) {
+                for (row, top, height) in rows(id, rect[3]) {
+                    let Some(node) = self.get(row) else { continue };
+                    let size = (rect[2], height);
+                    if self.row_sizes.insert(row, size) != Some(size) {
+                        self.restyle(tree, row);
+                    }
+                    compute(
+                        &mut self.taffy,
+                        node,
+                        Size {
+                            width: AvailableSpace::Definite(rect[2]),
+                            height: AvailableSpace::Definite(height),
+                        },
+                    );
+                    stack.push((row, rect[0], rect[1] + top));
+                    self.visible_rows.entry(id).or_default().push(row);
+                }
+            } else {
                 stack.extend(
                     tree.children(id)
                         .iter()
-                        .filter(|c| self.get(**c).is_some() && !detached(tree, **c))
+                        .filter(|c| self.get(**c).is_some() && !self.detached(tree, **c))
                         .map(|&c| (c, rect[0], rect[1])),
                 );
             }
@@ -477,7 +579,7 @@ impl Layout {
             let bottom = tree
                 .children(id)
                 .iter()
-                .filter(|c| !detached(tree, **c))
+                .filter(|c| !self.detached(tree, **c))
                 .filter_map(|c| rects.get(c))
                 .map(|r| r[1] + r[3])
                 .fold(top, f32::max);
