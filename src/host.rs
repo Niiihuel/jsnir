@@ -5,6 +5,7 @@ use crate::{
     App, Bridge, Event, HOST_CALLBACK, Inbox, Log, MAX_PENDING, Vm,
     editor::{EditorBitmapKey, EditorEvent, EditorFrame, EditorOutput, LineEditor, PointSelection},
     layout::Layout,
+    list::List,
     motion::{Channel, Motion, Value},
     or_log, spawn_app,
     text::{Mark, TextBitmap, TextEngine, TextStyle, WRAP_SLACK, node_spans, plain_text},
@@ -17,7 +18,7 @@ use crate::{
 use rquickjs::{Ctx, Exception, Function, function::MutFn};
 use std::{
     cell::RefCell,
-    collections::{HashMap, VecDeque},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     rc::Rc,
     sync::{Arc, Mutex, mpsc::TryRecvError},
     time::{Duration, Instant},
@@ -263,8 +264,59 @@ struct Scroll {
     bar: Option<(Rect, Rect)>,
 }
 
+/// Identifies one input sequence on the Host that issued it. Replacement invalidates the old handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtualListId {
+    node: u16,
+    generation: u64,
+}
+
+/// A requested scroll position in logical pixels.
+#[derive(Debug, Clone, Copy)]
+pub enum ListOffset {
+    /// Clamp an absolute offset and preserve its row anchor on future edits.
+    Pixels(f64),
+    /// Stay at the end until the next explicit pixel offset.
+    Tail,
+}
+
+/// Keyed edits to a Rust-owned list. Heights are positive, finite logical pixels.
+#[derive(Debug, Clone, Copy)]
+pub enum ListMutation {
+    Append(u64, f32),
+    Prepend(u64, f32),
+    /// Invalidate the row's content even if its new height equals its old height.
+    Update(u64, f32),
+    Remove(u64),
+}
+
+/// A delta relative to the last demand taken by the consumer, not a resident snapshot.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ListDemand {
+    /// Newly visible keys in list order.
+    pub entering: Vec<u64>,
+    /// Edited keys that remain visible, in key order.
+    pub changed: Vec<u64>,
+    /// Keys that left the window, in key order.
+    pub evicted: Vec<u64>,
+    /// Drop all residency for this previous generation before processing the delta.
+    pub retired: Option<VirtualListId>,
+}
+
+#[derive(Default)]
+struct VirtualList {
+    rows: List,
+    follow_tail: bool,
+    window_dirty: bool,
+    delivered: Option<VirtualListId>,
+    resident: HashSet<u64>,
+    edited: BTreeSet<u64>,
+}
+
 pub struct Host {
     pub tree: Tree,
+    virtual_lists: HashMap<u16, (u64, VirtualList)>,
+    list_generation: u64,
     bridge: Bridge,
     pending: u16,
     layout: Layout,
@@ -389,6 +441,8 @@ impl Host {
         )?;
         let mut host = Self {
             tree: Tree::default(),
+            virtual_lists: HashMap::new(),
+            list_generation: 0,
             bridge,
             pending: 0,
             layout: Layout::default(),
@@ -434,6 +488,133 @@ impl Host {
             return Err("the app did not mount a root node".into());
         }
         Ok(host)
+    }
+
+    /// Opts an existing List node into Rust-side demand, or replaces its input sequence.
+    /// Duplicate keys or invalid heights reject the entire replacement. The new viewport starts
+    /// empty. This does not change the node's legacy children, layout, or painting.
+    /// Removing the node (including by reload) ends its residency and invalidates the handle.
+    pub fn replace_virtual_list(
+        &mut self,
+        node: u16,
+        rows: impl IntoIterator<Item = (u64, f32)>,
+    ) -> Option<VirtualListId> {
+        if !matches!(self.tree.nodes.get(&node), Some(Node::List { .. })) {
+            return None;
+        }
+        let mut list = List::default();
+        for (key, height) in rows {
+            if !list.append(key, height) {
+                return None;
+            }
+        }
+        let generation = self.list_generation.checked_add(1)?;
+        self.list_generation = generation;
+        let entry = self.virtual_lists.entry(node).or_default();
+        *entry = (
+            generation,
+            VirtualList {
+                rows: list,
+                delivered: entry.1.delivered,
+                window_dirty: true,
+                ..Default::default()
+            },
+        );
+        Some(VirtualListId { node, generation })
+    }
+
+    fn virtual_list_mut(&mut self, id: VirtualListId) -> Option<&mut VirtualList> {
+        let (generation, list) = self.virtual_lists.get_mut(&id.node)?;
+        (*generation == id.generation).then_some(list)
+    }
+
+    /// Supplies the viewport in logical pixels. Invalid values and stale handles are ignored.
+    pub fn set_list_viewport(
+        &mut self,
+        id: VirtualListId,
+        offset: ListOffset,
+        extent: f64,
+    ) -> bool {
+        let Some(list) = self.virtual_list_mut(id) else {
+            return false;
+        };
+        let before = (list.rows.offset(), list.rows.extent());
+        let pixels = match offset {
+            ListOffset::Pixels(pixels) => pixels,
+            ListOffset::Tail => list.rows.total(),
+        };
+        if !list.rows.set_viewport(pixels, extent) {
+            return false;
+        }
+        list.follow_tail = matches!(offset, ListOffset::Tail);
+        list.window_dirty |= before != (list.rows.offset(), list.rows.extent());
+        true
+    }
+
+    /// The clamped or anchored logical offset of the current generation.
+    pub fn list_offset(&self, id: VirtualListId) -> Option<f64> {
+        let (generation, list) = self.virtual_lists.get(&id.node)?;
+        (*generation == id.generation).then(|| list.rows.offset())
+    }
+
+    /// Applies a keyed edit. Invalid edits and stale handles leave the list and demand unchanged.
+    pub fn mutate_list(&mut self, id: VirtualListId, edit: ListMutation) -> bool {
+        let Some(list) = self.virtual_list_mut(id) else {
+            return false;
+        };
+        let (key, geometry_changed) = match edit {
+            ListMutation::Append(key, height) if list.rows.append(key, height) => (key, true),
+            ListMutation::Prepend(key, height) if list.rows.prepend(key, height) => (key, true),
+            ListMutation::Remove(key) if list.rows.remove(key) => (key, true),
+            ListMutation::Update(key, height) => match list.rows.update_height(key, height) {
+                Some(changed) => (key, changed),
+                None => return false,
+            },
+            _ => return false,
+        };
+        if list.follow_tail && geometry_changed {
+            list.rows
+                .set_viewport(list.rows.total(), list.rows.extent());
+        }
+        list.window_dirty |= geometry_changed;
+        // A removal followed by reinsertion of the same resident key before delivery
+        // also invalidates that row. Never accumulate edits for offscreen keys.
+        if list.resident.contains(&key) {
+            list.edited.insert(key);
+        }
+        true
+    }
+
+    /// Takes the initial demand (even if empty), then only visible-key changes. No overscan.
+    /// A clean viewport is not traversed, and content-only edits do not reselect the window.
+    pub fn take_list_demand(&mut self, id: VirtualListId) -> Option<ListDemand> {
+        let list = self.virtual_list_mut(id)?;
+        let initial = list.delivered != Some(id);
+        let mut demand = ListDemand {
+            retired: list.delivered.filter(|_| initial),
+            ..Default::default()
+        };
+        if std::mem::take(&mut list.window_dirty) {
+            let mut resident = HashSet::new();
+            for (key, _, _) in list.rows.visible() {
+                resident.insert(key);
+                if !list.resident.contains(&key) {
+                    demand.entering.push(key);
+                }
+            }
+            demand
+                .evicted
+                .extend(list.resident.difference(&resident).copied());
+            demand.evicted.sort_unstable();
+            list.resident = resident;
+        }
+        demand.changed.extend(
+            std::mem::take(&mut list.edited)
+                .into_iter()
+                .filter(|key| list.resident.contains(key)),
+        );
+        list.delivered = Some(id);
+        (initial || demand != ListDemand::default()).then_some(demand)
     }
 
     fn now(&self) -> f64 {
@@ -719,6 +900,7 @@ impl Host {
         );
         self.layout.removed(&removed);
         for id in &removed {
+            self.virtual_lists.remove(id);
             self.scroll.remove(id);
             self.scroll_requests.remove(id);
             self.anchors.remove(id);
@@ -4674,6 +4856,142 @@ mod tests {
         // CSS: the row's automatic minimum is its content, 50 rows of 30 px, so the footer is pushed below the window.
         assert!((footer[1] - 1500.).abs() < 0.01, "{footer:?}");
         assert!((column[3] - 1500.).abs() < 0.01, "{column:?}");
+    }
+
+    const LIST_APP: &str = r#"
+        function jsnirMount() {
+            jsnir.batch(JSON.stringify({ ops: [
+                { op: 'create', id: 1, node: { kind: 'column' } },
+                { op: 'create', id: 2, parent: 1, node: { kind: 'list', style: { height: 20 } } },
+                { op: 'create', id: 3, parent: 2, node: { kind: 'text', text: 'legacy row' } }
+            ] }));
+        }
+    "#;
+
+    fn list_host() -> Host {
+        Host::new(LIST_APP.into(), "{}".into(), TextEngine::default())
+    }
+
+    fn demand(entering: &[u64], changed: &[u64], evicted: &[u64]) -> Option<ListDemand> {
+        Some(ListDemand {
+            entering: entering.to_vec(),
+            changed: changed.to_vec(),
+            evicted: evicted.to_vec(),
+            retired: None,
+        })
+    }
+
+    #[test]
+    fn virtual_list_host_preserves_anchor_and_delivers_only_key_deltas() {
+        use ListMutation::*;
+        use ListOffset::*;
+        let mut host = list_host();
+        assert!(host.replace_virtual_list(1, []).is_none());
+        let list = host
+            .replace_virtual_list(2, [(1, 2.), (2, 4.), (3, 5.)])
+            .unwrap();
+        assert!(host.set_list_viewport(list, Pixels(3.25), 1.));
+        assert_eq!(host.take_list_demand(list), demand(&[2], &[], &[]));
+        assert!(host.set_list_viewport(list, Pixels(3.5), 1.));
+        assert_eq!(host.take_list_demand(list), None);
+        assert!(host.set_list_viewport(list, Pixels(3.25), 1.));
+        assert!(host.mutate_list(list, Append(8, 10.)));
+        assert!(host.mutate_list(list, Prepend(4, 1.5)));
+        assert_eq!(host.list_offset(list), Some(4.75));
+        assert_eq!(host.take_list_demand(list), None);
+        assert!(host.mutate_list(list, Update(1, 3.)));
+        assert_eq!(host.list_offset(list), Some(5.75));
+        assert_eq!(host.take_list_demand(list), None);
+        assert!(host.mutate_list(list, Update(2, 4.))); // A content edit may leave height unchanged.
+        assert_eq!(host.take_list_demand(list), demand(&[], &[2], &[]));
+        assert!(!host.mutate_list(list, Append(2, 99.)));
+        assert!(!host.mutate_list(list, Update(2, 0.)));
+        assert!(!host.set_list_viewport(list, Pixels(f64::NAN), 1.));
+        assert_eq!(host.list_offset(list), Some(5.75));
+        assert_eq!(host.take_list_demand(list), None);
+        assert!(host.mutate_list(list, Remove(2)));
+        assert_eq!(host.list_offset(list), Some(4.5));
+        assert_eq!(host.take_list_demand(list), demand(&[3], &[], &[2]));
+        assert_eq!(host.take_list_demand(list), None);
+        assert!(host.set_list_viewport(list, Tail, 2.));
+        assert_eq!(host.list_offset(list), Some(17.5));
+        assert_eq!(host.take_list_demand(list), demand(&[8], &[], &[3]));
+        assert!(host.mutate_list(list, Append(9, 3.)));
+        assert_eq!(host.list_offset(list), Some(20.5));
+        assert_eq!(host.take_list_demand(list), demand(&[9], &[], &[8]));
+        assert!(host.set_list_viewport(list, Pixels(20.5), 2.));
+        assert!(host.mutate_list(list, Append(10, 3.)));
+        assert_eq!(host.list_offset(list), Some(20.5));
+        assert_eq!(host.take_list_demand(list), None);
+    }
+
+    #[test]
+    fn virtual_list_host_bounds_history_demand_and_fences_replacement() {
+        let mut host = list_host();
+        let old = host
+            .replace_virtual_list(2, (0..10_000).map(|key| (key, 1.)))
+            .unwrap();
+        assert!(host.set_list_viewport(old, ListOffset::Pixels(6_000.), 3.));
+        assert_eq!(
+            host.take_list_demand(old),
+            demand(&[6000, 6001, 6002], &[], &[])
+        );
+        for _ in 0..3 {
+            host.poll();
+            host.frame(640., 560., 1., 4096);
+            assert!(host.set_list_viewport(old, ListOffset::Pixels(6_000.), 3.));
+            assert_eq!(host.take_list_demand(old), None);
+        }
+        assert!(host.set_list_viewport(old, ListOffset::Pixels(6_001.), 3.));
+        assert_eq!(host.take_list_demand(old), demand(&[6003], &[], &[6000]));
+        assert!(host.replace_virtual_list(2, [(1, 1.), (1, 2.)]).is_none());
+        assert_eq!(host.list_offset(old), Some(6_001.));
+        let new = host.replace_virtual_list(2, [(6001, 2.)]).unwrap();
+        assert!(!host.mutate_list(old, ListMutation::Remove(6001)));
+        assert!(!host.set_list_viewport(old, ListOffset::Tail, 1.));
+        assert_eq!(host.take_list_demand(old), None);
+        assert_eq!(host.list_offset(old), None);
+        assert!(host.set_list_viewport(new, ListOffset::Pixels(0.), 1.));
+        assert_eq!(
+            host.take_list_demand(new),
+            Some(ListDemand {
+                entering: vec![6001],
+                retired: Some(old),
+                ..Default::default()
+            })
+        );
+        let empty = host.replace_virtual_list(2, []).unwrap();
+        assert_eq!(
+            host.take_list_demand(empty),
+            Some(ListDemand {
+                retired: Some(new),
+                ..Default::default()
+            })
+        );
+        assert_eq!(host.take_list_demand(empty), None);
+        assert!(host.reload(LIST_APP.into()));
+        settle(&mut host);
+        assert_eq!(host.take_reload_result(), Some(Ok(())));
+        assert_eq!(host.list_offset(empty), None);
+        let fresh = host.replace_virtual_list(2, []).unwrap();
+        assert_ne!(fresh, empty);
+        assert_eq!(host.take_list_demand(fresh), Some(ListDemand::default()));
+        assert_eq!(host.take_list_demand(fresh), None);
+    }
+
+    #[test]
+    fn legacy_list_host_keeps_tree_rows_out_of_layout_and_paint() {
+        let mut host = list_host();
+        let frame = host.frame(640., 560., 1., 4096);
+        assert_eq!(host.tree.children(2), [3]);
+        assert_eq!(host.tree.rect(2)[3], 20.);
+        assert_eq!(host.tree.rect(3), [0.; 4]);
+        assert!(
+            !frame
+                .items
+                .iter()
+                .any(|item| matches!(item, Item::Text { .. }))
+        );
     }
 
     // A host whose app mounts a root column (id 1); tests add nodes with batches.

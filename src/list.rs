@@ -1,8 +1,6 @@
-//! Weighted AVL sequence for future Rust-owned virtual rows. Internal order labels
+//! Weighted AVL sequence for Rust-owned virtual rows. Internal order labels
 //! are independent of row keys and never require relabeling. The key index and each
 //! tree path cost O(log n); window selection prunes nonintersecting subtrees.
-#![allow(dead_code)] // No Host or renderer consumer in this slice.
-
 use std::collections::BTreeMap;
 
 type Order = i128;
@@ -67,14 +65,19 @@ impl Row {
         root.rebalance()
     }
 
-    fn update(&mut self, order: Order, pixels: f64) {
-        if order == self.order {
+    fn update(&mut self, order: Order, pixels: f64) -> bool {
+        let changed = if order == self.order {
+            let changed = self.pixels != pixels;
             self.pixels = pixels;
+            changed
         } else {
             let side = usize::from(order > self.order);
-            self.child[side].as_mut().unwrap().update(order, pixels);
+            self.child[side].as_mut().unwrap().update(order, pixels)
+        };
+        if changed {
+            self.refresh();
         }
-        self.refresh();
+        changed
     }
 
     fn take_first(mut self: Box<Self>) -> (Box<Self>, Link) {
@@ -229,17 +232,18 @@ impl List {
         true
     }
 
-    pub(crate) fn update_height(&mut self, key: u64, height: f32) -> bool {
-        let Some(&order) = self.keys.get(&key) else {
-            return false;
-        };
+    /// `None` rejects the edit; otherwise returns whether the geometry changed.
+    pub(crate) fn update_height(&mut self, key: u64, height: f32) -> Option<bool> {
+        let &order = self.keys.get(&key)?;
         if !valid_height(height) {
-            return false;
+            return None;
         }
         let anchor = self.anchor();
-        self.root.as_mut().unwrap().update(order, f64::from(height));
-        self.restore(anchor);
-        true
+        let changed = self.root.as_mut().unwrap().update(order, f64::from(height));
+        if changed {
+            self.restore(anchor);
+        }
+        Some(changed)
     }
 
     pub(crate) fn remove(&mut self, key: u64) -> bool {
@@ -268,6 +272,10 @@ impl List {
 
     pub(crate) fn offset(&self) -> f64 {
         self.offset
+    }
+
+    pub(crate) fn extent(&self) -> f64 {
+        self.extent
     }
 
     /// A finite offset is clamped into [0, max(content height - extent, 0)].
@@ -349,7 +357,7 @@ mod tests {
         assert!(list.set_viewport(3.25, 1.));
         assert!(list.prepend(4, 1.5));
         assert_eq!(list.offset, 4.75);
-        assert!(list.update_height(1, 3.));
+        assert_eq!(list.update_height(1, 3.), Some(true));
         assert_eq!(list.offset, 5.75);
         assert!(list.remove(4));
         assert_eq!(list.offset, 4.25);
@@ -372,7 +380,7 @@ mod tests {
         assert!(list.append(2, 2.));
         assert!(list.append(3, 5.));
         assert!(list.set_viewport(5.5, 3.));
-        assert!(list.update_height(2, 1.));
+        assert_eq!(list.update_height(2, 1.), Some(true));
         assert_eq!(list.offset, 4.); // The original intra-row point no longer exists.
         assert!(list.remove(3));
         assert_eq!(list.offset, 2.);
@@ -392,11 +400,11 @@ mod tests {
         for invalid in [0., -1., f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             assert!(!list.append(2, invalid));
             assert!(!list.prepend(2, invalid));
-            assert!(!list.update_height(1, invalid));
+            assert_eq!(list.update_height(1, invalid), None);
         }
         assert!(!list.append(1, 10.));
         assert!(!list.prepend(1, 10.));
-        assert!(!list.update_height(2, 10.));
+        assert_eq!(list.update_height(2, 10.), None);
         assert!(!list.remove(2));
         for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             assert!(!list.set_viewport(invalid, 1.));
@@ -437,7 +445,7 @@ mod tests {
             assert!(list.prepend(key + 5_000, 1.));
         }
         assert!(list.set_viewport(7_500.5, 3.));
-        assert!(list.update_height(10, 3.));
+        assert_eq!(list.update_height(10, 3.), Some(true));
         assert!(list.remove(9_000));
         assert!(list.prepend(20_000, 0.25));
         assert_eq!(list.total(), 10_001.25);

@@ -22,7 +22,14 @@ The first priorities are keeping the UI responsive when the app VM fails, preser
 ## Next: cover what real screens use
 
 6. **SDK structure:** keyed lists with insert, remove and reorder; conditional subtrees; component cleanup hooks.
-   Today `list` only grows and `Dynamic` remounts its whole child.
+   The SDK `List` still only grows, and `Dynamic` remounts its whole child. The generic Rust `Host` can now
+   opt a mounted List into keyed demand with `replace_virtual_list`, `set_list_viewport`, `mutate_list`, and
+   `take_list_demand`. The consumer supplies a logical viewport and gets only entering, edited, and evicted
+   keys (no overscan or repeat snapshot). Same-height content edits do not reselect the window; geometry
+   edits can reconcile the visible window. The handle is valid on the issuing Host only, until input
+   replacement or node removal. This does not yet mount or draw virtual rows or send demand to QuickJS.
+   Next: drive demand from actual list layout and scroll, and wire a bounded resident row renderer through
+   the SDK without changing legacy List behavior.
 7. **Layout:** percentages, min/max sizes, wrapping, grid, z-order. **Text:** ellipsis, alignment, rich spans,
    font loading from the app, system font fallback. **Images.**
 8. **Rendering:** rounded clipping, rotation, backdrop blur, a glyph atlas instead of one texture per text,
