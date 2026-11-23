@@ -1,0 +1,25 @@
+[package]
+name = "jsnir-dev"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Vite-style development mode, Oxc TSX compiler, watcher, and CLI for JSNIR"
+
+[lib]
+name = "jsnir_dev"
+path = "src/lib.rs"
+
+[[bin]]
+name = "jsnir"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+jsnir = { path = "../..", default-features = false }
+jsnir-gpu = { path = "../../backends/gpu" }
+notify-debouncer-mini = "0.7"
+oxc = { version = "0.159", features = ["ast_visit", "semantic", "transformer", "codegen"] }
+png = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
