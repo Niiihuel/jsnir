@@ -2,7 +2,7 @@
 //! frame without calling JS. A property animates from what is on screen to its new target, as a CSS
 //! transition does, so a change in the middle of an animation turns around smoothly.
 use crate::tree::{self, Easing, Keyframe, Property, Transition};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// The React Bits stepper spring: CSS `linear()` with 29 evenly spaced samples.
 const SPRING: [f32; 29] = [
@@ -147,8 +147,32 @@ pub struct Motion {
     targets: HashMap<(u16, Channel), Value>,
     running: HashMap<(u16, Channel), Animation>,
     loops: HashMap<u16, Loop>,
+    /// Nodes that currently have any entry in `running` or `loops`, enabling O(1) static-node skips.
+    active_nodes: HashSet<u16>,
 }
 impl Motion {
+    #[inline]
+    fn clear_active_if_idle(&mut self, id: u16) {
+        if self.running.is_empty() && self.loops.is_empty() {
+            self.active_nodes.clear();
+        } else if !self.loops.contains_key(&id) && !self.running.keys().any(|&(n, _)| n == id) {
+            self.active_nodes.remove(&id);
+        }
+    }
+
+    /// Whether `id` currently has any running transition or keyframe loop.
+    /// Fast path: single branch when nothing in the app is animating.
+    #[inline]
+    pub fn has_active(&self, id: u16) -> bool {
+        (!self.running.is_empty() || !self.loops.is_empty()) && self.active_nodes.contains(&id)
+    }
+
+    /// Seeds a target value without starting an animation, if no target is recorded yet.
+    /// Used when `SetPaint` dynamically attaches `transitions` or `starting` to an already-drawn static node.
+    pub fn seed(&mut self, id: u16, channel: impl Into<Channel>, value: Value) {
+        self.targets.entry((id, channel.into())).or_insert(value);
+    }
+
     /// Sets the value a channel should reach and returns what to show now. With a transition and a
     /// previous target, a change animates from the value currently on screen.
     pub fn show(
@@ -178,9 +202,12 @@ impl Motion {
                             transition,
                         },
                     );
+                    self.active_nodes.insert(id);
                 }
                 None => {
-                    self.running.remove(&key);
+                    if self.running.remove(&key).is_some() {
+                        self.clear_active_if_idle(id);
+                    }
                 }
             },
             _ => {}
@@ -189,6 +216,7 @@ impl Motion {
             Some(Some(value)) => value,
             Some(None) => {
                 self.running.remove(&key);
+                self.clear_active_if_idle(id);
                 target
             }
             None => target,
@@ -216,6 +244,7 @@ impl Motion {
                 transition,
             },
         );
+        self.active_nodes.insert(id);
     }
     /// The target last set for a channel.
     pub fn target(&self, id: u16, channel: impl Into<Channel>) -> Option<Value> {
@@ -225,7 +254,9 @@ impl Motion {
     pub fn release(&mut self, id: u16, channel: impl Into<Channel>) {
         let key = (id, channel.into());
         self.targets.remove(&key);
-        self.running.remove(&key);
+        if self.running.remove(&key).is_some() {
+            self.clear_active_if_idle(id);
+        }
     }
     /// Whether any animation is still running at `now`, so the backend keeps drawing frames. An animation
     /// whose node is no longer walked (under a hidden node, say) is over once its time has passed.
@@ -250,7 +281,9 @@ impl Motion {
         now: f64,
     ) -> Keyed {
         if animations.is_empty() {
-            self.loops.remove(&id);
+            if self.loops.remove(&id).is_some() {
+                self.clear_active_if_idle(id);
+            }
             return Keyed::default();
         }
         let start = match self.loops.get(&id) {
@@ -263,6 +296,7 @@ impl Motion {
                         start: now,
                     },
                 );
+                self.active_nodes.insert(id);
                 now
             }
         };
@@ -293,9 +327,23 @@ impl Motion {
     }
     /// Drops everything about removed nodes, so a reused id starts fresh.
     pub fn forget(&mut self, ids: &[u16]) {
-        self.targets.retain(|(id, _), _| !ids.contains(id));
-        self.running.retain(|(id, _), _| !ids.contains(id));
-        self.loops.retain(|id, _| !ids.contains(id));
+        if ids.is_empty() {
+            return;
+        }
+        if !self.targets.is_empty() {
+            self.targets.retain(|(id, _), _| !ids.contains(id));
+        }
+        if !self.running.is_empty() {
+            self.running.retain(|(id, _), _| !ids.contains(id));
+        }
+        if !self.loops.is_empty() {
+            self.loops.retain(|id, _| !ids.contains(id));
+        }
+        if !self.active_nodes.is_empty() {
+            for id in ids {
+                self.active_nodes.remove(id);
+            }
+        }
     }
 }
 

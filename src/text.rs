@@ -17,10 +17,36 @@ pub const DEFAULT_FONT_SIZE: f32 = 16.;
 /// Spans (as their Debug text), width, lines, the shaping fields and the family of a style, as `limit_lines`
 /// and `cut_marks` key their caches.
 type CutKey = (String, u32, Option<u16>, [u32; 4], Option<String>);
+/// Rich multi-span measurement cache key: spans debug repr, optional width bits, shaping fields, and family.
+type RichMeasureKey = (String, Option<u32>, [u32; 4], Option<String>);
 /// What stands in for an inline image while shaping: its advance is set to the image's width.
 const PLACEHOLDER: &str = "\u{FFFC}";
 /// Cut texts kept before the cache starts over.
 const CUT_CACHE_MAX: usize = 1024;
+/// Plain text measurement entries kept before resetting the cache.
+const PLAIN_MEASURE_CACHE_MAX: usize = 4096;
+/// Maximum shaped `Buffer` instances retained for zero-HarfBuzz re-wrapping during live resize.
+const SHAPED_BUFFER_MAX: usize = 512;
+
+/// Interned shaping-relevant fields of a `TextStyle` for plain text measurement caching.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PlainStyleKey {
+    size: u32,
+    line_height: u32,
+    weight: u16,
+    letter_spacing: u32,
+    family: Option<String>,
+}
+
+/// Cached measurement and optional shaped `Buffer` for a single plain `(style, text)` entry.
+struct PlainMeasureEntry {
+    /// Unwrapped `[width, height]` with `width = None` (one line per `\n`-delimited paragraph).
+    natural: [f32; 2],
+    /// Most recent wrapped `(width_bits, [width, height])` for instant repeat hits (e.g. Taffy multi-pass).
+    last_wrapped: Option<(u32, [f32; 2])>,
+    /// Retained shaped `Buffer` so re-wrapping at a new width skips HarfBuzz shaping completely.
+    shaped: Option<Buffer>,
+}
 
 #[derive(Default)]
 pub struct TextEngine {
@@ -31,6 +57,14 @@ pub struct TextEngine {
     cuts: HashMap<CutKey, Vec<Span>>,
     /// Marks of rich text, keyed by its cut and alignment: a frame that draws unchanged rich text shapes nothing.
     marks_cache: HashMap<(CutKey, TextAlign), Vec<Mark>>,
+    /// Interned plain text styles; index matches `plain_measure`.
+    plain_styles: Vec<PlainStyleKey>,
+    /// Per-style map of `text -> PlainMeasureEntry`; lookups take `&str` with zero heap allocation.
+    plain_measure: Vec<HashMap<String, PlainMeasureEntry>>,
+    plain_measure_count: usize,
+    shaped_buffer_count: usize,
+    /// Measurement cache for multi-span / styled rich text.
+    rich_measure_cache: HashMap<RichMeasureKey, [f32; 2]>,
     /// Shaping calls so far, which tests count.
     #[cfg(test)]
     pub(crate) shapes: usize,
@@ -275,10 +309,56 @@ impl TextEngine {
         self.clear_caches();
     }
 
-    // Cuts and marks are laid out with the fonts they were made with: a font change drops them all.
+    // Cuts, marks, and measurements are laid out with the fonts they were made with: a font change drops them all.
     fn clear_caches(&mut self) {
         self.cuts.clear();
         self.marks_cache.clear();
+        self.plain_styles.clear();
+        self.plain_measure.clear();
+        self.plain_measure_count = 0;
+        self.shaped_buffer_count = 0;
+        self.rich_measure_cache.clear();
+    }
+
+    fn plain_style_id(&mut self, style: &TextStyle) -> usize {
+        let size = style.size.to_bits();
+        let line_height = style.line_height.to_bits();
+        let weight = style.weight;
+        let letter_spacing = style.letter_spacing.to_bits();
+        let family = style.family.as_deref();
+        if let Some(pos) = self.plain_styles.iter().position(|s| {
+            s.size == size
+                && s.line_height == line_height
+                && s.weight == weight
+                && s.letter_spacing == letter_spacing
+                && s.family.as_deref() == family
+        }) {
+            return pos;
+        }
+        let id = self.plain_styles.len();
+        self.plain_styles.push(PlainStyleKey {
+            size,
+            line_height,
+            weight,
+            letter_spacing,
+            family: style.family.clone(),
+        });
+        self.plain_measure.push(HashMap::new());
+        id
+    }
+
+    fn shape_plain_buffer(&mut self, text: &str, width: Option<f32>, style: &TextStyle) -> Buffer {
+        #[cfg(test)]
+        {
+            self.shapes += 1;
+        }
+        let fonts = self.fonts();
+        let mut buffer = Buffer::new_empty(metrics(style));
+        buffer.set_wrap(fonts, Wrap::WordOrGlyph);
+        buffer.set_size(fonts, width, None);
+        buffer.set_text(fonts, text, &attrs(style), Shaping::Advanced);
+        buffer.shape_until_scroll(fonts, false);
+        buffer
     }
 
     fn ink(&self) -> Color {
@@ -368,6 +448,88 @@ impl TextEngine {
         buffer
     }
 
+    /// Size of plain `text` laid out in `width` (one line per paragraph if `None`).
+    /// Cached per `(style, text)`: unwrapped hits return in O(1) with zero allocations, and wrapped resizes
+    /// re-wrap the retained shaped `Buffer` without re-running HarfBuzz shaping.
+    pub fn measure_plain(
+        &mut self,
+        text: &str,
+        width: Option<f32>,
+        style: &TextStyle,
+    ) -> [f32; 2] {
+        if text.is_empty() || width == Some(0.) {
+            return [0.; 2];
+        }
+        let style_id = self.plain_style_id(style);
+        if let Some(entry) = self.plain_measure[style_id].get_mut(text) {
+            match width {
+                None => return entry.natural,
+                Some(w) if !w.is_finite() || w >= entry.natural[0] + 0.001 => return entry.natural,
+                Some(w) => {
+                    let bits = w.to_bits();
+                    if let Some((cached_bits, size)) = entry.last_wrapped
+                        && cached_bits == bits
+                    {
+                        return size;
+                    }
+                    if let Some(buffer) = entry.shaped.as_mut() {
+                        let fonts = self.fonts.get_or_insert_with(FontSystem::new);
+                        buffer.set_size(fonts, Some(w), None);
+                        buffer.shape_until_scroll(fonts, false);
+                        let size = measure_buffer(buffer);
+                        entry.last_wrapped = Some((bits, size));
+                        return size;
+                    }
+                }
+            }
+            let w = width.unwrap();
+            let buffer = self.shape_plain_buffer(text, Some(w), style);
+            let size = measure_buffer(&buffer);
+            if let Some(entry) = self.plain_measure[style_id].get_mut(text) {
+                entry.last_wrapped = Some((w.to_bits(), size));
+            }
+            return size;
+        }
+
+        // Cache miss: shape once unwrapped so we know `natural` AND can re-wrap without re-shaping.
+        let mut buffer = self.shape_plain_buffer(text, None, style);
+        let natural = measure_buffer(&buffer);
+        let (result, last_wrapped) = match width {
+            Some(w) if w.is_finite() && w < natural[0] + 0.001 => {
+                let fonts = self.fonts.get_or_insert_with(FontSystem::new);
+                buffer.set_size(fonts, Some(w), None);
+                buffer.shape_until_scroll(fonts, false);
+                let wrapped = measure_buffer(&buffer);
+                (wrapped, Some((w.to_bits(), wrapped)))
+            }
+            _ => (natural, None),
+        };
+
+        if self.plain_measure_count >= PLAIN_MEASURE_CACHE_MAX {
+            for map in &mut self.plain_measure {
+                map.clear();
+            }
+            self.plain_measure_count = 0;
+            self.shaped_buffer_count = 0;
+        }
+        let shaped = if self.shaped_buffer_count < SHAPED_BUFFER_MAX {
+            self.shaped_buffer_count += 1;
+            Some(buffer)
+        } else {
+            None
+        };
+        self.plain_measure[style_id].insert(
+            text.to_owned(),
+            PlainMeasureEntry {
+                natural,
+                last_wrapped,
+                shaped,
+            },
+        );
+        self.plain_measure_count += 1;
+        result
+    }
+
     /// Size of `spans` laid out in `width` (one line if `None`).
     pub fn measure_styled(
         &mut self,
@@ -378,14 +540,20 @@ impl TextEngine {
         if blank(spans) || width == Some(0.) {
             return [0.; 2];
         }
-        self.shape_styled(spans, width, Wrap::WordOrGlyph, style)
-            .layout_runs()
-            .fold([0.0_f32; 2], |[width, height], run| {
-                [
-                    width.max(run.line_w),
-                    height.max(run.line_top + run.line_height),
-                ]
-            })
+        if spans.len() == 1 && is_plain_measure_span(&spans[0]) {
+            return self.measure_plain(&spans[0].text, width, style);
+        }
+        let key = rich_measure_key(spans, width, style);
+        if let Some(&size) = self.rich_measure_cache.get(&key) {
+            return size;
+        }
+        let buffer = self.shape_styled(spans, width, Wrap::WordOrGlyph, style);
+        let size = measure_buffer(&buffer);
+        if self.rich_measure_cache.len() >= CUT_CACHE_MAX {
+            self.rich_measure_cache.clear();
+        }
+        self.rich_measure_cache.insert(key, size);
+        size
     }
 
     /// `spans` cut to at most `lines` lines when laid out at `width`. If they wrap onto more, the last line
@@ -697,6 +865,40 @@ impl TextEngine {
     }
 }
 
+fn measure_buffer(buffer: &Buffer) -> [f32; 2] {
+    buffer
+        .layout_runs()
+        .fold([0.0_f32; 2], |[width, height], run| {
+            [
+                width.max(run.line_w),
+                height.max(run.line_top + run.line_height),
+            ]
+        })
+}
+
+/// Whether `span` has no shaping-relevant overrides (size, weight, family, italic, inline image).
+fn is_plain_measure_span(span: &Span) -> bool {
+    span.image.is_none()
+        && span.size.is_none()
+        && span.weight.is_none()
+        && span.family.is_none()
+        && !span.italic
+}
+
+fn rich_measure_key(spans: &[Span], width: Option<f32>, style: &TextStyle) -> RichMeasureKey {
+    (
+        format!("{spans:?}"),
+        width.map(f32::to_bits),
+        [
+            style.size.to_bits(),
+            style.line_height.to_bits(),
+            u32::from(style.weight),
+            style.letter_spacing.to_bits(),
+        ],
+        style.family.clone(),
+    )
+}
+
 /// The key of a cut of `spans` at `width` and `lines`, with the style fields that shaping reads.
 fn cut_key(spans: &[Span], width: f32, lines: Option<u16>, style: &TextStyle) -> CutKey {
     (
@@ -945,5 +1147,60 @@ mod tests {
                 .map(|g| g.font_id)
         };
         assert_ne!(face(0), face(1), "the italic run takes the oblique face");
+    }
+
+    #[test]
+    fn measure_plain_matches_uncached_shaping_and_rewraps_without_reshaping() {
+        let mut engine = engine();
+        let style = TextStyle::default();
+        let samples = [
+            "Hello world",
+            "Hello world with trailing spaces   ",
+            "First line\nSecond longer line here\nThird",
+            "Message payload 42 testing steady layout, scroll clipping, and hover walk.",
+            "Supercalifragilisticexpialidocious",
+        ];
+        for text in samples {
+            let natural_ref = measure_buffer(&engine.shape_styled(
+                &[run(text)],
+                None,
+                Wrap::WordOrGlyph,
+                &style,
+            ));
+            engine.shapes = 0;
+            let got_nat = engine.measure_plain(text, None, &style);
+            assert_eq!(got_nat, natural_ref, "natural mismatch for {text:?}");
+            assert_eq!(engine.shapes, 1, "first measurement shapes once");
+
+            // Unwrapped widths >= natural + slack hit O(1) natural cache with 0 shapes.
+            for extra in [WRAP_SLACK, 10., 200., 800.] {
+                let w = natural_ref[0] + extra;
+                let expected = measure_buffer(&engine.shape_styled(
+                    &[run(text)],
+                    Some(w),
+                    Wrap::WordOrGlyph,
+                    &style,
+                ));
+                let before = engine.shapes;
+                let got = engine.measure_plain(text, Some(w), &style);
+                assert_eq!(got, expected, "unwrapped mismatch for {text:?} at {w}");
+                assert_eq!(engine.shapes, before, "unwrapped width shapes nothing");
+            }
+
+            // Narrower widths re-wrap the retained Buffer with 0 additional HarfBuzz shapes!
+            for frac in [0.85_f32, 0.55, 0.30, 0.15] {
+                let w = (natural_ref[0] * frac).max(1.) + WRAP_SLACK;
+                let expected = measure_buffer(&engine.shape_styled(
+                    &[run(text)],
+                    Some(w),
+                    Wrap::WordOrGlyph,
+                    &style,
+                ));
+                let before = engine.shapes;
+                let got = engine.measure_plain(text, Some(w), &style);
+                assert_eq!(got, expected, "wrapped mismatch for {text:?} at {w}");
+                assert_eq!(engine.shapes, before, "re-wrapping retained buffer shapes nothing");
+            }
+        }
     }
 }

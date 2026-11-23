@@ -8,7 +8,7 @@ use crate::{
     text::{TextEngine, TextStyle, WRAP_SLACK, node_spans},
     tree::{Align, Axis, Justify, Node, Position, Tree},
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use taffy::prelude::{
     AvailableSpace, Dimension, FlexDirection, LengthPercentage, LengthPercentageAuto, NodeId, Rect,
     Size, TaffyTree, auto, length,
@@ -21,12 +21,20 @@ pub struct Layout {
     nodes: Vec<Option<NodeId>>,
     root: Option<u16>,
     viewport: Option<(f32, f32)>,
+    // Whether any layout input changed since the last `compute_with_rows` pass.
+    dirty: bool,
     // Heights currently pinned by an animation, so they can be released when it ends.
     pinned: HashMap<u16, f32>,
     // Content height of each scroll node in the last computed layout.
     content: HashMap<u16, f32>,
     row_sizes: HashMap<u16, (f32, Option<f32>)>,
     visible_rows: HashMap<u16, Vec<u16>>,
+    // Detached (`Position::Fixed`) node IDs outside list rows, tracked incrementally to avoid full-tree scans.
+    fixed_set: HashSet<u16>,
+    // Reusable direct-indexed scratch buffers for `compute_with_rows` (zero per-frame HashMap allocations).
+    rects_scratch: Vec<Option<[f32; 4]>>,
+    touched_ids: Vec<u16>,
+    walk_stack: Vec<(u16, f32, f32)>,
 }
 impl Default for Layout {
     fn default() -> Self {
@@ -39,10 +47,15 @@ impl Default for Layout {
             nodes: Vec::new(),
             root: None,
             viewport: None,
+            dirty: true,
             pinned: HashMap::new(),
             content: HashMap::new(),
             row_sizes: HashMap::new(),
             visible_rows: HashMap::new(),
+            fixed_set: HashSet::new(),
+            rects_scratch: Vec::new(),
+            touched_ids: Vec::new(),
+            walk_stack: Vec::new(),
         }
     }
 }
@@ -187,6 +200,7 @@ impl Layout {
         style
     }
     pub(crate) fn attach_row(&mut self, tree: &Tree, row: u16) {
+        self.dirty = true;
         self.row_sizes.insert(row, (0., Some(0.)));
         let mut stack = vec![row];
         while let Some(id) = stack.pop() {
@@ -197,6 +211,7 @@ impl Layout {
         }
     }
     pub(crate) fn detach_row(&mut self, tree: &Tree, row: u16) {
+        self.dirty = true;
         let mut stack = vec![row];
         while let Some(id) = stack.pop() {
             self.removed(&[id]);
@@ -207,6 +222,14 @@ impl Layout {
     }
     pub(crate) fn visible_rows(&self, list: u16) -> &[u16] {
         self.visible_rows.get(&list).map_or(&[], Vec::as_slice)
+    }
+    /// Whether the layout needs recomputation for `(width, height)`.
+    pub fn is_dirty(&self, width: f32, height: f32) -> bool {
+        self.dirty || self.viewport != Some((width, height)) || !self.pinned.is_empty()
+    }
+    /// Whether any node heights are currently pinned by animations.
+    pub fn has_pinned(&self) -> bool {
+        !self.pinned.is_empty()
     }
     /// Adds a newly created node to the layout. Only explicitly attached rows join the layout.
     pub fn created(&mut self, tree: &Tree, id: u16, parent: Option<u16>) {
@@ -243,12 +266,19 @@ impl Layout {
             self.nodes.resize(i + 1, None);
         }
         self.nodes[i] = Some(t);
+        let is_detached = self.detached(tree, id);
+        if is_detached {
+            self.fixed_set.insert(id);
+        } else {
+            self.fixed_set.remove(&id);
+        }
         match parent {
-            Some(_) if self.detached(tree, id) => {}
+            Some(_) if is_detached => {}
             Some(p) => self.taffy.add_child(p, t).expect("taffy: child"),
             None if is_root => self.root = Some(id),
             None => {}
         }
+        self.dirty = true;
     }
     /// Lays out a whole tree, for when its structure changed (for example, after an app reload).
     #[cfg(feature = "examples")]
@@ -265,17 +295,22 @@ impl Layout {
     }
     /// Removes nodes that left the tree. Pass the whole removed subtree.
     pub fn removed(&mut self, ids: &[u16]) {
+        if ids.is_empty() {
+            return;
+        }
         for &id in ids {
             if let Some(node) = self.nodes.get_mut(id as usize).and_then(Option::take) {
                 let _ = self.taffy.remove(node);
             }
             self.pinned.remove(&id);
             self.row_sizes.remove(&id);
+            self.fixed_set.remove(&id);
             if self.root == Some(id) {
                 self.root = None;
                 self.viewport = None;
             }
         }
+        self.dirty = true;
     }
     /// The children of `parent` changed order: Taffy takes the tree's order. Lists keep their rows out of Taffy.
     pub fn reordered(&mut self, tree: &Tree, parent: u16) {
@@ -294,6 +329,7 @@ impl Layout {
         self.taffy
             .set_children(t, &children)
             .expect("taffy: children");
+        self.dirty = true;
     }
     /// The node's style changed. A scroll node's children change with it: their flex-shrink depends on it.
     pub fn restyled(&mut self, tree: &Tree, id: u16) {
@@ -320,13 +356,20 @@ impl Layout {
                     height: length(height),
                 };
             }
+            if self.detached(tree, id) {
+                self.fixed_set.insert(id);
+            } else {
+                self.fixed_set.remove(&id);
+            }
             self.taffy.set_style(t, style).expect("taffy: style");
             self.pinned.remove(&id);
+            self.dirty = true;
         }
     }
     pub(crate) fn text_changed(&mut self, id: u16) {
         if let Some(node) = self.get(id) {
             self.taffy.mark_dirty(node).expect("taffy: text node");
+            self.dirty = true;
         }
     }
     /// Pins the heights of animating nodes; nodes missing from `heights` go back to their own style.
@@ -349,6 +392,7 @@ impl Layout {
                 style.size.height = length(height);
                 self.taffy.set_style(t, style).expect("taffy: style");
                 self.pinned.insert(id, height);
+                self.dirty = true;
             }
         }
     }
@@ -358,17 +402,14 @@ impl Layout {
     }
     // The fixed nodes below `root`, at any depth: each one is a Taffy root. Lists keep their rows out of the layout.
     fn fixed_nodes(&self, tree: &Tree, root: u16) -> Vec<u16> {
-        let mut out = Vec::new();
-        let mut stack = vec![root];
-        while let Some(id) = stack.pop() {
-            if id != root && detached(tree, id) && self.get(id).is_some() {
-                out.push(id);
-            }
-            if !matches!(tree.nodes.get(&id), Some(Node::List { .. })) {
-                stack.extend(tree.children(id));
-            }
+        if self.fixed_set.is_empty() {
+            return Vec::new();
         }
-        out
+        self.fixed_set
+            .iter()
+            .copied()
+            .filter(|&id| id != root && self.get(id).is_some() && !self.in_row(tree, id))
+            .collect()
     }
     /// Computes the layout for the window size and returns the absolute rectangles that changed.
     /// Taffy caches per node: if nothing changed, the previous result is reused.
@@ -392,6 +433,7 @@ impl Layout {
     ) -> Vec<(u16, [f32; 4])> {
         self.visible_rows.clear();
         let Some(root) = self.root else {
+            self.dirty = false;
             return Vec::new();
         };
         let root_node = self.get(root).expect("root in the layout");
@@ -447,9 +489,8 @@ impl Layout {
                                 };
                                 // The style the field is drawn with: its height is its lines' height.
                                 let style = TextStyle::of(font, [255; 4]);
-                                let runs = node_spans(value, None);
-                                let [_, height] = text.measure_styled(
-                                    &runs,
+                                let [_, height] = text.measure_plain(
+                                    value,
                                     width.map(|w| w + WRAP_SLACK),
                                     &style,
                                 );
@@ -474,6 +515,12 @@ impl Layout {
                                 AvailableSpace::MaxContent => None,
                             });
                             let style = TextStyle::resolve(font);
+                            // Fast path: plain text without line clamping skips Vec<Span>/String allocation.
+                            if spans.as_deref().is_none_or(<[_]>::is_empty) && lines.is_none() {
+                                let [width, height] =
+                                    text.measure_plain(value, width.map(|w| w + WRAP_SLACK), &style);
+                                return Size { width, height };
+                            }
                             // Measures the text the node draws: cut to its line limit at this width.
                             let runs = node_spans(value, spans.as_deref());
                             let cut;
@@ -496,15 +543,17 @@ impl Layout {
         for (node, space) in roots {
             compute(&mut self.taffy, node, space);
         }
-        // Taffy gives each position relative to the parent: accumulate from each root.
-        let mut rects: HashMap<u16, [f32; 4]> = HashMap::new();
+        // Taffy gives each position relative to the parent: accumulate from each root into direct-indexed scratch.
+        let mut rects = std::mem::take(&mut self.rects_scratch);
+        let mut touched = std::mem::take(&mut self.touched_ids);
+        touched.clear();
         let mut follows = Vec::new();
         // Scroll nodes, with their bottom padding: their content height is read below.
         let mut scrolls = Vec::new();
-        let mut stack: Vec<(u16, f32, f32)> = std::iter::once(root)
-            .chain(fixed)
-            .map(|id| (id, 0., 0.))
-            .collect();
+        let mut stack = std::mem::take(&mut self.walk_stack);
+        stack.clear();
+        stack.push((root, 0., 0.));
+        stack.extend(fixed.into_iter().map(|id| (id, 0., 0.)));
         while let Some((id, px, py)) = stack.pop() {
             let l = self
                 .taffy
@@ -520,7 +569,13 @@ impl Layout {
                     l.size.height,
                 ]
             };
-            rects.insert(id, rect);
+            let idx = id as usize;
+            if rects.len() <= idx {
+                rects.resize(idx + 1, None);
+            }
+            if rects[idx].replace(rect).is_none() {
+                touched.push(id);
+            }
             if let Some(target) = tree
                 .nodes
                 .get(&id)
@@ -571,28 +626,42 @@ impl Layout {
         }
         // A following node takes its target's rectangle.
         for (id, target) in follows {
-            if let Some(&rect) = rects.get(&target) {
-                rects.insert(id, rect);
+            if let Some(rect) = rects.get(target as usize).and_then(|r| *r) {
+                let idx = id as usize;
+                if rects.len() <= idx {
+                    rects.resize(idx + 1, None);
+                }
+                if rects[idx].replace(rect).is_none() {
+                    touched.push(id);
+                }
             }
         }
         // Content height: from the top of the scroll node to its lowest child, plus the bottom padding.
         self.content.clear();
         for (id, padding) in scrolls {
-            let top = rects[&id][1];
+            let top = rects[id as usize].expect("scroll node rect")[1];
             let bottom = tree
                 .children(id)
                 .iter()
                 .filter(|c| !self.detached(tree, **c))
-                .filter_map(|c| rects.get(c))
+                .filter_map(|&c| rects.get(c as usize).and_then(|r| *r))
                 .map(|r| r[1] + r[3])
                 .fold(top, f32::max);
             self.content.insert(id, bottom - top + padding);
         }
-        let mut changed: Vec<(u16, [f32; 4])> = rects
-            .into_iter()
-            .filter(|(id, rect)| tree.rect(*id) != *rect)
-            .collect();
+        let mut changed = Vec::new();
+        for id in touched.drain(..) {
+            if let Some(rect) = rects[id as usize].take()
+                && tree.rect(id) != rect
+            {
+                changed.push((id, rect));
+            }
+        }
         changed.sort_unstable_by_key(|(id, _)| *id);
+        self.rects_scratch = rects;
+        self.touched_ids = touched;
+        self.walk_stack = stack;
+        self.dirty = false;
         changed
     }
 }

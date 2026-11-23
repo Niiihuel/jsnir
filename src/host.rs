@@ -624,6 +624,14 @@ pub struct Host {
     wait_budget: Duration,
     sent_at: Option<Instant>,
     layout: Layout,
+    // Nodes with a height transition, height variant, or height keyframe animation, tracked incrementally.
+    sized_nodes: HashSet<u16>,
+    // Cached per-node layout subtree bounds and conservative "cannot cull" flags, rebuilt only on tree/layout changes.
+    cull_cache_dirty: bool,
+    cull_bounds: Vec<[f32; 4]>,
+    cull_special: Vec<bool>,
+    // Previous frame's `Frame.items.len()`, used to pre-size `items` in one allocation.
+    last_items_len: usize,
     text: TextEngine,
     motion: Motion,
     clock: Instant,
@@ -801,6 +809,11 @@ impl Host {
             wait_budget,
             sent_at: None,
             layout: Layout::default(),
+            sized_nodes: HashSet::new(),
+            cull_cache_dirty: true,
+            cull_bounds: Vec::new(),
+            cull_special: Vec::new(),
+            last_items_len: 0,
             text,
             motion: Motion::default(),
             clock: Instant::now(),
@@ -1523,7 +1536,14 @@ impl Host {
         self.editor.fonts_changed();
         self.editor_key = None;
         for (id, node) in self.tree.nodes.iter() {
-            if matches!(node, Node::Text { .. }) {
+            if matches!(
+                node,
+                Node::Text { .. }
+                    | Node::Input {
+                        multiline: true,
+                        ..
+                    }
+            ) {
                 self.layout.text_changed(id);
             }
         }
@@ -1753,6 +1773,7 @@ impl Host {
         let mut affected_lists = HashSet::new();
         let mut created = Vec::new();
         let mut restyled = Vec::new();
+        let mut repainted = Vec::new();
         let mut texts = Vec::new();
         let mut list_metadata = Vec::new();
         let mut requests = Vec::new();
@@ -1794,6 +1815,23 @@ impl Host {
                     restyled.push(*id);
                 }
                 Op::SetStyle { id, .. } => restyled.push(*id),
+                Op::SetPaint { id, paint } => {
+                    // If a previously static already-drawn node gains transitions or starting values via SetPaint,
+                    // seed Motion with its current values before applying the batch so transitions start cleanly.
+                    if (!paint.transitions.is_empty() || paint.starting.is_some())
+                        && self.screen.get(*id as usize).is_some_and(Option::is_some)
+                        && let Some(old_node) = self.tree.nodes.get(id)
+                        && let Some(old_paint) = old_node.paint()
+                        && old_paint.transitions.is_empty()
+                        && old_paint.starting.is_none()
+                    {
+                        let disabled = matches!(old_node, Node::Box { disabled: true, .. });
+                        let old_v = self.variant(*id, old_paint, disabled);
+                        let rect = self.tree.rect(*id);
+                        seed_motion_from_paint(&mut self.motion, *id, old_paint, &old_v, rect);
+                    }
+                    repainted.push(*id);
+                }
                 Op::SetText { id, .. } | Op::SetSpans { id, .. } | Op::SetField { id, .. } => texts.push(*id),
                 Op::Focus { id } => focus_request = Some(*id),
                 Op::After { .. } | Op::VirtualList { .. } | Op::CallbackGuard { .. } => {
@@ -1870,6 +1908,7 @@ impl Host {
             self.scroll_requests.remove(id);
             self.anchors.remove(id);
             self.placements.remove(id);
+            self.sized_nodes.remove(id);
         }
         self.motion.forget(&removed);
         if self.focused.is_some_and(|f| removed.contains(&f)) {
@@ -1898,8 +1937,25 @@ impl Host {
             .filter(|(id, _)| seen.insert(*id) && self.tree.nodes.get(id).is_some())
             .collect();
         last.reverse();
+        let moved_any = !moved.is_empty();
+        let reordered_any = !reordered.is_empty();
+        let restyled_any = !restyled.is_empty();
+        let repainted_any = !repainted.is_empty();
+        let created_any = !last.is_empty();
         for (id, parent) in last {
             self.layout.created(&self.tree, id, parent);
+            if self.tree.nodes.get(&id).is_some_and(is_height_animated) {
+                self.sized_nodes.insert(id);
+            } else {
+                self.sized_nodes.remove(&id);
+            }
+        }
+        for id in repainted {
+            if self.tree.nodes.get(&id).is_some_and(is_height_animated) {
+                self.sized_nodes.insert(id);
+            } else {
+                self.sized_nodes.remove(&id);
+            }
         }
         let moved = moved.into_iter().filter_map(|id| self.tree.parent(id));
         for parent in reordered.into_iter().chain(moved) {
@@ -1907,6 +1963,15 @@ impl Host {
         }
         for id in restyled {
             self.layout.restyled(&self.tree, id);
+        }
+        if !removed.is_empty()
+            || created_any
+            || reordered_any
+            || moved_any
+            || restyled_any
+            || repainted_any
+        {
+            self.cull_cache_dirty = true;
         }
         for id in texts {
             self.layout.text_changed(id);
@@ -2148,127 +2213,6 @@ impl Host {
             let next = (base + delta_y / s.k).clamp(0., s.max);
             (next != base).then_some((s.id, WheelOffset::Legacy(next)))
         })
-    }
-
-    // The offset of a scroll node in this frame. A `scrollTo` that is waiting, or a glide, sets it. Otherwise an
-    // end-anchored node stays at the bottom while it is there; elsewhere, the child at the top of its view keeps its
-    // place when content above or below it changes, and a wheel scroll since the last frame moves the node.
-    fn frame_offset(&mut self, id: u16, max: f32, now: f64, end: bool) -> f32 {
-        let requested = match self.scroll_requests.remove(&id) {
-            Some(request) => {
-                self.request(id, request, max, now);
-                true
-            }
-            None => false,
-        };
-        let base = self.scroll_offset(id, max, now);
-        if !end {
-            return base;
-        }
-        // An offset moved by a glide, a wheel or a `scrollTo` since the last frame is kept as it is.
-        let kept = if requested {
-            base
-        } else {
-            match self.anchors.get(&id) {
-                None => max,
-                Some(anchor) if (base - anchor.offset).abs() > 0.5 => base,
-                Some(anchor) if anchor.bottom => max,
-                Some(anchor) => anchor
-                    .child
-                    .and_then(|child| self.child_top(id, child))
-                    .map_or(base, |top| top - anchor.gap),
-            }
-        }
-        .clamp(0., max);
-        if kept != base {
-            // The target of a finished glide stays set: it would move the offset back.
-            self.motion.release(id, Channel::Scroll);
-        }
-        let anchor = self.anchor_at(id, kept, max);
-        self.anchors.insert(id, anchor);
-        self.scroll.insert(id, kept);
-        kept
-    }
-
-    // Applies a `scrollTo` to the offset of a node drawn with `max`: at once, or as a glide from the offset on screen.
-    fn request(&mut self, id: u16, request: ScrollRequest, max: f32, now: f64) {
-        let current = self.scroll.get(&id).copied().unwrap_or(0.);
-        let target = request
-            .offset
-            .unwrap_or(match request.to {
-                Some(ScrollEdge::End) => max,
-                _ => 0.,
-            })
-            .clamp(0., max);
-        if request.smooth {
-            let transition = ease_out(Property::Y);
-            self.motion.start(
-                id,
-                Channel::Scroll,
-                Value::Number(current),
-                Value::Number(target),
-                &transition,
-                now,
-            );
-        } else {
-            self.motion.release(id, Channel::Scroll);
-            self.scroll.insert(id, target);
-        }
-    }
-
-    // The anchor of an end-anchored node at `offset`: the first node in view among its children, going down into the
-    // boxes that straddle the top of the view, so rows inside a list box keep their place too.
-    fn anchor_at(&self, id: u16, offset: f32, max: f32) -> EndAnchor {
-        let mut child = None;
-        let mut parent = id;
-        while let Some(next) = self.tree.children(parent).iter().copied().find(|&c| {
-            self.child_top(id, c)
-                .is_some_and(|top| top + self.tree.rect(c)[3] > offset)
-        }) {
-            child = Some(next);
-            let straddles = self.child_top(id, next).is_some_and(|top| top < offset);
-            if straddles && matches!(self.tree.nodes.get(&next), Some(Node::Box { .. })) {
-                parent = next;
-            } else {
-                break;
-            }
-        }
-        let gap = child
-            .and_then(|child| self.child_top(id, child))
-            .map_or(0., |top| top - offset);
-        EndAnchor {
-            child,
-            gap,
-            offset,
-            bottom: offset >= max - 0.5,
-        }
-    }
-
-    // Top of a node inside a scroll node, in its content, in logical pixels; None if it is no longer inside it.
-    fn child_top(&self, id: u16, node: u16) -> Option<f32> {
-        self.within(node, id)
-            .then(|| self.tree.rect(node)[1] - self.tree.rect(id)[1])
-    }
-
-    // The offset of a scroll node in this frame: where its glide is, or the stored one, clamped to `max`.
-    fn scroll_offset(&mut self, id: u16, max: f32, now: f64) -> f32 {
-        let offset = match self.motion.target(id, Channel::Scroll) {
-            Some(target) => {
-                let target = Value::Number(target.number().clamp(0., max));
-                self.motion
-                    .show(
-                        id,
-                        Channel::Scroll,
-                        target,
-                        Some(&ease_out(Property::Y)),
-                        now,
-                    )
-                    .number()
-            }
-            None => self.scroll.get(&id).copied().unwrap_or(0.).clamp(0., max),
-        };
-        self.scroll.insert(id, offset);
-        offset
     }
 
     // A press on a scrollbar: on the thumb it starts a drag, on the track above or below it pages by a viewport.
@@ -3093,6 +3037,87 @@ impl Host {
         any
     }
 
+    fn rebuild_cull_cache(&mut self) {
+        let end = self.tree.nodes.end();
+        self.cull_bounds.clear();
+        self.cull_bounds.resize(end, [0.; 4]);
+        // Default `true` so any node not visited from `root` (e.g. detached virtual list rows) is never culled.
+        self.cull_special.clear();
+        self.cull_special.resize(end, true);
+        let Some(root) = self.tree.root else {
+            self.cull_cache_dirty = false;
+            return;
+        };
+        let mut order = Vec::with_capacity(end);
+        let mut stack = vec![root];
+        let mut anchor_targets = Vec::new();
+        while let Some(id) = stack.pop() {
+            let Some(node) = self.tree.nodes.get(&id) else {
+                continue;
+            };
+            order.push(id);
+            if let Some(anchor) = node.style().and_then(|s| s.anchor.as_ref()) {
+                anchor_targets.push(anchor.node);
+            }
+            if !matches!(node, Node::List { .. }) {
+                stack.extend(self.tree.children(id).iter().copied());
+            }
+        }
+        for &id in order.iter().rev() {
+            let Some(node) = self.tree.nodes.get(&id) else {
+                continue;
+            };
+            let rect = self.tree.rect(id);
+            let mut min_x = rect[0];
+            let mut min_y = rect[1];
+            let mut max_x = rect[0] + rect[2];
+            let mut max_y = rect[1] + rect[3];
+            let mut special = node_is_cull_special(node, self.motion.has_active(id));
+            let clips = node.style().is_some_and(|s| s.clip);
+            if !matches!(node, Node::List { .. }) {
+                for &c in self.tree.children(id) {
+                    let ci = c as usize;
+                    if ci >= end {
+                        continue;
+                    }
+                    special |= self.cull_special[ci];
+                    let child_fixed = self
+                        .tree
+                        .nodes
+                        .get(&c)
+                        .and_then(Node::style)
+                        .is_some_and(|s| s.position == Position::Fixed);
+                    if !clips && !child_fixed {
+                        let b = self.cull_bounds[ci];
+                        if b[2] > 0. || b[3] > 0. {
+                            min_x = min_x.min(b[0]);
+                            min_y = min_y.min(b[1]);
+                            max_x = max_x.max(b[0] + b[2]);
+                            max_y = max_y.max(b[1] + b[3]);
+                        }
+                    }
+                }
+            }
+            self.cull_bounds[id as usize] =
+                [min_x, min_y, (max_x - min_x).max(0.), (max_y - min_y).max(0.)];
+            self.cull_special[id as usize] = special;
+        }
+        // Any node targeted by a Fixed overlay's anchor (and its ancestor chain) must always populate `screen`.
+        for mut target in anchor_targets {
+            while (target as usize) < end {
+                if self.cull_special[target as usize] {
+                    break;
+                }
+                self.cull_special[target as usize] = true;
+                match self.tree.parent(target) {
+                    Some(p) => target = p,
+                    None => break,
+                }
+            }
+        }
+        self.cull_cache_dirty = false;
+    }
+
     fn render(
         &mut self,
         width: f32,
@@ -3106,7 +3131,10 @@ impl Host {
             self.focused = None;
             self.editor_dragging = false;
         }
-        let mut items = Vec::new();
+        if self.cull_cache_dirty {
+            self.rebuild_cull_cache();
+        }
+        let mut items = Vec::with_capacity(self.last_items_len);
         let mut hits = std::mem::take(&mut self.hits);
         hits.clear();
         let mut cursors = std::mem::take(&mut self.cursor_rects);
@@ -3134,8 +3162,36 @@ impl Host {
                 clip: window,
                 round_clip: None,
                 in_row: false,
+                group_hover: false,
+                group_active: false,
             };
             let mut walker = Walker {
+                tree: &self.tree,
+                layout: &self.layout,
+                virtual_lists: &self.virtual_lists,
+                bound_rows: &self.bound_rows,
+                images: &self.images,
+                cull_bounds: &self.cull_bounds,
+                cull_special: &self.cull_special,
+                hovered: self.hovered,
+                pressed: self.pressed,
+                focused: self.focused,
+                hovered_groups: &self.hovered_groups,
+                pressed_groups: &self.pressed_groups,
+                node_drag: self.node_drag,
+                pointer: self.pointer,
+                drag: self.drag,
+                reduced_motion: self.reduced_motion,
+                keyframes_at: self.keyframes_at,
+                hide_caret: self.hide_caret,
+                screen: &mut self.screen,
+                motion: &mut self.motion,
+                text: &mut self.text,
+                editor: &mut self.editor,
+                editor_key: &mut self.editor_key,
+                scroll: &mut self.scroll,
+                scroll_requests: &mut self.scroll_requests,
+                anchors: &mut self.anchors,
                 items: &mut items,
                 hits: &mut hits,
                 cursors: &mut cursors,
@@ -3153,8 +3209,8 @@ impl Host {
                 queued: 0,
                 looping: false,
             };
-            walker.node(self, root, base, scale, max_side);
-            walker.draw_deferred(self, scale, max_side);
+            walker.node(root, base, scale, max_side);
+            walker.draw_deferred(scale, max_side);
             looping = walker.looping;
         }
         self.hits = hits;
@@ -3167,6 +3223,7 @@ impl Host {
         if self.dev_error.is_some() {
             self.render_dev_error(&mut items, [0., 0., width, height]);
         }
+        self.last_items_len = items.len();
         (
             Frame {
                 items,
@@ -3244,7 +3301,7 @@ impl Host {
 
         let mut measure = |text: &str, max_w: f32, style: &TextStyle| -> f32 {
             self.text
-                .measure_styled(&node_spans(text, None), Some(max_w), style)[1]
+                .measure_plain(text, Some(max_w), style)[1]
                 .max(style.line_height)
         };
 
@@ -3478,23 +3535,42 @@ impl Host {
     // Recomputes what the pointer is over, from the last frame: the hovered node, the group nodes and the boxes with
     // a hover callback. Calls the hover callbacks of the boxes it entered or left. Returns whether any of it changed.
     fn refresh_hover(&mut self) -> bool {
+        if self.pointer.is_none()
+            && self.hovered.is_none()
+            && self.hovered_groups.is_empty()
+            && self.hovered_boxes.is_empty()
+        {
+            return false;
+        }
         let top = self.pointer.and_then(|p| self.top_hit(p));
         let hovered = self
             .pointer
             .and_then(|p| self.primary_target(p))
             .filter(|id| self.interactive(*id));
-        let groups: Vec<u16> = self
-            .group_rects
-            .iter()
-            .filter(|(id, rect, layer)| self.pointed(top, *rect, *layer, *id))
-            .map(|(id, _, _)| *id)
-            .collect();
-        let boxes: Vec<u16> = self
-            .hover_rects
-            .iter()
-            .filter(|(id, rect, layer)| self.pointed(top, *rect, *layer, *id))
-            .map(|(id, _, _)| *id)
-            .collect();
+        let groups: Vec<u16> = if self.pointer.is_none() || self.group_rects.is_empty() {
+            Vec::new()
+        } else {
+            self.group_rects
+                .iter()
+                .filter(|(id, rect, layer)| self.pointed(top, *rect, *layer, *id))
+                .map(|(id, _, _)| *id)
+                .collect()
+        };
+        if self.hover_rects.is_empty() && self.hovered_boxes.is_empty() {
+            let changed = hovered != self.hovered || groups != self.hovered_groups;
+            self.hovered = hovered;
+            self.hovered_groups = groups;
+            return changed;
+        }
+        let boxes: Vec<u16> = if self.pointer.is_none() {
+            Vec::new()
+        } else {
+            self.hover_rects
+                .iter()
+                .filter(|(id, rect, layer)| self.pointed(top, *rect, *layer, *id))
+                .map(|(id, _, _)| *id)
+                .collect()
+        };
         let entered: Vec<u16> = boxes
             .iter()
             .filter(|id| !self.hovered_boxes.contains(id))
@@ -3575,33 +3651,11 @@ impl Host {
 
     // The variant a node shows now: hover, then active, then focus, each overriding the one before.
     fn variant(&self, id: u16, paint: &Paint, disabled: bool) -> Variant {
-        let (hover, active) = self.interaction(id);
-        let applied = [
-            (!disabled && hover, &paint.hover),
-            (!disabled && active, &paint.active),
-            (self.focused == Some(id), &paint.focus),
-        ];
-        let mut out = Variant::default();
-        for (on, variant) in applied {
-            if on && let Some(v) = variant {
-                out = Variant {
-                    background: v.background.or(out.background),
-                    gradient: v.gradient.or(out.gradient),
-                    brightness: v.brightness.or(out.brightness),
-                    scale: v.scale.or(out.scale),
-                    opacity: v.opacity.or(out.opacity),
-                    x: v.x.or(out.x),
-                    y: v.y.or(out.y),
-                    color: v.color.or(out.color),
-                    edge: v.edge.or(out.edge),
-                    height: v.height.or(out.height),
-                    width: v.width.or(out.width),
-                    underline: v.underline.or(out.underline),
-                    cursor: v.cursor.or(out.cursor),
-                };
-            }
+        if paint.hover.is_none() && paint.active.is_none() && paint.focus.is_none() {
+            return Variant::default();
         }
-        out
+        let (hover, active) = self.interaction(id);
+        resolve_variant(paint, disabled, hover, active, self.focused == Some(id))
     }
 
     // The height a variant gives a node now, if any.
@@ -3615,25 +3669,23 @@ impl Host {
     // Taffy layout with animated heights: a node with a `height` transition animates from its height on
     // screen to its new natural height, and pinning that height each frame moves what follows it.
     fn lay_out(&mut self, width: f32, height: f32, now: f64) {
+        if self.sized_nodes.is_empty() && self.virtual_lists.is_empty() {
+            if !self.layout.is_dirty(width, height) {
+                return;
+            }
+            if self.layout.has_pinned() {
+                self.layout.pin_heights(&self.tree, &HashMap::new());
+            }
+        }
         // Nodes with a height transition, a height in a variant or a height keyframe: their heights are pinned while
         // they change.
         let sized: Vec<(u16, Option<Transition>)> = self
-            .tree
-            .nodes
+            .sized_nodes
             .iter()
-            .filter_map(|(id, node)| {
-                let paint = node.paint()?;
+            .filter_map(|&id| {
+                let paint = self.tree.nodes.get(&id)?.paint()?;
                 let transition = transition(paint, HEIGHT_TRANSITION).cloned();
-                let variant = [&paint.hover, &paint.active, &paint.focus]
-                    .into_iter()
-                    .flatten()
-                    .any(|v| v.height.is_some());
-                let keyed = paint
-                    .animations
-                    .iter()
-                    .flatten()
-                    .any(|a| a.property == Property::Height);
-                (transition.is_some() || variant || keyed).then_some((id, transition))
+                Some((id, transition))
             })
             .collect();
         let compute = |layout: &mut Layout,
@@ -3751,8 +3803,175 @@ impl Host {
                 .collect(),
         };
         self.tree.apply_ui_ref(&batch.ops).expect("layout batch");
+        self.cull_cache_dirty = true;
         let _ = self.bridge.log.send(Log::Ui(batch));
     }
+}
+
+fn resolve_variant(
+    paint: &Paint,
+    disabled: bool,
+    hover: bool,
+    active: bool,
+    focused: bool,
+) -> Variant {
+    let applied = [
+        (!disabled && hover, &paint.hover),
+        (!disabled && active, &paint.active),
+        (focused, &paint.focus),
+    ];
+    let mut out = Variant::default();
+    for (on, variant) in applied {
+        if on && let Some(v) = variant {
+            out = Variant {
+                background: v.background.or(out.background),
+                gradient: v.gradient.or(out.gradient),
+                brightness: v.brightness.or(out.brightness),
+                scale: v.scale.or(out.scale),
+                opacity: v.opacity.or(out.opacity),
+                x: v.x.or(out.x),
+                y: v.y.or(out.y),
+                color: v.color.or(out.color),
+                edge: v.edge.or(out.edge),
+                height: v.height.or(out.height),
+                width: v.width.or(out.width),
+                underline: v.underline.or(out.underline),
+                cursor: v.cursor.or(out.cursor),
+            };
+        }
+    }
+    out
+}
+
+fn seed_motion_from_paint(motion: &mut Motion, id: u16, paint: &Paint, v: &Variant, rect: Rect) {
+    let opacity = v.opacity.or(paint.opacity).unwrap_or(1.);
+    let (x, y) = (v.x.unwrap_or(paint.x), v.y.unwrap_or(paint.y));
+    let scale = v.scale.or(paint.scale).unwrap_or(1.);
+    let brightness = v.brightness.or(paint.brightness).unwrap_or(1.);
+    let draw = paint.draw.unwrap_or(1.);
+    let width = v.width.unwrap_or(rect[2]);
+    let background = v
+        .background
+        .or(paint.background)
+        .map_or(Value::Color([0.; 4]), Value::color);
+    let edge = v
+        .edge
+        .or(paint.edge)
+        .map_or(Value::Color([0.; 4]), Value::color);
+    let color = v
+        .color
+        .or(paint.color)
+        .map_or(Value::Color([0.; 4]), Value::color);
+    motion.seed(id, Property::Opacity, Value::Number(opacity));
+    motion.seed(id, Property::X, Value::Number(x));
+    motion.seed(id, Property::Y, Value::Number(y));
+    motion.seed(id, Property::Scale, Value::Number(scale));
+    motion.seed(id, Property::Brightness, Value::Number(brightness));
+    motion.seed(id, Property::Draw, Value::Number(draw));
+    motion.seed(id, Property::Left, Value::Number(rect[0]));
+    motion.seed(id, Property::Width, Value::Number(width));
+    motion.seed(id, Property::Background, background);
+    motion.seed(id, Property::Edge, edge);
+    motion.seed(id, Property::Color, color);
+}
+
+fn variant_affects_geometry(paint: &Paint) -> bool {
+    [&paint.hover, &paint.active, &paint.focus]
+        .into_iter()
+        .flatten()
+        .any(|v| {
+            v.x.is_some()
+                || v.y.is_some()
+                || v.scale.is_some()
+                || v.width.is_some()
+                || v.height.is_some()
+        })
+}
+
+fn node_is_cull_special(node: &Node, has_active_motion: bool) -> bool {
+    if has_active_motion || matches!(node, Node::Input { .. } | Node::List { .. }) {
+        return true;
+    }
+    if let Some(s) = node.style()
+        && (s.position == Position::Fixed
+            || s.layer.is_some()
+            || s.scroll
+            || s.follow.is_some())
+    {
+        return true;
+    }
+    if let Some(p) = node.paint()
+        && (p.x != 0.
+            || p.y != 0.
+            || p.scale.is_some_and(|s| s != 1.)
+            || !p.shadows.is_empty()
+            || !p.transitions.is_empty()
+            || p.animations.as_ref().is_some_and(|a| !a.is_empty())
+            || p.starting.is_some()
+            || variant_affects_geometry(p))
+    {
+        return true;
+    }
+    false
+}
+
+fn within_tree(tree: &Tree, mut node: u16, ancestor: u16) -> bool {
+    loop {
+        if node == ancestor {
+            return true;
+        }
+        match tree.parent(node) {
+            Some(parent) => node = parent,
+            None => return false,
+        }
+    }
+}
+
+fn input_content_of(tree: &Tree, id: u16) -> Rect {
+    let [x, y, w, h] = tree.rect(id);
+    let [top, right, bottom, left] = tree
+        .nodes
+        .get(&id)
+        .and_then(Node::style)
+        .map_or([0.; 4], |s| s.padding.sides());
+    [
+        x + left,
+        y + top,
+        (w - left - right).max(0.),
+        (h - top - bottom).max(0.),
+    ]
+}
+
+fn nearest_group_of(tree: &Tree, id: u16) -> Option<u16> {
+    let mut ancestor = tree.parent(id);
+    while let Some(a) = ancestor {
+        if tree
+            .nodes
+            .get(&a)
+            .and_then(Node::style)
+            .is_some_and(|s| s.group)
+        {
+            return Some(a);
+        }
+        ancestor = tree.parent(a);
+    }
+    None
+}
+
+fn is_height_animated(node: &Node) -> bool {
+    let Some(paint) = node.paint() else {
+        return false;
+    };
+    transition(paint, HEIGHT_TRANSITION).is_some()
+        || [&paint.hover, &paint.active, &paint.focus]
+            .into_iter()
+            .flatten()
+            .any(|v| v.height.is_some())
+        || paint
+            .animations
+            .iter()
+            .flatten()
+            .any(|a| a.property == Property::Height)
 }
 
 fn transition(paint: &Paint, property: Property) -> Option<&Transition> {
@@ -3870,7 +4089,8 @@ struct Placement {
     anchor_offset: f32,
 }
 
-// What a node inherits from its ancestors: a uniform scale `k` and offset, group opacity, brightness and clip.
+// What a node inherits from its ancestors: a uniform scale `k` and offset, group opacity, brightness, clip,
+// and the nearest ancestor `group`'s hover/active state (propagated in O(1) instead of walking parents).
 #[derive(Clone, Copy)]
 struct Context {
     k: f32,
@@ -3881,6 +4101,8 @@ struct Context {
     // Rounded rectangle and corner radius of the innermost rounded clip; None for none.
     round_clip: Option<(Rect, Corners)>,
     in_row: bool,
+    group_hover: bool,
+    group_active: bool,
 }
 impl Context {
     fn rect(&self, [x, y, w, h]: Rect) -> Rect {
@@ -3904,6 +4126,32 @@ impl Context {
 }
 
 struct Walker<'a> {
+    tree: &'a Tree,
+    layout: &'a Layout,
+    virtual_lists: &'a HashMap<u16, (u64, VirtualList)>,
+    bound_rows: &'a HashMap<u16, (u16, u64)>,
+    images: &'a HashMap<String, ImageData>,
+    cull_bounds: &'a [[f32; 4]],
+    cull_special: &'a [bool],
+    hovered: Option<u16>,
+    pressed: Option<u16>,
+    focused: Option<u16>,
+    hovered_groups: &'a [u16],
+    pressed_groups: &'a [u16],
+    node_drag: Option<NodeDrag>,
+    pointer: Option<[f32; 2]>,
+    drag: Option<(u16, f32)>,
+    reduced_motion: bool,
+    keyframes_at: Option<f32>,
+    hide_caret: bool,
+    screen: &'a mut Vec<Option<Rect>>,
+    motion: &'a mut Motion,
+    text: &'a mut TextEngine,
+    editor: &'a mut LineEditor,
+    editor_key: &'a mut Option<EditorBitmapKey>,
+    scroll: &'a mut HashMap<u16, f32>,
+    scroll_requests: &'a mut HashMap<u16, ScrollRequest>,
+    anchors: &'a mut HashMap<u16, EndAnchor>,
     items: &'a mut Vec<Item>,
     hits: &'a mut Vec<Hit>,
     cursors: &'a mut Vec<CursorHit>,
@@ -3953,16 +4201,183 @@ struct Shown {
     looping: bool,
 }
 
-impl Walker<'_> {
+impl<'a> Walker<'a> {
+    #[inline]
+    fn group_state(&self, id: u16) -> (bool, bool) {
+        if self.hovered_groups.is_empty() {
+            return (false, false);
+        }
+        let hovered = self.hovered_groups.contains(&id);
+        (hovered, hovered && self.pressed_groups.contains(&id))
+    }
+
+    #[inline]
+    fn variant(&self, id: u16, paint: &Paint, disabled: bool, ctx: &Context, is_group: bool) -> Variant {
+        if paint.hover.is_none() && paint.active.is_none() && paint.focus.is_none() {
+            return Variant::default();
+        }
+        let dragging = self.node_drag.is_some_and(|d| d.id == id);
+        let own_hover = self.hovered == Some(id) || dragging;
+        let own_active = (self.pressed == Some(id) && self.hovered == Some(id)) || dragging;
+        let (self_hover, self_active) = if is_group {
+            self.group_state(id)
+        } else {
+            (false, false)
+        };
+        let hover = own_hover || ctx.group_hover || self_hover;
+        let active = own_active || ctx.group_active || self_active;
+        resolve_variant(paint, disabled, hover, active, self.focused == Some(id))
+    }
+
+    fn row_can_receive(&self, mut child: u16) -> bool {
+        if self.virtual_lists.is_empty() {
+            return true;
+        }
+        while let Some(parent) = self.tree.parent(child) {
+            if let Some((_, list)) = self.virtual_lists.get(&parent) {
+                let height = self.tree.rect(parent)[3];
+                let (offset, extent) = list.frame_viewport(height);
+                if !self.bound_rows.get(&child).is_some_and(|&(_, key)| {
+                    list.rows.visible_row_at(key, offset, extent).is_some()
+                }) {
+                    return false;
+                }
+            }
+            child = parent;
+        }
+        true
+    }
+
+    fn screen_rect(&self, id: u16) -> Option<Rect> {
+        self.screen
+            .get(id as usize)
+            .copied()
+            .flatten()
+            .filter(|_| self.row_can_receive(id))
+    }
+
+    fn child_top(&self, id: u16, node: u16) -> Option<f32> {
+        within_tree(self.tree, node, id).then(|| self.tree.rect(node)[1] - self.tree.rect(id)[1])
+    }
+
+    fn anchor_at(&self, id: u16, offset: f32, max: f32) -> EndAnchor {
+        let mut child = None;
+        let mut parent = id;
+        while let Some(next) = self.tree.children(parent).iter().copied().find(|&c| {
+            self.child_top(id, c)
+                .is_some_and(|top| top + self.tree.rect(c)[3] > offset)
+        }) {
+            child = Some(next);
+            let straddles = self.child_top(id, next).is_some_and(|top| top < offset);
+            if straddles && matches!(self.tree.nodes.get(&next), Some(Node::Box { .. })) {
+                parent = next;
+            } else {
+                break;
+            }
+        }
+        let gap = child
+            .and_then(|child| self.child_top(id, child))
+            .map_or(0., |top| top - offset);
+        EndAnchor {
+            child,
+            gap,
+            offset,
+            bottom: offset >= max - 0.5,
+        }
+    }
+
+    fn request(&mut self, id: u16, request: ScrollRequest, max: f32, now: f64) {
+        let current = self.scroll.get(&id).copied().unwrap_or(0.);
+        let target = request
+            .offset
+            .unwrap_or(match request.to {
+                Some(ScrollEdge::End) => max,
+                _ => 0.,
+            })
+            .clamp(0., max);
+        if request.smooth {
+            let transition = ease_out(Property::Y);
+            self.motion.start(
+                id,
+                Channel::Scroll,
+                Value::Number(current),
+                Value::Number(target),
+                &transition,
+                now,
+            );
+        } else {
+            self.motion.release(id, Channel::Scroll);
+            self.scroll.insert(id, target);
+        }
+    }
+
+    fn scroll_offset(&mut self, id: u16, max: f32, now: f64) -> f32 {
+        let offset = match self.motion.target(id, Channel::Scroll) {
+            Some(target) => {
+                let target = Value::Number(target.number().clamp(0., max));
+                self.motion
+                    .show(
+                        id,
+                        Channel::Scroll,
+                        target,
+                        Some(&ease_out(Property::Y)),
+                        now,
+                    )
+                    .number()
+            }
+            None => self.scroll.get(&id).copied().unwrap_or(0.).clamp(0., max),
+        };
+        self.scroll.insert(id, offset);
+        offset
+    }
+
+    fn frame_offset(&mut self, id: u16, max: f32, now: f64, end: bool) -> f32 {
+        let requested = match self.scroll_requests.remove(&id) {
+            Some(request) => {
+                self.request(id, request, max, now);
+                true
+            }
+            None => false,
+        };
+        let base = self.scroll_offset(id, max, now);
+        if !end {
+            return base;
+        }
+        // An offset moved by a glide, a wheel or a `scrollTo` since the last frame is kept as it is.
+        let kept = if requested {
+            base
+        } else {
+            match self.anchors.get(&id) {
+                None => max,
+                Some(anchor) if (base - anchor.offset).abs() > 0.5 => base,
+                Some(anchor) if anchor.bottom => max,
+                Some(anchor) => anchor
+                    .child
+                    .and_then(|child| self.child_top(id, child))
+                    .map_or(base, |top| top - anchor.gap),
+            }
+        }
+        .clamp(0., max);
+        if kept != base {
+            // The target of a finished glide stays set: it would move the offset back.
+            self.motion.release(id, Channel::Scroll);
+        }
+        let anchor = self.anchor_at(id, kept, max);
+        self.anchors.insert(id, anchor);
+        self.scroll.insert(id, kept);
+        kept
+    }
+
     fn shown(
         &mut self,
-        host: &mut Host,
         id: u16,
         paint: &Paint,
         rect: Rect,
         disabled: bool,
+        ctx: &Context,
+        is_group: bool,
     ) -> Shown {
-        let v = host.variant(id, paint, disabled);
+        let v = self.variant(id, paint, disabled, ctx, is_group);
         let background = v.background.or(paint.background);
         let brightness = v.brightness.or(paint.brightness).unwrap_or(1.);
         let scale = v.scale.or(paint.scale).unwrap_or(1.);
@@ -3970,19 +4385,48 @@ impl Walker<'_> {
         let opacity = v.opacity.or(paint.opacity).unwrap_or(1.);
         let (x, y) = (v.x.unwrap_or(paint.x), v.y.unwrap_or(paint.y));
         let text_color = v.color.or(paint.color);
+        let draw_base = paint.draw.unwrap_or(1.);
+        let width_base = v.width.unwrap_or(rect[2]);
+
+        let has_transitions = !paint.transitions.is_empty();
+        let has_animations = paint.animations.as_ref().is_some_and(|a| !a.is_empty());
+        let has_starting = paint.starting.is_some();
+        let has_active = self.motion.has_active(id);
+
+        // Fast path: static node with no transitions, animations, starting state, or active motion.
+        // Skips all 11 Motion HashMap operations completely.
+        if !has_transitions && !has_animations && !has_starting && !has_active {
+            return Shown {
+                opacity,
+                x,
+                y,
+                scale,
+                brightness,
+                background: background.map(|c| Value::color(c).rgba()),
+                gradient: v.gradient.or(paint.gradient),
+                edge: edge.map(|c| Value::color(c).rgba()),
+                color: text_color.map(|c| Value::color(c).rgba()),
+                draw: draw_base,
+                left: rect[0],
+                width: width_base,
+                underline: v.underline.unwrap_or(false),
+                looping: false,
+            };
+        }
+
         let now = self.now;
-        let reduced = host.reduced_motion;
-        let motion = &mut host.motion;
+        let reduced = self.reduced_motion;
+        let motion = &mut *self.motion;
         // First time on screen: properties with a starting value animate from it.
-        if motion.target(id, Property::Opacity).is_none()
-            && let Some(starting) = &paint.starting
+        if let Some(starting) = &paint.starting
+            && motion.target(id, Property::Opacity).is_none()
         {
             let from = [
                 (Property::Opacity, starting.opacity, opacity),
                 (Property::X, starting.x, x),
                 (Property::Y, starting.y, y),
                 (Property::Scale, starting.scale, scale),
-                (Property::Draw, starting.draw, paint.draw.unwrap_or(1.)),
+                (Property::Draw, starting.draw, draw_base),
             ];
             for (property, start, target) in from {
                 if let (Some(start), Some(t)) = (start, transition(paint, property)) {
@@ -3998,14 +4442,17 @@ impl Walker<'_> {
             }
         }
         // Keyframe values override the base values while their animations run.
-        let frozen = host.keyframes_at;
-        let keyed = motion.keyframes(
-            id,
-            paint.animations.as_deref().unwrap_or(&[]),
-            reduced,
-            frozen,
-            now,
-        );
+        let keyed = if has_animations || has_active {
+            motion.keyframes(
+                id,
+                paint.animations.as_deref().unwrap_or(&[]),
+                reduced,
+                self.keyframes_at,
+                now,
+            )
+        } else {
+            Default::default()
+        };
         let overridden = |property: Property| {
             keyed
                 .values
@@ -4014,15 +4461,17 @@ impl Walker<'_> {
                 .map(|(_, v)| *v)
         };
         let mut number = |property, value: f32| {
-            let shown = motion
-                .show(
-                    id,
-                    property,
-                    Value::Number(value),
-                    transition(paint, property),
-                    now,
-                )
-                .number();
+            let tr = transition(paint, property);
+            let shown = if tr.is_some()
+                || has_active
+                || (has_starting && property == Property::Opacity)
+            {
+                motion
+                    .show(id, property, Value::Number(value), tr, now)
+                    .number()
+            } else {
+                value
+            };
             overridden(property).map_or(shown, Value::number)
         };
         let opacity = number(Property::Opacity, opacity);
@@ -4030,15 +4479,20 @@ impl Walker<'_> {
         let y = number(Property::Y, y);
         let scale = number(Property::Scale, scale);
         let brightness = number(Property::Brightness, brightness);
-        let draw = number(Property::Draw, paint.draw.unwrap_or(1.));
+        let draw = number(Property::Draw, draw_base);
         let left = number(Property::Left, rect[0]);
-        let width = number(Property::Width, v.width.unwrap_or(rect[2]));
+        let width = number(Property::Width, width_base);
         // A color animates from transparent when it appears.
         let mut color = |property, value: Option<u32>| {
+            let tr = transition(paint, property);
+            if tr.is_none() && !has_active {
+                return match overridden(property) {
+                    Some(v) => Some(v.rgba()),
+                    None => value.map(|c| Value::color(c).rgba()),
+                };
+            }
             let target = value.map_or(Value::Color([0.; 4]), Value::color);
-            let shown = motion
-                .show(id, property, target, transition(paint, property), now)
-                .rgba();
+            let shown = motion.show(id, property, target, tr, now).rgba();
             match overridden(property) {
                 Some(v) => Some(v.rgba()),
                 None => (value.is_some() || shown[3] > 0.).then_some(shown),
@@ -4069,8 +4523,18 @@ impl Walker<'_> {
     }
 
     // Draws a node in its place, or queues it when it starts a layer of its own: a fixed node, or one on another layer.
-    fn node(&mut self, host: &mut Host, id: u16, ctx: Context, scale: f32, max_side: usize) {
-        let style = host.tree.nodes.get(&id).and_then(Node::style);
+    fn node(&mut self, id: u16, ctx: Context, scale: f32, max_side: usize) {
+        // Sound O(1) subtree clip cull: when neither `id` nor any descendant has layers, fixed overlays,
+        // transforms, shadows, inputs, scroll containers, anchors, or animations, `cull_bounds[id]` strictly
+        // bounds the entire subtree in `ctx` coordinates.
+        if !ctx.in_row && !self.cull_special.get(id as usize).copied().unwrap_or(true) {
+            let screen_bounds = ctx.rect(self.cull_bounds[id as usize]);
+            let on = intersect(screen_bounds, ctx.clip);
+            if on[2] <= 0. || on[3] <= 0. {
+                return;
+            }
+        }
+        let style = self.tree.nodes.get(&id).and_then(Node::style);
         let fixed = style.is_some_and(|s| s.position == Position::Fixed);
         let layer = style.and_then(|s| s.layer.or(fixed.then_some(1)));
         let fixed = fixed && !ctx.in_row;
@@ -4087,26 +4551,26 @@ impl Walker<'_> {
             self.queued += 1;
             return;
         }
-        self.draw(host, id, ctx, scale, max_side);
+        self.draw(id, ctx, scale, max_side);
     }
 
     // Draws the queued layers, lowest first and in document order within a layer. A layer's own layered children are
     // queued in turn, so they are drawn after the lower layers and before the higher ones.
-    fn draw_deferred(&mut self, host: &mut Host, scale: f32, max_side: usize) {
+    fn draw_deferred(&mut self, scale: f32, max_side: usize) {
         while let Some(next) = (0..self.deferred.len())
             .min_by_key(|&i| (self.deferred[i].layer, self.deferred[i].order))
         {
             let Deferred { id, layer, ctx, .. } = self.deferred.swap_remove(next);
             let ctx = match ctx {
                 Some(ctx) => ctx,
-                None => match self.fixed_context(host, id) {
+                None => match self.fixed_context(id) {
                     Some(ctx) => ctx,
                     None => continue,
                 },
             };
             self.layer = layer;
             self.layer_root = Some(id);
-            self.draw(host, id, ctx, scale, max_side);
+            self.draw(id, ctx, scale, max_side);
         }
         self.layer = 0;
         self.layer_root = None;
@@ -4114,12 +4578,12 @@ impl Walker<'_> {
 
     // The context a fixed node is drawn in: its origin is where it is placed this frame. None while its anchor is not
     // on screen, which hides it.
-    fn fixed_context(&mut self, host: &Host, id: u16) -> Option<Context> {
-        let style = host.tree.nodes.get(&id)?.style()?;
-        let [_, _, w, h] = host.tree.rect(id);
+    fn fixed_context(&mut self, id: u16) -> Option<Context> {
+        let style = self.tree.nodes.get(&id)?.style()?;
+        let [_, _, w, h] = self.tree.rect(id);
         let [x, y] = match &style.anchor {
             Some(anchor) => {
-                let rect = host.screen_rect(anchor.node)?;
+                let rect = self.screen_rect(anchor.node)?;
                 let (offset, side) = place(anchor, rect, [w, h], self.window);
                 if let Some(subscription) = &anchor.placement
                     && subscription.callback != 0
@@ -4144,6 +4608,8 @@ impl Walker<'_> {
             }
             None => [style.left.unwrap_or(0.), style.top.unwrap_or(0.)],
         };
+        let (group_hover, group_active) =
+            nearest_group_of(self.tree, id).map_or((false, false), |g| self.group_state(g));
         Some(Context {
             k: 1.,
             offset: [x, y],
@@ -4152,18 +4618,23 @@ impl Walker<'_> {
             clip: self.window,
             round_clip: None,
             in_row: false,
+            group_hover,
+            group_active,
         })
     }
 
-    fn draw(&mut self, host: &mut Host, id: u16, ctx: Context, scale: f32, max_side: usize) {
-        let Some(node) = host.tree.nodes.get(&id).cloned() else {
+    fn draw(&mut self, id: u16, ctx: Context, scale: f32, max_side: usize) {
+        let tree = self.tree;
+        let layout = self.layout;
+        let Some(node) = tree.nodes.get(&id) else {
             return;
         };
-        let layout_rect = host.tree.rect(id);
+        let layout_rect = tree.rect(id);
         let disabled = matches!(node, Node::Box { disabled: true, .. });
+        let is_group = node.style().is_some_and(|s| s.group);
         let default_paint = Paint::default();
         let paint = node.paint().unwrap_or(&default_paint);
-        let shown = self.shown(host, id, paint, layout_rect, disabled);
+        let shown = self.shown(id, paint, layout_rect, disabled, &ctx, is_group);
         // On-screen rectangle: layout transitions of `left` and `width`, then the node's own transform.
         let rect = [shown.left, layout_rect[1], shown.width, layout_rect[3]];
         let mut inner = ctx;
@@ -4180,17 +4651,20 @@ impl Walker<'_> {
         inner.k = ctx.k * s;
         inner.brightness = ctx.brightness * shown.brightness;
         let screen = inner.rect(rect);
-        host.screen[id as usize] = Some(screen);
-        let empty = (screen[2] <= 0. || screen[3] <= 0.) && host.tree.children(id).is_empty();
+        self.screen[id as usize] = Some(screen);
+        let has_children = !tree.children(id).is_empty();
+        let empty = (screen[2] <= 0. || screen[3] <= 0.) && !has_children;
         // A walked node has visible ancestors, so a loop that is on screen keeps the window drawing.
         let on_screen = intersect(screen, ctx.clip);
-        if shown.looping && on_screen[2] > 0. && on_screen[3] > 0. {
+        let visible = on_screen[2] > 0. && on_screen[3] > 0.;
+        if shown.looping && visible {
             self.looping = true;
         }
         if shown.opacity <= 0.001 || empty {
             return;
         }
-        let layer = shown.opacity < 0.999;
+        let layer = shown.opacity < 0.999
+            && (visible || has_children || !paint.shadows.is_empty());
         if layer {
             self.items.push(Item::PushLayer {
                 opacity: shown.opacity,
@@ -4199,9 +4673,9 @@ impl Walker<'_> {
         let clip = ctx.clip;
         let round_clip = ctx.round_clip;
         // The root of a layer covers what is below it, even where it reacts to nothing.
-        if self.layer_root == Some(id) {
+        if visible && self.layer_root == Some(id) {
             self.hits.push(Hit {
-                rect: intersect(screen, clip),
+                rect: on_screen,
                 id,
                 layer: self.layer,
             });
@@ -4212,132 +4686,164 @@ impl Walker<'_> {
         let mask = paint
             .mask
             .as_ref()
-            .map(|source| host.images.get(source).cloned());
+            .map(|source| self.images.get(source).cloned());
         let hidden = matches!(mask, Some(None));
         let mask = mask.flatten().map(|image| (image, screen));
         if !hidden {
-            for shadow in &paint.shadows {
-                let Shadow {
-                    y,
-                    blur,
-                    spread,
-                    color,
-                } = *shadow;
-                let shadow = ShadowSpec {
-                    y: y * inner.k,
-                    blur: blur * inner.k,
-                    spread: spread * inner.k,
-                    color: inner.color(Value::color(color).rgba()),
-                };
-                self.items.push(Item::Shadow {
-                    rect: screen,
-                    radius: shadow_radius,
-                    shadow,
-                    clip,
-                    round_clip,
-                });
-            }
-            if let Some([top, bottom]) = shown.gradient {
-                let [top, bottom] = [top, bottom].map(|c| inner.color(Value::color(c).rgba()));
-                self.items.push(Item::Fill {
-                    rect: screen,
-                    radius,
-                    top,
-                    bottom,
-                    clip,
-                    round_clip,
-                    mask: mask.clone(),
-                });
-            } else if let Some(background) = shown.background {
-                let color = inner.color(background);
-                self.items.push(Item::Fill {
-                    rect: screen,
-                    radius,
-                    top: color,
-                    bottom: color,
-                    clip,
-                    round_clip,
-                    mask: mask.clone(),
-                });
-            }
-            if let Some(edge) = shown.edge {
-                let color = inner.color(edge);
-                if let Some(sides) = paint.edge_sides {
-                    // Each side is a band inside the rectangle. The bands do not overlap, so a translucent edge
-                    // does not darken where two meet. Without a radius, a band is a plain rectangle. With one, each
-                    // piece is the rounded ring clipped to it: the straight strips, and each corner square (radius
-                    // by radius) drawn once, by the top or bottom side if it has a width, else by the left or right.
-                    // So a corner keeps its arc even when only one of its sides has an edge.
-                    let [top, right, bottom, left] = sides.map(|w| w * inner.k);
-                    let [x, y, w, h] = screen;
-                    let pieces: Vec<(f32, Rect)> = if radius.iter().any(|&r| r > 0.) {
-                        let [tl, tr, br, bl] = radius;
-                        let corner = |r: f32, across: f32, along: f32| {
-                            [r.max(across).min(w / 2.), r.max(along).min(h / 2.)]
-                        };
-                        let [tl_w, tl_h] = corner(tl, left, top);
-                        let [tr_w, tr_h] = corner(tr, right, top);
-                        let [br_w, br_h] = corner(br, right, bottom);
-                        let [bl_w, bl_h] = corner(bl, left, bottom);
-                        let owner = |vertical: f32, horizontal: f32| {
-                            if vertical > 0. { vertical } else { horizontal }
-                        };
-                        vec![
-                            (top, [x + tl_w, y, w - tl_w - tr_w, top]),
-                            (bottom, [x + bl_w, y + h - bottom, w - bl_w - br_w, bottom]),
-                            (left, [x, y + tl_h, left, h - tl_h - bl_h]),
-                            (right, [x + w - right, y + tr_h, right, h - tr_h - br_h]),
-                            (owner(top, left), [x, y, tl_w, tl_h]),
-                            (owner(top, right), [x + w - tr_w, y, tr_w, tr_h]),
-                            (
-                                owner(bottom, right),
-                                [x + w - br_w, y + h - br_h, br_w, br_h],
-                            ),
-                            (owner(bottom, left), [x, y + h - bl_h, bl_w, bl_h]),
-                        ]
-                    } else {
-                        let middle = (h - top - bottom).max(0.);
-                        vec![
-                            (top, [x, y, w, top]),
-                            (bottom, [x, y + h - bottom, w, bottom]),
-                            (left, [x, y + top, left, middle]),
-                            (right, [x + w - right, y + top, right, middle]),
-                        ]
-                    };
-                    for (width, strip) in pieces {
-                        if width <= 0. || strip[2] <= 0. || strip[3] <= 0. {
-                            continue;
-                        }
-                        if radius.iter().any(|&r| r > 0.) {
-                            self.items.push(Item::Inset {
-                                rect: screen,
-                                radius,
-                                spread: width,
-                                offset: [0., 0.],
-                                color,
-                                clip: intersect(strip, clip),
-                                round_clip,
-                                mask: mask.clone(),
-                            });
-                        } else {
-                            self.items.push(Item::Fill {
-                                rect: strip,
-                                radius: [0.; 4],
-                                top: color,
-                                bottom: color,
-                                clip,
-                                round_clip,
-                                mask: mask.clone(),
-                            });
-                        }
+            if !paint.shadows.is_empty() {
+                for shadow in &paint.shadows {
+                    let Shadow {
+                        y,
+                        blur,
+                        spread,
+                        color,
+                    } = *shadow;
+                    let sy = y * inner.k;
+                    let sblur = blur * inner.k;
+                    let sspread = spread * inner.k;
+                    let reach = sblur + sspread.max(0.);
+                    let shadow_box = [
+                        screen[0] - reach,
+                        screen[1] + sy - reach,
+                        screen[2] + 2. * reach,
+                        screen[3] + 2. * reach,
+                    ];
+                    let shadow_vis = intersect(shadow_box, clip);
+                    if shadow_vis[2] <= 0. || shadow_vis[3] <= 0. {
+                        continue;
                     }
-                } else {
-                    let spread = paint.edge_width.unwrap_or(1.) * inner.k;
+                    let shadow = ShadowSpec {
+                        y: sy,
+                        blur: sblur,
+                        spread: sspread,
+                        color: inner.color(Value::color(color).rgba()),
+                    };
+                    self.items.push(Item::Shadow {
+                        rect: screen,
+                        radius: shadow_radius,
+                        shadow,
+                        clip,
+                        round_clip,
+                    });
+                }
+            }
+            if visible {
+                if let Some([top, bottom]) = shown.gradient {
+                    let [top, bottom] =
+                        [top, bottom].map(|c| inner.color(Value::color(c).rgba()));
+                    self.items.push(Item::Fill {
+                        rect: screen,
+                        radius,
+                        top,
+                        bottom,
+                        clip,
+                        round_clip,
+                        mask: mask.clone(),
+                    });
+                } else if let Some(background) = shown.background {
+                    let color = inner.color(background);
+                    self.items.push(Item::Fill {
+                        rect: screen,
+                        radius,
+                        top: color,
+                        bottom: color,
+                        clip,
+                        round_clip,
+                        mask: mask.clone(),
+                    });
+                }
+                if let Some(edge) = shown.edge {
+                    let color = inner.color(edge);
+                    if let Some(sides) = paint.edge_sides {
+                        // Each side is a band inside the rectangle. The bands do not overlap, so a translucent edge
+                        // does not darken where two meet. Without a radius, a band is a plain rectangle. With one, each
+                        // piece is the rounded ring clipped to it: the straight strips, and each corner square (radius
+                        // by radius) drawn once, by the top or bottom side if it has a width, else by the left or right.
+                        // So a corner keeps its arc even when only one of its sides has an edge.
+                        let [top, right, bottom, left] = sides.map(|w| w * inner.k);
+                        let [x, y, w, h] = screen;
+                        let pieces: Vec<(f32, Rect)> = if radius.iter().any(|&r| r > 0.) {
+                            let [tl, tr, br, bl] = radius;
+                            let corner = |r: f32, across: f32, along: f32| {
+                                [r.max(across).min(w / 2.), r.max(along).min(h / 2.)]
+                            };
+                            let [tl_w, tl_h] = corner(tl, left, top);
+                            let [tr_w, tr_h] = corner(tr, right, top);
+                            let [br_w, br_h] = corner(br, right, bottom);
+                            let [bl_w, bl_h] = corner(bl, left, bottom);
+                            let owner = |vertical: f32, horizontal: f32| {
+                                if vertical > 0. { vertical } else { horizontal }
+                            };
+                            vec![
+                                (top, [x + tl_w, y, w - tl_w - tr_w, top]),
+                                (bottom, [x + bl_w, y + h - bottom, w - bl_w - br_w, bottom]),
+                                (left, [x, y + tl_h, left, h - tl_h - bl_h]),
+                                (right, [x + w - right, y + tr_h, right, h - tr_h - br_h]),
+                                (owner(top, left), [x, y, tl_w, tl_h]),
+                                (owner(top, right), [x + w - tr_w, y, tr_w, tr_h]),
+                                (
+                                    owner(bottom, right),
+                                    [x + w - br_w, y + h - br_h, br_w, br_h],
+                                ),
+                                (owner(bottom, left), [x, y + h - bl_h, bl_w, bl_h]),
+                            ]
+                        } else {
+                            let middle = (h - top - bottom).max(0.);
+                            vec![
+                                (top, [x, y, w, top]),
+                                (bottom, [x, y + h - bottom, w, bottom]),
+                                (left, [x, y + top, left, middle]),
+                                (right, [x + w - right, y + top, right, middle]),
+                            ]
+                        };
+                        for (width, strip) in pieces {
+                            if width <= 0. || strip[2] <= 0. || strip[3] <= 0. {
+                                continue;
+                            }
+                            if radius.iter().any(|&r| r > 0.) {
+                                self.items.push(Item::Inset {
+                                    rect: screen,
+                                    radius,
+                                    spread: width,
+                                    offset: [0., 0.],
+                                    color,
+                                    clip: intersect(strip, clip),
+                                    round_clip,
+                                    mask: mask.clone(),
+                                });
+                            } else {
+                                self.items.push(Item::Fill {
+                                    rect: strip,
+                                    radius: [0.; 4],
+                                    top: color,
+                                    bottom: color,
+                                    clip,
+                                    round_clip,
+                                    mask: mask.clone(),
+                                });
+                            }
+                        }
+                    } else {
+                        let spread = paint.edge_width.unwrap_or(1.) * inner.k;
+                        self.items.push(Item::Inset {
+                            rect: screen,
+                            radius,
+                            spread,
+                            offset: [0., 0.],
+                            color,
+                            clip,
+                            round_clip,
+                            mask: mask.clone(),
+                        });
+                    }
+                }
+                if let Some(highlight) = paint.highlight {
+                    let color = inner.color(Value::color(highlight).rgba());
                     self.items.push(Item::Inset {
                         rect: screen,
                         radius,
-                        spread,
-                        offset: [0., 0.],
+                        spread: 0.,
+                        offset: [0., inner.k],
                         color,
                         clip,
                         round_clip,
@@ -4345,22 +4851,9 @@ impl Walker<'_> {
                     });
                 }
             }
-            if let Some(highlight) = paint.highlight {
-                let color = inner.color(Value::color(highlight).rgba());
-                self.items.push(Item::Inset {
-                    rect: screen,
-                    radius,
-                    spread: 0.,
-                    offset: [0., inner.k],
-                    color,
-                    clip,
-                    round_clip,
-                    mask: mask.clone(),
-                });
-            }
         }
         let color = shown.color.unwrap_or([244., 244., 245., 255.]);
-        match &node {
+        match node {
             Node::Text {
                 text,
                 font,
@@ -4368,109 +4861,123 @@ impl Walker<'_> {
                 align,
                 spans,
                 ..
-            } if !text.is_empty() => {
+            } if visible && !text.is_empty() => {
                 let style = TextStyle {
                     align: *align,
                     ..TextStyle::of(font, inner.color(color))
                 };
-                // Draws the text cut to its line limit at the width the layout measured.
-                let mut runs = node_spans(text, spans.as_deref()).into_owned();
-                if shown.underline {
-                    runs.iter_mut().for_each(|run| run.underline = true);
-                }
                 let rich = spans.as_ref().is_some_and(|spans| !spans.is_empty());
-                // Rich or underlined text cuts and places its marks in one cached step, so unchanged text shapes
-                // nothing. The underline is in the spans, so the cached marks are keyed by it.
-                let (runs, marks) = if rich || shown.underline {
-                    // Plain text is cut in the style layout measured it in.
-                    let cut_style = if rich {
-                        style.clone()
-                    } else {
-                        TextStyle {
-                            align: *align,
-                            ..TextStyle::resolve(font)
-                        }
-                    };
-                    host.text
-                        .cut_marks(&runs, layout_rect[2], *lines, &cut_style)
+                if !rich && !shown.underline && lines.is_none() {
+                    // Fast path: plain, non-underlined, unclamped text skips `node_spans` and `plain_text`.
+                    self.items.push(Item::Text {
+                        rect: screen,
+                        text: text.clone(),
+                        spans: None,
+                        style,
+                        wrap: true,
+                        zoom: inner.k,
+                        clip,
+                        round_clip,
+                    });
                 } else {
-                    let runs = match lines {
-                        Some(lines) => host.text.limit_lines(
-                            &runs,
-                            layout_rect[2],
-                            *lines,
-                            &TextStyle::resolve(font),
-                        ),
-                        None => runs,
+                    // Draws the text cut to its line limit at the width the layout measured.
+                    let mut runs = node_spans(text, spans.as_deref()).into_owned();
+                    if shown.underline {
+                        runs.iter_mut().for_each(|run| run.underline = true);
+                    }
+                    // Rich or underlined text cuts and places its marks in one cached step, so unchanged text shapes
+                    // nothing. The underline is in the spans, so the cached marks are keyed by it.
+                    let (runs, marks) = if rich || shown.underline {
+                        // Plain text is cut in the style layout measured it in.
+                        let cut_style = if rich {
+                            style.clone()
+                        } else {
+                            TextStyle {
+                                align: *align,
+                                ..TextStyle::resolve(font)
+                            }
+                        };
+                        self.text
+                            .cut_marks(&runs, layout_rect[2], *lines, &cut_style)
+                    } else {
+                        let runs = match lines {
+                            Some(lines) => self.text.limit_lines(
+                                &runs,
+                                layout_rect[2],
+                                *lines,
+                                &TextStyle::resolve(font),
+                            ),
+                            None => runs,
+                        };
+                        (runs, Vec::new())
                     };
-                    (runs, Vec::new())
-                };
-                let zoom = inner.k;
-                for mark in marks {
-                    match mark {
-                        Mark::Image { span, rect } => {
-                            let Some(image) = runs[span]
-                                .image
-                                .as_ref()
-                                .and_then(|image| host.images.get(&image.source))
-                                .filter(|_| !hidden)
-                            else {
-                                continue;
-                            };
-                            self.items.push(Item::Image {
-                                rect: scaled(screen, rect, zoom),
-                                radius: [0.; 4],
-                                image: image.clone(),
-                                tint: [255; 4],
-                                clip,
-                                round_clip,
-                                mask: None,
-                            });
-                        }
-                        Mark::Underline { span, rect } | Mark::Strike { span, rect } => {
-                            let color = runs[span]
-                                .color
-                                .map_or(color, |c| c.to_be_bytes().map(f32::from));
-                            let color = inner.color(color);
-                            self.items.push(Item::Fill {
-                                rect: scaled(screen, rect, zoom),
-                                radius: [0.; 4],
-                                top: color,
-                                bottom: color,
-                                clip,
-                                round_clip,
-                                mask: None,
-                            });
-                        }
-                        Mark::Background { span, rect } => {
-                            let Some(background) = runs[span].background else {
-                                continue;
-                            };
-                            let color = inner.color(background.to_be_bytes().map(f32::from));
-                            self.items.push(Item::Fill {
-                                rect: scaled(screen, rect, zoom),
-                                radius: [runs[span].background_radius * zoom; 4],
-                                top: color,
-                                bottom: color,
-                                clip,
-                                round_clip,
-                                mask: None,
-                            });
+                    let zoom = inner.k;
+                    for mark in marks {
+                        match mark {
+                            Mark::Image { span, rect } => {
+                                let Some(image) = runs[span]
+                                    .image
+                                    .as_ref()
+                                    .and_then(|image| self.images.get(&image.source))
+                                    .filter(|_| !hidden)
+                                else {
+                                    continue;
+                                };
+                                self.items.push(Item::Image {
+                                    rect: scaled(screen, rect, zoom),
+                                    radius: [0.; 4],
+                                    image: image.clone(),
+                                    tint: [255; 4],
+                                    clip,
+                                    round_clip,
+                                    mask: None,
+                                });
+                            }
+                            Mark::Underline { span, rect } | Mark::Strike { span, rect } => {
+                                let color = runs[span]
+                                    .color
+                                    .map_or(color, |c| c.to_be_bytes().map(f32::from));
+                                let color = inner.color(color);
+                                self.items.push(Item::Fill {
+                                    rect: scaled(screen, rect, zoom),
+                                    radius: [0.; 4],
+                                    top: color,
+                                    bottom: color,
+                                    clip,
+                                    round_clip,
+                                    mask: None,
+                                });
+                            }
+                            Mark::Background { span, rect } => {
+                                let Some(background) = runs[span].background else {
+                                    continue;
+                                };
+                                let color = inner.color(background.to_be_bytes().map(f32::from));
+                                self.items.push(Item::Fill {
+                                    rect: scaled(screen, rect, zoom),
+                                    radius: [runs[span].background_radius * zoom; 4],
+                                    top: color,
+                                    bottom: color,
+                                    clip,
+                                    round_clip,
+                                    mask: None,
+                                });
+                            }
                         }
                     }
+                    self.items.push(Item::Text {
+                        rect: screen,
+                        text: plain_text(&runs),
+                        spans: rich.then_some(runs),
+                        style,
+                        wrap: true,
+                        zoom,
+                        clip,
+                        round_clip,
+                    });
                 }
-                self.items.push(Item::Text {
-                    rect: screen,
-                    text: plain_text(&runs),
-                    spans: rich.then_some(runs),
-                    style,
-                    wrap: true,
-                    zoom,
-                    clip,
-                    round_clip,
-                });
             }
-            Node::Icon { icon, stroke, .. } => {
+            Node::Icon { icon, stroke, .. } if visible => {
                 self.items.push(Item::Icon {
                     rect: screen,
                     icon: *icon,
@@ -4482,8 +4989,8 @@ impl Walker<'_> {
                     round_clip,
                 });
             }
-            Node::Image { source, .. } => {
-                if let Some(image) = host.images.get(source).filter(|_| !hidden) {
+            Node::Image { source, .. } if visible => {
+                if let Some(image) = self.images.get(source).filter(|_| !hidden) {
                     let tint = shown.color.unwrap_or([255., 255., 255., 255.]);
                     self.items.push(Item::Image {
                         rect: screen,
@@ -4504,13 +5011,15 @@ impl Walker<'_> {
                 multiline,
                 purpose,
                 ..
-            } => {
-                self.hits.push(Hit {
-                    rect: intersect(screen, clip),
-                    id,
-                    layer: self.layer,
-                });
-                let content = inner.rect(host.input_content(id));
+            } if visible || self.focused == Some(id) => {
+                if visible {
+                    self.hits.push(Hit {
+                        rect: on_screen,
+                        id,
+                        layer: self.layer,
+                    });
+                }
+                let content = inner.rect(input_content_of(tree, id));
                 let style = TextStyle::of(font, inner.color(color));
                 // A line sits in the middle of a single-line field, and at the top of a multi-line one.
                 let line = [
@@ -4530,27 +5039,27 @@ impl Walker<'_> {
                     line[3] / inner.k
                 };
                 let width = content[2] / inner.k;
-                if host.focused == Some(id) {
+                if self.focused == Some(id) {
                     let requested = if *multiline {
-                        host.scroll_offset(id, f32::MAX, self.now)
+                        self.scroll_offset(id, f32::MAX, self.now)
                     } else {
                         0.
                     };
-                    host.editor.scroll_to(requested);
-                    let frame = host.editor.frame(
-                        &mut host.text,
+                    self.editor.scroll_to(requested);
+                    let frame = self.editor.frame(
+                        self.text,
                         &style,
                         [width, view],
                         scale * inner.k,
                         max_side,
-                        host.editor_key,
+                        *self.editor_key,
                     );
-                    host.editor_key = Some(frame.bitmap_key);
+                    *self.editor_key = Some(frame.bitmap_key);
                     if *multiline {
                         if frame.scroll_y != requested {
-                            host.motion.release(id, Channel::Scroll);
+                            self.motion.release(id, Channel::Scroll);
                         }
-                        host.scroll.insert(id, frame.scroll_y);
+                        self.scroll.insert(id, frame.scroll_y);
                         self.scrolls.push(Scroll {
                             id,
                             layer: self.layer,
@@ -4563,7 +5072,7 @@ impl Walker<'_> {
                             list_generation: None,
                         });
                     }
-                    if text.is_empty() && !host.editor.composing() {
+                    if text.is_empty() && !self.editor.composing() {
                         self.placeholder(
                             placeholder,
                             *placeholder_color,
@@ -4582,7 +5091,7 @@ impl Walker<'_> {
                     if *purpose != InputPurpose::Password {
                         *self.ime_area = Some(caret);
                     }
-                    let caret = (frame.caret_visible && !host.hide_caret).then_some(caret);
+                    let caret = (frame.caret_visible && !self.hide_caret).then_some(caret);
                     self.items.push(Item::Editor {
                         rect: if *multiline { content } else { line },
                         frame: Box::new(frame),
@@ -4608,14 +5117,12 @@ impl Walker<'_> {
                         text.clone()
                     };
                     // Unfocused, the wrapped text is drawn whole and shifted up by the scroll; the clip shows the visible part.
-                    let height = host.text.measure_styled(
-                        &node_spans(&display, None),
-                        Some(width + WRAP_SLACK),
-                        &style,
-                    )[1]
+                    let height = self
+                        .text
+                        .measure_plain(&display, Some(width + WRAP_SLACK), &style)[1]
                     .max(style.line_height);
                     let max = (height - view).max(0.);
-                    let offset = host.scroll_offset(id, max, self.now);
+                    let offset = self.scroll_offset(id, max, self.now);
                     self.scrolls.push(Scroll {
                         id,
                         layer: self.layer,
@@ -4662,54 +5169,60 @@ impl Walker<'_> {
             }
             _ => {}
         }
-        if matches!(node, Node::Box { press, contextmenu, drag, .. } if press != 0 || contextmenu != 0 || drag != 0)
-        {
-            self.hits.push(Hit {
-                rect: intersect(screen, clip),
-                id,
-                layer: self.layer,
-            });
-        }
-        if node.style().is_some_and(|s| s.group) && !disabled {
-            self.groups.push((id, intersect(screen, clip), self.layer));
-        }
-        if let Node::Box { hover, dismiss, .. } = &node {
-            let rect = intersect(screen, clip);
-            if *hover != 0 {
-                self.hovers.push((id, rect, self.layer));
+        if visible {
+            if matches!(node, Node::Box { press, contextmenu, drag, .. } if *press != 0 || *contextmenu != 0 || *drag != 0)
+            {
+                self.hits.push(Hit {
+                    rect: on_screen,
+                    id,
+                    layer: self.layer,
+                });
             }
-            if *dismiss != 0 {
-                self.dismissers.push((id, rect, self.layer));
+            if is_group && !disabled {
+                self.groups.push((id, on_screen, self.layer));
             }
-        }
-        let has_cursor = paint.cursor.is_some()
-            || [&paint.hover, &paint.active, &paint.focus]
-                .into_iter()
-                .flatten()
-                .any(|v| v.cursor.is_some());
-        if has_cursor {
-            self.cursors.push(CursorHit {
-                rect: intersect(screen, clip),
-                id,
-                layer: self.layer,
-                after_hits: self.hits.len(),
-            });
+            if let Node::Box { hover, dismiss, .. } = node {
+                if *hover != 0 {
+                    self.hovers.push((id, on_screen, self.layer));
+                }
+                if *dismiss != 0 {
+                    self.dismissers.push((id, on_screen, self.layer));
+                }
+            }
+            let has_cursor = paint.cursor.is_some()
+                || [&paint.hover, &paint.active, &paint.focus]
+                    .into_iter()
+                    .flatten()
+                    .any(|v| v.cursor.is_some());
+            if has_cursor {
+                self.cursors.push(CursorHit {
+                    rect: on_screen,
+                    id,
+                    layer: self.layer,
+                    after_hits: self.hits.len(),
+                });
+            }
         }
         let mut child = inner;
+        if is_group {
+            let (gh, ga) = self.group_state(id);
+            child.group_hover = gh;
+            child.group_active = ga;
+        }
         if node.style().is_some_and(|s| s.clip || s.scroll) {
-            child.clip = intersect(clip, screen);
+            child.clip = on_screen;
             // shortcut: a rounded clip inside another rounded clip replaces it, so the outer corners are lost.
             if radius.iter().any(|&r| r > 0.) {
                 child.round_clip = Some((screen, radius));
             }
         }
-        let virtual_list = host.virtual_lists.get(&id).map(|&(generation, ref list)| {
+        let virtual_list = self.virtual_lists.get(&id).map(|&(generation, ref list)| {
             if list.auto.is_some() {
                 let (offset, extent) = list.frame_viewport(layout_rect[3]);
                 self.scrolls.push(Scroll {
                     id,
                     layer: self.layer,
-                    rect: intersect(screen, clip),
+                    rect: on_screen,
                     k: inner.k,
                     top: offset as f32,
                     max: list.max_offset(extent) as f32,
@@ -4721,15 +5234,15 @@ impl Walker<'_> {
             list.frame_viewport(layout_rect[3]).1
         });
         // A scrollbar and its opacity this frame, drawn over the content.
-        let mut bar = None;
+        let mut bar: Option<(&Scrollbar, Rect, Rect, f32)> = None;
         if virtual_list.is_none() && node.style().is_some_and(|s| s.scroll) {
             // The offset is clamped to this frame's content, so it stays valid when the content shrinks.
-            let content = host.layout.content_height(id);
+            let content = layout.content_height(id);
             let max = (content - layout_rect[3]).max(0.);
             let end = node
                 .style()
                 .is_some_and(|s| s.scroll_anchor == ScrollAnchor::End);
-            let offset = host.frame_offset(id, max, self.now, end);
+            let offset = self.frame_offset(id, max, self.now, end);
             child.offset[1] -= offset * inner.k;
             let rects = paint
                 .scrollbar
@@ -4747,12 +5260,12 @@ impl Walker<'_> {
                     );
                     // Auto-hide fades the bar in while the pointer is over the node, or while its thumb is dragged.
                     let alpha = if scrollbar.auto_hide {
-                        let over = host
+                        let over = self
                             .pointer
-                            .is_some_and(|p| contains(intersect(screen, clip), p));
-                        let dragged = host.drag.is_some_and(|(drag, _)| drag == id);
+                            .is_some_and(|p| contains(on_screen, p));
+                        let dragged = self.drag.is_some_and(|(drag, _)| drag == id);
                         let shown = Value::Number(f32::from(u8::from(over || dragged)));
-                        host.motion
+                        self.motion
                             .show(
                                 id,
                                 Channel::Thumb,
@@ -4764,13 +5277,13 @@ impl Walker<'_> {
                     } else {
                         1.
                     };
-                    bar = Some((scrollbar.clone(), rects.0, rects.1, alpha));
+                    bar = Some((scrollbar, rects.0, rects.1, alpha));
                     rects
                 });
             self.scrolls.push(Scroll {
                 id,
                 layer: self.layer,
-                rect: intersect(screen, clip),
+                rect: on_screen,
                 k: inner.k,
                 top: offset,
                 max,
@@ -4789,16 +5302,19 @@ impl Walker<'_> {
             child.clip = intersect(child.clip, view);
             child.in_row = true;
             if child.clip[2] > 0. && child.clip[3] > 0. {
-                for row in host.layout.visible_rows(id).to_vec() {
-                    self.node(host, row, child, scale, max_side);
+                for &row in layout.visible_rows(id) {
+                    self.node(row, child, scale, max_side);
                 }
             }
         } else if !matches!(node, Node::List { .. }) {
-            for &c in host.tree.children(id).to_vec().iter() {
-                self.node(host, c, child, scale, max_side);
+            for &c in tree.children(id) {
+                self.node(c, child, scale, max_side);
             }
         }
-        if let Some((scrollbar, track, thumb, alpha)) = bar.filter(|(_, _, _, alpha)| *alpha > 0.) {
+        if visible
+            && let Some((scrollbar, track, thumb, alpha)) =
+                bar.filter(|(_, _, _, alpha)| *alpha > 0.)
+        {
             // The bar is clipped like the node's content, and shaded by its auto-hide opacity.
             let shade = |rgba: u32| {
                 let mut color = inner.color(Value::color(rgba).rgba());
@@ -5232,7 +5748,10 @@ mod tests {
         host.pointer_move(Some(inside));
         assert!(host.wheel(50.));
         let frame = host.frame(640., 560., 1., 4096);
-        for n in 0..10 {
+        // At offset 50 inside a 100 px box (30 px rows with 19 px top-aligned text):
+        // row 1's box overlaps [top, top + 10] (so clicks hit it below), while its text ends at top - 1.
+        // Texts of rows 2..=4 overlap the clip; off-screen texts (0, 1, 5..10) are culled.
+        for n in 2..=4 {
             let (rect, clip) = drawn(&frame, &format!("row {n}"));
             assert!(
                 (rect[1] - (top + 30. * n as f32 - 50.)).abs() < 0.01,
@@ -5241,6 +5760,16 @@ mod tests {
             assert!(
                 near(clip, [x, top, width, height]),
                 "row {n} is clipped to the box: {clip:?}"
+            );
+        }
+        for n in [0, 1, 5, 6, 7, 8, 9] {
+            let label = format!("row {n}");
+            assert!(
+                !frame
+                    .items
+                    .iter()
+                    .any(|item| matches!(item, Item::Text { text, .. } if text == &label)),
+                "off-screen {label:?} should be culled from frame items"
             );
         }
 
@@ -5661,15 +6190,17 @@ mod tests {
     fn hover_follows_a_scroll_once_the_scroll_is_idle() {
         let mut host = states();
         let (_, [_, top, width, _]) = scroll_column(&mut host);
+        let row0 = host.tree.parent(text_id(&host, "row 0")).unwrap();
         let fills = fills_of(&frame_of(&mut host), ROW_FILL);
         assert_eq!(fills.len(), 1);
         assert!((fills[0][1] - top).abs() < 0.01, "{fills:?}");
 
         // Scrolling 45 px moves row 1 under the same point, but hover keeps row 0 until the scroll is idle.
+        // Row 0 is scrolled completely above the clip (culled from drawn fills), and row 1 is not hovered yet.
         assert!(host.wheel(45.));
         let fills = fills_of(&frame_of(&mut host), ROW_FILL);
-        assert_eq!(fills.len(), 1);
-        assert!((fills[0][1] - (top - 45.)).abs() < 0.01, "{fills:?}");
+        assert!(fills.is_empty(), "row 0 is culled off-screen and row 1 is not hovered yet: {fills:?}");
+        assert_eq!(host.hovered_groups, [row0]);
 
         std::thread::sleep(Duration::from_millis(120));
         let frame = frame_of(&mut host);
@@ -5707,16 +6238,57 @@ mod tests {
     fn a_pointer_move_during_a_scroll_updates_hover_at_once() {
         let mut host = states();
         let (_, [x, top, _, _]) = scroll_column(&mut host);
+        let row0 = host.tree.parent(text_id(&host, "row 0")).unwrap();
         frame_of(&mut host);
         assert!(host.wheel(45.));
         let fills = fills_of(&frame_of(&mut host), ROW_FILL);
-        assert!((fills[0][1] - (top - 45.)).abs() < 0.01, "{fills:?}");
+        assert!(fills.is_empty(), "row 0 is culled off-screen and row 1 is not hovered yet: {fills:?}");
+        assert_eq!(host.hovered_groups, [row0]);
 
         // Row 1 is under the moved pointer: no idle time to wait for.
         host.pointer_move(Some([x + 4., top + 6.]));
         let fills = fills_of(&frame_of(&mut host), ROW_FILL);
         assert_eq!(fills.len(), 1);
         assert!((fills[0][1] - (top - 15.)).abs() < 0.01, "{fills:?}");
+    }
+
+    #[test]
+    fn clip_culling_preserves_casting_shadows_and_dynamic_transitions() {
+        const APP: &str = r#"
+            function jsnirMount() {
+                jsnir.batch(JSON.stringify({ ops: [
+                    { op: 'create', id: 1, node: { kind: 'box', style: { width: 400, height: 200 } } },
+                    { op: 'create', id: 2, parent: 1, node: { kind: 'box', style: { width: 200, height: 100, clip: true } } },
+                    // Positioned just below the 100 px clip, but casts a 24 px blur shadow upward into the clip.
+                    { op: 'create', id: 3, parent: 2, node: { kind: 'box', style: { position: 'absolute', left: 10, top: 105, width: 80, height: 20 }, paint: { background: 0xff0000ff, shadows: [{ y: 0, blur: 24, spread: 0, color: 0x000000ff }] } } },
+                    // Initially static node (no transitions) that dynamically receives a transition + new color later.
+                    { op: 'create', id: 4, parent: 1, node: { kind: 'box', style: { width: 80, height: 40 }, paint: { background: 0x000000ff } } },
+                ] }));
+            }
+            function jsnirEvent(_, text) { jsnir.batch(text); }
+        "#;
+        let mut host = Host::new(APP.into(), "{}".into(), TextEngine::default());
+        settle(&mut host);
+        let frame = host.frame(400., 200., 1., 4096);
+        assert!(
+            frame.items.iter().any(|item| matches!(item, Item::Shadow { .. })),
+            "an off-screen box whose shadow reaches into the clip must still emit its shadow"
+        );
+        // Dynamically attach a 400 ms background transition while switching color 0x000000ff -> 0xffffffff.
+        host.push(r#"{"ops":[{"op":"setpaint","id":4,"paint":{"background":4294967295,"transitions":[{"property":"background","duration":400,"easing":"linear"}]}}]}"#.into());
+        while host.busy() {
+            host.poll();
+            std::thread::yield_now();
+        }
+        let first = host.frame(400., 200., 1., 4096);
+        assert!(first.animating, "dynamically attached transition must animate from old static paint");
+        std::thread::sleep(Duration::from_millis(40));
+        let mid = host.frame(400., 200., 1., 4096);
+        let box4_fill = mid.items.iter().find_map(|item| match item {
+            Item::Fill { rect, top, .. } if (rect[2] - 80.).abs() < 0.1 && (rect[3] - 40.).abs() < 0.1 => Some(*top),
+            _ => None,
+        }).expect("box 4 fill");
+        assert!(box4_fill[0] > 0 && box4_fill[0] < 255, "mid-transition color should interpolate: {box4_fill:?}");
     }
 
     #[test]
