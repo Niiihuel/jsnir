@@ -2,8 +2,14 @@
 declare var jsnir: {
     set(id: number, value: number): void;
     batch(json: string): void;
+    commit(words: number): void;
+    report(message: string): void;
     setText(id: number, text: string): void;
     readText(id: number): string | undefined;
+    /** Shared binary command buffer (Uint32 view) flushed with `jsnir.commit(words)`. */
+    cmd: Uint32Array;
+    /** Shared binary command buffer (Float32 view over the same memory as `cmd`). */
+    cmdF32: Float32Array;
     /** Columns shared with Rust, indexed by node id. Read only. Do not keep them across callbacks: they can grow. */
     columns: {
         /** Value of a label. */
@@ -48,22 +54,24 @@ interface Transition { property?: Property; duration?: number; delay?: number; e
 interface Keyframe { offset?: number; value?: number | undefined; color?: number | undefined }
 interface Animation { property?: Property; keyframes?: Keyframe[]; duration?: number; delay?: number; easing?: Easing; bezier?: [number, number, number, number] | undefined; iterations?: number | undefined; alternate?: boolean }
 interface Shadow { y?: number; blur?: number; spread?: number; color?: number }
-interface Variant { background?: number | undefined; gradient?: [number, number] | undefined; brightness?: number | undefined; scale?: number | undefined; opacity?: number | undefined; x?: number | undefined; y?: number | undefined; color?: number | undefined; edge?: number | undefined; height?: number | undefined; width?: number | undefined; underline?: boolean | undefined }
+type Cursor = "default" | "pointer" | "text" | "notAllowed" | "grab" | "grabbing" | "move" | "colResize" | "rowResize" | "ewResize" | "nsResize" | "neswResize" | "nwseResize";
+interface Variant { background?: number | undefined; gradient?: [number, number] | undefined; brightness?: number | undefined; scale?: number | undefined; opacity?: number | undefined; x?: number | undefined; y?: number | undefined; color?: number | undefined; edge?: number | undefined; height?: number | undefined; width?: number | undefined; underline?: boolean | undefined; cursor?: Cursor | undefined }
 interface Starting { opacity?: number | undefined; x?: number | undefined; y?: number | undefined; scale?: number | undefined; draw?: number | undefined }
 interface Scrollbar { width?: number; thumb?: number; track?: number | undefined; radius?: number; minThumb?: number; inset?: number; autoHide?: boolean }
-interface Paint { background?: number | undefined; gradient?: [number, number] | undefined; radius?: number | [number, number, number, number]; mask?: string | undefined; edge?: number | undefined; edgeWidth?: number | undefined; edgeSides?: [number, number, number, number] | undefined; highlight?: number | undefined; shadows?: Shadow[]; opacity?: number | undefined; x?: number; y?: number; scale?: number | undefined; brightness?: number | undefined; color?: number | undefined; draw?: number | undefined; transitions?: Transition[]; animations?: Animation[] | undefined; starting?: Starting | undefined; hover?: Variant | undefined; active?: Variant | undefined; focus?: Variant | undefined; scrollbar?: Scrollbar | undefined }
+interface Paint { background?: number | undefined; gradient?: [number, number] | undefined; radius?: number | [number, number, number, number]; mask?: string | undefined; edge?: number | undefined; edgeWidth?: number | undefined; edgeSides?: [number, number, number, number] | undefined; highlight?: number | undefined; shadows?: Shadow[]; opacity?: number | undefined; x?: number; y?: number; scale?: number | undefined; brightness?: number | undefined; color?: number | undefined; draw?: number | undefined; transitions?: Transition[]; animations?: Animation[] | undefined; starting?: Starting | undefined; hover?: Variant | undefined; active?: Variant | undefined; focus?: Variant | undefined; scrollbar?: Scrollbar | undefined; cursor?: Cursor | undefined }
 interface Font { size?: number | undefined; weight?: number | undefined; lineHeight?: number | undefined; letterSpacing?: number; family?: string | undefined }
 interface InlineImage { source?: string; width?: number; height?: number }
 interface Span { text?: string; color?: number | undefined; weight?: number | undefined; size?: number | undefined; family?: string | undefined; underline?: boolean; italic?: boolean; strike?: boolean; background?: number | undefined; backgroundRadius?: number; image?: InlineImage | undefined }
 type IconName = "arrowLeft" | "arrowRight" | "tick" | "checkCircle";
+type InputPurpose = "normal" | "password" | "search" | "email" | "number";
 type Node =
     | { kind: "column"; style?: Style }
-    | { kind: "list"; style?: Style }
+    | { kind: "list"; style?: Style; scroll?: number }
     | { kind: "label"; value: number }
     | { kind: "button"; callback: number }
     | { kind: "text"; text: string; style?: Style; font?: Font; paint?: Paint; lines?: number | undefined; align?: TextAlign; spans?: Span[] | undefined }
-    | { kind: "input"; text?: string; selection?: [number, number]; submit?: number; change?: number; placeholder?: string; placeholderColor?: number | undefined; multiline?: boolean; submitOnEnter?: boolean; style?: Style; font?: Font; paint?: Paint }
-    | { kind: "box"; style?: Style; paint?: Paint; press?: number; disabled?: boolean; hover?: number; contextmenu?: number; dismiss?: number; scroll?: number }
+    | { kind: "input"; text?: string; selection?: [number, number]; submit?: number; change?: number; placeholder?: string; placeholderColor?: number | undefined; multiline?: boolean; submitOnEnter?: boolean; retainOnSubmit?: boolean; purpose?: InputPurpose; style?: Style; font?: Font; paint?: Paint }
+    | { kind: "box"; style?: Style; paint?: Paint; press?: number; disabled?: boolean; hover?: number; contextmenu?: number; dismiss?: number; scroll?: number; drag?: number }
     | { kind: "icon"; icon: IconName; size: number; stroke: number; style?: Style; paint?: Paint }
     | { kind: "image"; source: string; style?: Style; paint?: Paint };
 type Operation =
@@ -71,11 +79,13 @@ type Operation =
     | { op: "move"; id: number; before: number | undefined }
     | { op: "set"; id: number; value: number }
     | { op: "settext"; id: number; text: string }
+    | { op: "setfield"; id: number; expected: string; text: string }
     | { op: "setspans"; id: number; spans: Span[] }
     | { op: "setsource"; id: number; source: string }
     | { op: "setpaint"; id: number; paint: Paint }
     | { op: "setstyle"; id: number; style: Style }
     | { op: "setdisabled"; id: number; disabled: boolean }
+    | { op: "focus"; id: number }
     | { op: "remove"; id: number }
     | { op: "after"; ms: number; callback: number }
     | { op: "virtuallist"; id: number; name: string }

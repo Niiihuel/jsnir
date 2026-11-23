@@ -2,17 +2,21 @@
 //! handles pointer, focus and text input, runs transitions and timers, and turns the tree into a list
 //! of drawing items that any backend can paint. JS never runs on this thread.
 use crate::{
-    App, Bridge, Event, HOST_CALLBACK, Inbox, ListBindings, Log, MAX_PENDING, Vm,
-    editor::{EditorBitmapKey, EditorEvent, EditorFrame, EditorOutput, LineEditor, PointSelection},
+    App, Bridge, Event, HOST_CALLBACK, Inbox, JsEngine, ListBindings, Log, MAX_PENDING,
+    ScriptBundle, Vm,
+    editor::{
+        EditorBitmapKey, EditorEvent, EditorFrame, EditorOutput, LineEditor, PointSelection,
+        SurroundingText, mask_text,
+    },
     layout::Layout,
     list::List,
     motion::{Channel, Motion, Value},
     or_log, spawn_app,
     text::{Mark, TextBitmap, TextEngine, TextStyle, WRAP_SLACK, node_spans, plain_text},
     tree::{
-        Anchor, AnchorAlign, Batch, Easing, Icon, Node, Op, Paint, PlacementSubscription, Position,
-        Property, Replica, ScrollAnchor, ScrollEdge, Scrollbar, Shadow, Side, Span, Transition,
-        Tree, Variant,
+        Anchor, AnchorAlign, Batch, Easing, Icon, InputPurpose, Node, Op, Paint,
+        PlacementSubscription, Position, Property, Replica, ScrollAnchor, ScrollEdge, Scrollbar,
+        Shadow, Side, Span, Transition, Tree, Variant,
     },
 };
 use rquickjs::{Ctx, Exception, Function, function::MutFn};
@@ -23,7 +27,7 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
-        mpsc::TryRecvError,
+        mpsc::{RecvTimeoutError, TryRecvError},
     },
     time::{Duration, Instant},
 };
@@ -148,14 +152,26 @@ pub struct ShadowSpec {
     pub color: Rgba,
 }
 
-/// Pointer shape over what is under it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Cursor {
-    #[default]
-    Default,
-    Pointer,
-    Text,
-    NotAllowed,
+pub use crate::tree::Cursor;
+
+/// Error shown in the native development overlay while the previous valid app stays running underneath.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DevError {
+    pub title: String,
+    pub message: String,
+    pub location: Option<String>,
+    pub frame: Option<String>,
+}
+
+/// Cross-platform IME state for the currently focused field (Linux Wayland/X11, Windows TSF, macOS).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImeState {
+    /// Whether platform IME composition should be enabled (false when unfocused or focused on a password field).
+    pub allowed: bool,
+    /// Semantic purpose of the focused input.
+    pub purpose: InputPurpose,
+    /// Window of text surrounding the caret/selection (at most 4000 UTF-8 bytes) when `allowed` is true.
+    pub surrounding: Option<SurroundingText>,
 }
 
 pub struct Frame {
@@ -173,10 +189,10 @@ type Configure = Box<dyn for<'js> Fn(&Ctx<'js>) -> rquickjs::Result<()> + Send>;
 // It must not enter the ordinary callback dispatcher before its mount token has been checked.
 const PLACEMENT_PREFIX: &str = "\0placement:";
 
-// The app in QuickJS: `jsnirMount` once, `jsnirEvent(callback, text)` per event. A reload makes a new VM with the
-// same replica, startup arguments and globals.
+// The app in QuickJS (or another `JsEngine`): `jsnirMount` once, `jsnirEvent` / typed numeric handlers per event.
+// A reload makes a new VM with the same replica, startup arguments and globals.
 struct HostApp {
-    vm: Vm,
+    vm: Box<dyn JsEngine>,
     replica: Rc<RefCell<Replica>>,
     args: String,
     configure: Configure,
@@ -184,23 +200,60 @@ struct HostApp {
 }
 impl App for HostApp {
     fn mount(&mut self) -> Result<Vec<Op>, String> {
-        self.vm.try_call("jsnirMount", ())
+        self.vm.call_mount()
     }
     fn handle(&mut self, e: Event, _: &Tree) -> Vec<Op> {
         if e.callback == HOST_CALLBACK
             && let Some(text) = e.text.strip_prefix(PLACEMENT_PREFIX)
         {
-            return or_log(self.vm.try_call("jsnirPlacement", (text,)));
+            return or_log(self.vm.call_placement(text));
         }
-        or_log(self.vm.try_call("jsnirEvent", (e.callback, e.text)))
+        or_log(self.vm.call_event(e.callback, &e.text, None))
     }
     fn guarded(&mut self, e: Event, guard: String) -> Vec<Op> {
-        or_log(self.vm.try_call("jsnirEvent", (e.callback, e.text, guard)))
+        or_log(self.vm.call_event(e.callback, &e.text, Some(&guard)))
+    }
+    fn handle_drag(
+        &mut self,
+        callback: u16,
+        guard: Option<String>,
+        phase: u8,
+        x: f32,
+        y: f32,
+        sx: f32,
+        sy: f32,
+        dx: f32,
+        dy: f32,
+    ) -> Vec<Op> {
+        or_log(
+            self.vm
+                .call_drag(callback, phase, x, y, sx, sy, dx, dy, guard.as_deref()),
+        )
+    }
+    fn handle_scroll(
+        &mut self,
+        callback: u16,
+        guard: Option<String>,
+        top: f32,
+        height: f32,
+        client: f32,
+    ) -> Vec<Op> {
+        or_log(
+            self.vm
+                .call_scroll(callback, top, height, client, guard.as_deref()),
+        )
+    }
+    fn handle_context_menu(
+        &mut self,
+        callback: u16,
+        guard: Option<String>,
+        x: f32,
+        y: f32,
+    ) -> Vec<Op> {
+        or_log(self.vm.call_context_menu(callback, x, y, guard.as_deref()))
     }
     fn list(&mut self, delta: String) -> Result<(ListBindings, Vec<Op>), String> {
-        let (reply, ops) = self
-            .vm
-            .try_call_with::<String>("jsnirVirtualList", (delta,))?;
+        let (reply, ops) = self.vm.call_virtual_list(&delta)?;
         let pairs =
             serde_json::from_str::<Vec<(String, u16)>>(&reply).map_err(|e| e.to_string())?;
         let bindings = pairs
@@ -218,9 +271,9 @@ impl App for HostApp {
     fn sync(&mut self, view: &Tree, ids: Option<&[u16]>) {
         self.vm.sync(view, ids)
     }
-    fn reload(&mut self, js: &str) -> Result<Vec<Op>, String> {
-        // The old VM's signals carry over to the new one. If the new script fails to load, the old one keeps running.
-        let state = self.vm.try_invoke::<String>("jsnirReloadState", ()).ok();
+    fn reload(&mut self, js: &str, preserve_state: bool) -> Result<Vec<Op>, String> {
+        // The old VM's signals carry over to the new one unless this is a hard reload. If the new script fails to load, the old one keeps running.
+        let state = preserve_state.then(|| self.vm.reload_state()).flatten();
         let placement_epoch = self.placement_epoch + 1;
         let vm = Vm::try_load_with(js, self.replica.clone(), state.as_deref(), |c| {
             c.globals().set("__jsnirArgs", self.args.as_str())?;
@@ -228,8 +281,8 @@ impl App for HostApp {
                 .set("__jsnirPlacementEpoch", placement_epoch.to_string())?;
             (self.configure)(c)
         })?;
-        let mount = vm.try_call("jsnirMount", ())?;
-        self.vm = vm;
+        let mount = vm.call_mount()?;
+        self.vm = Box::new(vm);
         self.placement_epoch = placement_epoch;
         Ok(mount)
     }
@@ -253,6 +306,31 @@ struct Hit {
     rect: Rect,
     id: u16,
     layer: i32,
+}
+
+// A node with an explicit cursor override, recorded while drawing alongside its position after `hits`.
+struct CursorHit {
+    rect: Rect,
+    id: u16,
+    layer: i32,
+    after_hits: usize,
+}
+
+// An active primary-button drag on a `Node::Box` with a `drag` callback.
+#[derive(Clone, Copy)]
+struct NodeDrag {
+    id: u16,
+    start: [f32; 2],
+    last: [f32; 2],
+    moved: bool,
+}
+
+// Kind of each in-flight message sent to the app thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Inflight {
+    Event,
+    DragMove,
+    Reload(bool),
 }
 
 // A `scrollTo` op, applied by the frame that draws its node.
@@ -347,6 +425,7 @@ type RowProvider = Box<dyn FnMut(u64) -> Result<serde_json::Value, String> + Sen
 #[derive(Default)]
 struct VirtualList {
     provider: Option<RowProvider>,
+    measured: bool,
     rows: List,
     bindings: HashMap<u64, u16>,
     follow_tail: bool,
@@ -447,9 +526,85 @@ impl VirtualList {
     }
 }
 
+enum EventPayload {
+    Text(String),
+    Drag {
+        phase: u8,
+        x: f32,
+        y: f32,
+        sx: f32,
+        sy: f32,
+        dx: f32,
+        dy: f32,
+    },
+    Scroll {
+        top: f32,
+        height: f32,
+        client: f32,
+    },
+    ContextMenu {
+        x: f32,
+        y: f32,
+    },
+}
+
 struct QueuedEvent {
-    event: Event,
+    callback: u16,
+    payload: EventPayload,
     guard: Option<String>,
+}
+
+impl QueuedEvent {
+    fn into_inbox(self) -> Inbox {
+        match self.payload {
+            EventPayload::Text(text) => {
+                let event = Event {
+                    callback: self.callback,
+                    text,
+                };
+                match self.guard {
+                    Some(guard) => Inbox::Guarded(event, guard),
+                    None => Inbox::Event(event),
+                }
+            }
+            EventPayload::Drag {
+                phase,
+                x,
+                y,
+                sx,
+                sy,
+                dx,
+                dy,
+            } => Inbox::Drag {
+                callback: self.callback,
+                guard: self.guard,
+                phase,
+                x,
+                y,
+                sx,
+                sy,
+                dx,
+                dy,
+            },
+            EventPayload::Scroll {
+                top,
+                height,
+                client,
+            } => Inbox::Scroll {
+                callback: self.callback,
+                guard: self.guard,
+                top,
+                height,
+                client,
+            },
+            EventPayload::ContextMenu { x, y } => Inbox::ContextMenu {
+                callback: self.callback,
+                guard: self.guard,
+                x,
+                y,
+            },
+        }
+    }
 }
 
 pub struct Host {
@@ -465,6 +620,9 @@ pub struct Host {
     list_vm: u64,
     bridge: Bridge,
     pending: u16,
+    // Bounded wait budget for `poll()`: lets fast JS replies land in the same frame without holding slow frames.
+    wait_budget: Duration,
+    sent_at: Option<Instant>,
     layout: Layout,
     text: TextEngine,
     motion: Motion,
@@ -497,8 +655,11 @@ pub struct Host {
     editor_dragging: bool,
     published: (String, [u32; 2]),
     hits: Vec<Hit>,
+    cursor_rects: Vec<CursorHit>,
     scrolls: Vec<Scroll>,
     placements: HashMap<u16, Placement>,
+    viewport_reporting: bool,
+    reported_viewport: Option<[f32; 2]>,
     // Offset of each scroll node in logical pixels; a node without an entry is at its top.
     scroll: HashMap<u16, f32>,
     // `scrollTo` ops that the next frame drawing their node applies.
@@ -506,6 +667,11 @@ pub struct Host {
     anchors: HashMap<u16, EndAnchor>,
     // A scrollbar thumb being dragged: its scroll node, and how far below the thumb's top the pointer grabbed it.
     drag: Option<(u16, f32)>,
+    // A `Node::Box` with a `drag` callback currently being dragged by the primary button.
+    node_drag: Option<NodeDrag>,
+    // Latest pointer position waiting to be sent as a drag `"move"` once the previous one is answered.
+    pending_drag_move: Option<[f32; 2]>,
+    drag_moves_inflight: u16,
     images: HashMap<String, ImageData>,
     image_generation: u64,
     // Changes with every font change: a backend drops the text bitmaps it made with the old fonts.
@@ -517,10 +683,13 @@ pub struct Host {
     pub keyframes_at: Option<f32>,
     // Reduced motion: infinite keyframe animations do not run, and their nodes show their base values.
     reduced_motion: bool,
-    // For each message sent to the app and not answered yet: whether it is a reload.
-    inflight: VecDeque<bool>,
+    // Kind of each message sent to the app and not answered yet.
+    inflight: VecDeque<Inflight>,
     // Outcomes of the reloads that were applied, oldest first, until `take_reload_result`.
     reload_results: VecDeque<Result<(), String>>,
+    // Native development error overlay shown above the app tree when compilation or reload fails.
+    dev_error: Option<DevError>,
+    dev_overlay_enabled: bool,
 }
 
 const HEIGHT_TRANSITION: Property = Property::Height;
@@ -537,7 +706,28 @@ impl Host {
 
     /// Starts an app and returns an error if the script fails to load or mount.
     pub fn try_new(script: String, args: String, text: TextEngine) -> Result<Self, String> {
-        Self::start(script, args, text, |_| Ok(()))
+        Self::start(ScriptBundle::Source(script), args, text, |_| Ok(()))
+    }
+
+    /// Starts an app from precompiled QuickJS bytecode (`JSNRBC01`, built with [`crate::compile_bytecode`]).
+    pub fn try_new_bytecode(
+        bytecode: Vec<u8>,
+        args: String,
+        text: TextEngine,
+    ) -> Result<Self, String> {
+        Self::start(ScriptBundle::Bytecode(bytecode), args, text, |_| Ok(()))
+    }
+
+    /// Starts an app from raw bytes, automatically detecting precompiled QuickJS bytecode (`JSNRBC01`)
+    /// or UTF-8 JavaScript source.
+    pub fn try_new_auto(bytes: Vec<u8>, args: String, text: TextEngine) -> Result<Self, String> {
+        Self::start(ScriptBundle::from_bytes(bytes)?, args, text, |_| Ok(()))
+    }
+
+    /// Configures how long `poll()` may wait for a just-sent event's reply before returning to draw the frame.
+    /// Defaults to 800 µs (or `JSNIR_WAIT_US`). Pass `Duration::ZERO` to disable bounded waiting.
+    pub fn set_wait_budget(&mut self, budget: Duration) {
+        self.wait_budget = budget;
     }
 
     /// Exposes `jsnirRequest(json)` to an embedded app. The handler runs on the app thread.
@@ -549,7 +739,7 @@ impl Host {
     ) -> Result<Self, String> {
         // Shared by every VM the app runs in, so a reloaded app keeps the same handler.
         let handler = Arc::new(Mutex::new(handler));
-        Self::start(script, args, text, move |ctx| {
+        Self::start(ScriptBundle::Source(script), args, text, move |ctx| {
             let handler = handler.clone();
             let request = Function::new(
                 ctx.clone(),
@@ -563,7 +753,7 @@ impl Host {
     }
 
     fn start(
-        script: String,
+        bundle: ScriptBundle,
         args: String,
         text: TextEngine,
         configure: impl for<'js> Fn(&Ctx<'js>) -> rquickjs::Result<()> + Send + 'static,
@@ -573,16 +763,21 @@ impl Host {
         let list_issuer = NEXT_LIST_ISSUER
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .map_err(|_| "virtual list issuer IDs exhausted".to_owned())?;
+        let wait_budget = std::env::var("JSNIR_WAIT_US")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(Duration::from_micros)
+            .unwrap_or(Duration::from_micros(800));
         let (mount, bridge) = spawn_app(
             Duration::ZERO,
             move |replica: Rc<RefCell<Replica>>| -> Result<Box<dyn App>, String> {
-                let vm = Vm::try_load_with(&script, replica.clone(), None, |c| {
+                let vm = Vm::try_load_bundle(&bundle, replica.clone(), None, |c| {
                     c.globals().set("__jsnirArgs", args.as_str())?;
                     configure(c)
                 })
                 .map_err(|error| format!("script failed to load: {error}"))?;
                 Ok(Box::new(HostApp {
-                    vm,
+                    vm: Box::new(vm),
                     replica,
                     args,
                     configure: Box::new(configure),
@@ -603,6 +798,8 @@ impl Host {
             list_vm: 0,
             bridge,
             pending: 0,
+            wait_budget,
+            sent_at: None,
             layout: Layout::default(),
             text,
             motion: Motion::default(),
@@ -626,12 +823,18 @@ impl Host {
             editor_dragging: false,
             published: Default::default(),
             hits: Vec::new(),
+            cursor_rects: Vec::new(),
             scrolls: Vec::new(),
             placements: HashMap::new(),
+            viewport_reporting: false,
+            reported_viewport: None,
             scroll: HashMap::new(),
             scroll_requests: HashMap::new(),
             anchors: HashMap::new(),
             drag: None,
+            node_drag: None,
+            pending_drag_move: None,
+            drag_moves_inflight: 0,
             images: HashMap::new(),
             image_generation: 0,
             font_epoch: 0,
@@ -640,6 +843,8 @@ impl Host {
             reduced_motion: false,
             inflight: VecDeque::new(),
             reload_results: VecDeque::new(),
+            dev_error: None,
+            dev_overlay_enabled: false,
         };
         host.receive(mount);
         if host.tree.root.is_none() {
@@ -684,6 +889,43 @@ impl Host {
     /// the new mounts. An unsuccessful reload does not clear the error.
     pub fn virtual_list_error(&self) -> Option<&str> {
         self.list_error.as_deref()
+    }
+
+    /// True while the SDK mount for this handle remains active.
+    pub fn virtual_list_mounted(&self, id: VirtualListId) -> bool {
+        self.virtual_lists.get(&id.node).is_some_and(|(generation, _)| id.matches(self.list_issuer, *generation))
+    }
+
+    /// Like `connect_virtual_list`, with the SDK row's natural height measured at the current width.
+    pub fn connect_measured_virtual_list(
+        &mut self,
+        name: &str,
+        rows: impl IntoIterator<Item = (u64, f32)>,
+        provide: impl FnMut(u64) -> Result<serde_json::Value, String> + Send + 'static,
+    ) -> Result<VirtualListId, String> {
+        let id = self.connect_virtual_list(name, rows, provide)?;
+        self.virtual_list_mut(id).unwrap().measured = true;
+        self.set_list_offset(id, ListOffset::Tail);
+        Ok(id)
+    }
+
+    /// Update the index and mark changed payloads while retaining mounted rows that belong to the new window.
+    /// Returns false if the list reply lane is in flight, allowing the embedder to retry on the next frame.
+    pub fn refresh_virtual_list(&mut self, id: VirtualListId, index: Option<&[(u64, f32)]>, changed: &[u64]) -> bool {
+        let Some(list) = self.virtual_list_mut(id) else { return false };
+        if list.reply.pending.is_some() { return false; }
+        let mut removed = Vec::new();
+        if let Some(index) = index {
+            let Some(rows) = list.rows.reordered(index) else { return false };
+            removed.extend(list.bindings.keys().copied().filter(|key| !rows.contains(*key)));
+            list.rows = rows;
+            if list.follow_tail { list.rows.set_viewport(list.rows.total(), list.rows.extent()); }
+            list.window_dirty = true;
+            if let Some(auto) = &mut list.auto { auto.ready = false; }
+        }
+        list.edited.extend(changed.iter().filter(|key| list.resident.contains(key)).copied());
+        for key in removed { self.unbind_virtual_row(id, key); }
+        true
     }
 
     /// Opts an existing List node into Rust-side demand, or replaces its input sequence.
@@ -762,6 +1004,12 @@ impl Host {
         true
     }
 
+    /// Bring a keyed row to the top of the viewport, clamped by remaining content.
+    pub fn scroll_list_to_row(&mut self, id: VirtualListId, key: u64) -> bool {
+        let Some(offset) = self.virtual_list_mut(id).and_then(|list| list.rows.top(key)) else { return false };
+        self.set_list_offset(id, ListOffset::Pixels(offset))
+    }
+
     /// Binds an existing direct child to an indexed key, one child per key and one key per child.
     /// Repeating the same binding is a no-op. Binding does not change demand or tree ownership.
     pub fn bind_virtual_row(&mut self, id: VirtualListId, key: u64, row: u16) -> bool {
@@ -811,6 +1059,7 @@ impl Host {
             }
         }
         self.hits.retain(|hit| !ids.contains(&hit.id));
+        self.cursor_rects.retain(|cursor| !ids.contains(&cursor.id));
         self.scrolls.retain(|scroll| !ids.contains(&scroll.id));
         for rects in [
             &mut self.group_rects,
@@ -829,6 +1078,10 @@ impl Host {
         self.hovered_boxes.retain(|id| !ids.contains(id));
         if self.drag.is_some_and(|(id, _)| ids.contains(&id)) {
             self.drag = None;
+        }
+        if self.node_drag.is_some_and(|drag| ids.contains(&drag.id)) {
+            self.node_drag = None;
+            self.pending_drag_move = None;
         }
     }
 
@@ -1109,37 +1362,59 @@ impl Host {
 
     /// Whether events are waiting for an answer from the app, or timers are due: keep polling.
     pub fn busy(&self) -> bool {
-        self.pending > 0 || !self.timers.is_empty() || !self.backlog.is_empty()
+        self.pending > 0
+            || !self.timers.is_empty()
+            || !self.backlog.is_empty()
+            || self.pending_drag_move.is_some()
+    }
+
+    fn has_inflight_reload(&self) -> bool {
+        self.inflight
+            .iter()
+            .any(|kind| matches!(kind, Inflight::Reload(_)))
+    }
+
+    fn can_send_now(&self) -> bool {
+        self.list_error.is_none()
+            && self.pending < MAX_PENDING
+            && self.list_ticket.is_none()
+            && (self.list_mounts.is_empty() || !self.has_inflight_reload())
+    }
+
+    fn queued_payload(&self, callback: u16, payload: EventPayload) -> QueuedEvent {
+        QueuedEvent {
+            guard: self.callback_guards.get(&callback).cloned(),
+            callback,
+            payload,
+        }
     }
 
     fn queued_event(&self, event: Event) -> QueuedEvent {
-        QueuedEvent {
-            guard: self.callback_guards.get(&event.callback).cloned(),
-            event,
-        }
+        self.queued_payload(event.callback, EventPayload::Text(event.text))
     }
 
     fn send(&mut self, event: Event) {
         self.send_queued(self.queued_event(event));
     }
 
+    fn send_payload(&mut self, callback: u16, payload: EventPayload) {
+        self.send_queued(self.queued_payload(callback, payload));
+    }
+
     fn send_queued(&mut self, queued: QueuedEvent) {
         if self.list_error.is_some()
-            || self.callback_guards.get(&queued.event.callback) != queued.guard.as_ref()
+            || self.callback_guards.get(&queued.callback) != queued.guard.as_ref()
         {
             return;
         }
-        if self.pending < MAX_PENDING
-            && self.list_ticket.is_none()
-            && (self.list_mounts.is_empty() || !self.inflight.contains(&true))
-        {
-            let message = match queued.guard {
-                Some(guard) => Inbox::Guarded(queued.event, guard),
-                None => Inbox::Event(queued.event),
-            };
-            self.bridge.events.try_send(message).expect("event queue");
+        if self.can_send_now() {
+            self.bridge
+                .events
+                .try_send(queued.into_inbox())
+                .expect("event queue");
             self.pending += 1;
-            self.inflight.push_back(false);
+            self.inflight.push_back(Inflight::Event);
+            self.sent_at = Some(Instant::now());
         } else {
             self.backlog.push(queued);
         }
@@ -1155,24 +1430,51 @@ impl Host {
 
     /// Replaces the app with `script` (SDK + app) without restarting: the window, the program's connection and
     /// the native state of the tree stay. Signals keep their values where the new code creates them in the same
-    /// order with the same initial value. Focus, a field's text and selection, and scroll offsets stay on the nodes
-    /// that keep their place in the tree. Returns false when the event queue is full. The outcome is reported by
-    /// `take_reload_result` once `poll` has applied it; on failure the previous app keeps running.
+    /// order with the same initial value (or matching key). Focus, a field's text and selection, and scroll offsets
+    /// stay on the nodes that keep their place in the tree. Returns false when the event queue is full. The outcome
+    /// is reported by `take_reload_result` once `poll` has applied it; on failure the previous app keeps running.
     pub fn reload(&mut self, script: String) -> bool {
+        self.reload_inner(script, true)
+    }
+
+    /// Like `reload`, but resets all JS signals and native focus/scroll state instead of preserving them.
+    pub fn hard_reload(&mut self, script: String) -> bool {
+        self.reload_inner(script, false)
+    }
+
+    fn reload_inner(&mut self, script: String, preserve_state: bool) -> bool {
         if self.pending == MAX_PENDING
             || self.list_ticket.is_some()
             || (!self.list_mounts.is_empty()
-                && (!self.backlog.is_empty() || self.inflight.contains(&true)))
+                && (!self.backlog.is_empty() || self.has_inflight_reload()))
         {
             return false;
         }
         self.bridge
             .events
-            .try_send(Inbox::Reload(script))
+            .try_send(Inbox::Reload(script, preserve_state))
             .expect("event queue");
         self.pending += 1;
-        self.inflight.push_back(true);
+        self.inflight.push_back(Inflight::Reload(preserve_state));
         true
+    }
+
+    /// Enables showing reload errors automatically in the native error overlay.
+    pub fn enable_dev_overlay(&mut self, enabled: bool) {
+        self.dev_overlay_enabled = enabled;
+        if !enabled {
+            self.dev_error = None;
+        }
+    }
+
+    /// Shows or clears the native development error overlay above the app.
+    pub fn set_dev_error(&mut self, error: Option<DevError>) {
+        self.dev_error = error;
+    }
+
+    /// The currently displayed development error overlay, if any.
+    pub fn dev_error(&self) -> Option<&DevError> {
+        self.dev_error.as_ref()
     }
 
     /// The outcome of the next reload that `poll` has applied: `Err` when the new code failed to load or mount.
@@ -1236,14 +1538,16 @@ impl Host {
         self.images.remove(source);
     }
 
-    /// Fires due timers and applies the batches that arrived.
+    /// Fires due timers and applies the batches that arrived. When an event was just sent within
+    /// `wait_budget` (default 800 µs), waits up to that deadline so fast JS answers land in the current frame
+    /// without delaying frames when JS is slow.
     pub fn poll(&mut self) {
         let now = self.now();
         let guards = &self.callback_guards;
         let (due, waiting): (Vec<_>, Vec<_>) = self
             .timers
             .drain(..)
-            .filter(|(_, event)| guards.get(&event.event.callback) == event.guard.as_ref())
+            .filter(|(_, event)| guards.get(&event.callback) == event.guard.as_ref())
             .partition(|(at, _)| *at <= now);
         self.timers = waiting;
         let backlog = std::mem::take(&mut self.backlog);
@@ -1253,26 +1557,58 @@ impl Host {
         {
             self.send_queued(event);
         }
+        let deadline = self
+            .sent_at
+            .filter(|_| !self.wait_budget.is_zero())
+            .map(|t| t + self.wait_budget);
         while self.pending > 0 {
-            match self.bridge.updates.try_recv() {
+            let wait = deadline.map_or(Duration::ZERO, |d| {
+                d.saturating_duration_since(Instant::now())
+            });
+            let received = if wait.is_zero() {
+                self.bridge.updates.try_recv().map_err(|e| match e {
+                    TryRecvError::Empty => RecvTimeoutError::Timeout,
+                    TryRecvError::Disconnected => RecvTimeoutError::Disconnected,
+                })
+            } else {
+                self.bridge.updates.recv_timeout(wait)
+            };
+            match received {
                 Ok(batch) => {
                     self.pending -= 1;
-                    if self.inflight.pop_front() == Some(true) {
-                        self.receive_reload(batch);
-                    } else if let Some(ticket) = self.list_ticket.take() {
-                        self.receive_list_reply(ticket, batch);
-                    } else {
-                        self.receive(batch);
+                    match self.inflight.pop_front() {
+                        Some(Inflight::Reload(preserve_state)) => {
+                            self.receive_reload(batch, preserve_state)
+                        }
+                        Some(Inflight::DragMove) => {
+                            self.drag_moves_inflight = self.drag_moves_inflight.saturating_sub(1);
+                            self.receive(batch);
+                        }
+                        _ => {
+                            if let Some(ticket) = self.list_ticket.take() {
+                                self.receive_list_reply(ticket, batch);
+                            } else {
+                                self.receive(batch);
+                            }
+                        }
                     }
                 }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => panic!("app thread disconnected"),
+                Err(RecvTimeoutError::Timeout) => {
+                    // Past the budget: slow answers never hold later frames.
+                    self.sent_at = None;
+                    break;
+                }
+                Err(RecvTimeoutError::Disconnected) => panic!("app thread disconnected"),
             }
         }
+        if self.pending == 0 {
+            self.sent_at = None;
+        }
+        self.flush_drag_move();
     }
 
-    // Applies the batch of a reload. The old tree's native state is kept only if the new code loaded.
-    fn receive_reload(&mut self, batch: Batch) {
+    // Applies the batch of a reload. The old tree's native state is kept only if the new code loaded and `preserve_state` is true.
+    fn receive_reload(&mut self, batch: Batch, preserve_state: bool) {
         // The app sends the outcome before the batch that carries it.
         let outcome = self
             .bridge
@@ -1284,14 +1620,33 @@ impl Host {
             // The app has already installed the new VM, even if its tree batch fails.
             self.list_vm = self.list_vm.checked_add(1).expect("VM epochs exhausted");
             self.callback_guards.clear();
+            self.reported_viewport = None;
             self.timers.retain(|(_, event)| event.guard.is_none());
+        } else if self.dev_overlay_enabled
+            && let Err(error) = &outcome
+        {
+            self.dev_error = Some(DevError {
+                title: "Reload failed".into(),
+                message: error.clone(),
+                location: None,
+                frame: None,
+            });
         }
         self.reload_results.push_back(outcome);
         let accepted = self.receive(batch);
         if let Some(kept) = kept {
             if accepted {
                 self.list_error = None;
+                self.dev_error = None;
             } else {
+                if self.dev_overlay_enabled {
+                    self.dev_error = Some(DevError {
+                        title: "Mount batch rejected".into(),
+                        message: "The reloaded app mounted an invalid UI batch.".into(),
+                        location: None,
+                        frame: None,
+                    });
+                }
                 if !self.list_mounts.is_empty() {
                     self.fail_list(
                         "reload replaced the VM but its mount batch was rejected".into(),
@@ -1306,7 +1661,16 @@ impl Host {
                     }
                 }
             }
-            self.restore(kept);
+            if preserve_state {
+                self.restore(kept);
+            } else {
+                self.pressed = None;
+                self.editor_dragging = false;
+                self.drag = None;
+                self.node_drag = None;
+                self.pending_drag_move = None;
+                self.focused = None;
+            }
         }
     }
 
@@ -1335,6 +1699,9 @@ impl Host {
         // A press or drag that began on the old tree ends with it.
         self.pressed = None;
         self.editor_dragging = false;
+        self.drag = None;
+        self.node_drag = None;
+        self.pending_drag_move = None;
         for (place, offset) in kept.scroll {
             if let Some(id) = self.find(&place) {
                 self.scroll.insert(id, offset);
@@ -1344,9 +1711,13 @@ impl Host {
             && let Some(id) = self.find(&place)
         {
             self.focus(Some(id));
-            if let Some(Node::Input { multiline, .. }) = self.tree.nodes.get(&id) {
-                let multiline = *multiline;
+            if let Some(Node::Input {
+                multiline, purpose, ..
+            }) = self.tree.nodes.get(&id)
+            {
+                let (multiline, password) = (*multiline, *purpose == InputPurpose::Password);
                 self.editor.reset(&text, selection, multiline);
+                self.editor.set_password(password);
                 self.publish(id);
             }
         }
@@ -1383,10 +1754,15 @@ impl Host {
         let mut texts = Vec::new();
         let mut list_metadata = Vec::new();
         let mut requests = Vec::new();
+        let mut focus_request = None;
         // Parents whose children were placed out of order, and moved nodes (their parent is known after the apply).
         let mut reordered = Vec::new();
         let mut moved = Vec::new();
-        for op in &batch.ops {
+        // Where in the batch each ID was last created and last mounted as a list: a recycled ID's mount counts only
+        // when it came after the ID's last creation (one pass, no per-create scan).
+        let mut last_create: HashMap<u16, usize> = HashMap::new();
+        let mut last_listed: HashMap<u16, usize> = HashMap::new();
+        for (index, op) in batch.ops.iter().enumerate() {
             match op {
                 Op::Remove { id } => {
                     removed.extend(self.tree.subtree(*id));
@@ -1405,6 +1781,7 @@ impl Host {
                 Op::Create {
                     id, parent, before, ..
                 } => {
+                    last_create.insert(*id, index);
                     created.push((*id, *parent));
                     if before.is_some() {
                         reordered.extend(*parent);
@@ -1415,8 +1792,12 @@ impl Host {
                     restyled.push(*id);
                 }
                 Op::SetStyle { id, .. } => restyled.push(*id),
-                Op::SetText { id, .. } | Op::SetSpans { id, .. } => texts.push(*id),
+                Op::SetText { id, .. } | Op::SetSpans { id, .. } | Op::SetField { id, .. } => texts.push(*id),
+                Op::Focus { id } => focus_request = Some(*id),
                 Op::After { .. } | Op::VirtualList { .. } | Op::CallbackGuard { .. } => {
+                    if let Op::VirtualList { id, .. } = op {
+                        last_listed.insert(*id, index);
+                    }
                     list_metadata.push(op.clone());
                 }
                 Op::ScrollTo {
@@ -1449,7 +1830,17 @@ impl Host {
                 reply.invalidated = true;
             }
         }
-        self.scroll_requests.extend(requests);
+        for (id, request) in requests {
+            if let Some((_, list)) = self.virtual_lists.get_mut(&id)
+                && let Some(auto) = &mut list.auto
+            {
+                auto.requested = Some(if matches!(request.to, Some(ScrollEdge::End)) {
+                    ListOffset::Tail
+                } else { ListOffset::Pixels(f64::from(request.offset.unwrap_or(0.))) });
+            } else {
+                self.scroll_requests.insert(id, request);
+            }
+        }
         // Nodes created and removed in the same batch are gone too.
         removed.extend(
             created
@@ -1482,7 +1873,30 @@ impl Host {
         if self.focused.is_some_and(|f| removed.contains(&f)) {
             self.focused = None;
         }
-        for (id, parent) in created {
+        if self.pressed.is_some_and(|p| removed.contains(&p) || !self.pressable(p)) {
+            self.pressed = None;
+        }
+        if let Some(drag) = self.node_drag {
+            if removed.contains(&drag.id) {
+                self.node_drag = None;
+                self.pending_drag_move = None;
+            } else if matches!(
+                self.tree.nodes.get(&drag.id),
+                Some(Node::Box { disabled: true, .. })
+            ) {
+                self.finish_node_drag(true);
+            }
+        }
+        // An ID the batch recycled was created more than once, and one created then removed is gone: layout gets only
+        // the last creation of each ID that is still in the tree, so it never hangs a node from a stale parent.
+        let mut seen = HashSet::new();
+        let mut last: Vec<(u16, Option<u16>)> = created
+            .into_iter()
+            .rev()
+            .filter(|(id, _)| seen.insert(*id) && self.tree.nodes.get(id).is_some())
+            .collect();
+        last.reverse();
+        for (id, parent) in last {
             self.layout.created(&self.tree, id, parent);
         }
         let moved = moved.into_iter().filter_map(|id| self.tree.parent(id));
@@ -1494,6 +1908,25 @@ impl Host {
         }
         for id in texts {
             self.layout.text_changed(id);
+            if self.focused == Some(id)
+                && let Some(Node::Input {
+                    text,
+                    selection,
+                    multiline,
+                    purpose,
+                    ..
+                }) = self.tree.nodes.get(&id)
+                && (&self.published.0 != text || self.published.1 != *selection)
+            {
+                self.editor.reset(text, *selection, *multiline);
+                self.editor
+                    .set_password(*purpose == InputPurpose::Password);
+                self.published = (text.clone(), *selection);
+                self.editor_key = None;
+            }
+        }
+        if let Some(id) = focus_request {
+            self.focus(Some(id));
         }
         let now = self.now();
         for op in list_metadata {
@@ -1505,7 +1938,10 @@ impl Host {
                     });
                     self.timers.push((now + f64::from(ms), event));
                 }
-                Op::VirtualList { id, name } if self.tree.nodes.get(&id).is_some() => {
+                Op::VirtualList { id, name }
+                    if matches!(self.tree.nodes.get(&id), Some(Node::List { .. }))
+                        && last_create.get(&id) < last_listed.get(&id) =>
+                {
                     self.list_mounts.insert(id, name);
                 }
                 Op::CallbackGuard {
@@ -1528,17 +1964,58 @@ impl Host {
 
     // ---------- Input ----------
 
-    // The topmost thing under `point`: the last one drawn, which is the highest layer's and the latest in it.
-    fn top_hit(&self, point: [f32; 2]) -> Option<(u16, i32)> {
+    // The topmost thing under `point` and its index in `hits`: the last one drawn, which is the highest layer's and
+    // the latest in it.
+    fn top_hit_indexed(&self, point: [f32; 2]) -> Option<(usize, u16, i32)> {
         self.hits
             .iter()
+            .enumerate()
             .rev()
-            .find(|h| contains(h.rect, point) && self.row_input_at(h.id, Some(point)))
-            .map(|h| (h.id, h.layer))
+            .find(|(_, h)| contains(h.rect, point) && self.row_input_at(h.id, Some(point)))
+            .map(|(index, h)| (index, h.id, h.layer))
+    }
+
+    // The topmost thing under `point`: the last one drawn, which is the highest layer's and the latest in it.
+    fn top_hit(&self, point: [f32; 2]) -> Option<(u16, i32)> {
+        self.top_hit_indexed(point).map(|(_, id, layer)| (id, layer))
     }
 
     fn hit(&self, point: [f32; 2]) -> Option<u16> {
         self.top_hit(point).map(|(id, _)| id)
+    }
+
+    // The topmost primary-button target under `point`: an Input, a disabled Box, or a Box with `press` or `drag`.
+    // Walks up through non-primary boxes (such as a `contextmenu`-only child) without crossing a layer boundary.
+    fn primary_target(&self, point: [f32; 2]) -> Option<u16> {
+        let top = self.hit(point)?;
+        let mut node = top;
+        loop {
+            let is_primary = match self.tree.nodes.get(&node)? {
+                Node::Input { .. } | Node::Box { disabled: true, .. } => true,
+                Node::Box { press, drag, .. } => *press != 0 || *drag != 0,
+                _ => false,
+            };
+            if is_primary
+                && (node == top
+                    || self.hits.iter().any(|h| {
+                        h.id == node
+                            && contains(h.rect, point)
+                            && self.row_input_at(node, Some(point))
+                    }))
+            {
+                return Some(node);
+            }
+            let layered = self
+                .tree
+                .nodes
+                .get(&node)
+                .and_then(Node::style)
+                .is_some_and(|s| s.position == Position::Fixed || s.layer.is_some());
+            if layered {
+                return None;
+            }
+            node = self.tree.parent(node)?;
+        }
     }
 
     // Whether a node of `layer` is covered at the pointer by a higher layer: the topmost thing under it is above
@@ -1820,10 +2297,185 @@ impl Host {
         matches!(self.tree.nodes.get(&id), Some(Node::Box { press, disabled: false, .. }) if *press != 0)
     }
 
+    fn draggable(&self, id: u16) -> bool {
+        matches!(self.tree.nodes.get(&id), Some(Node::Box { drag, disabled: false, .. }) if *drag != 0)
+    }
+
+    fn interactive(&self, id: u16) -> bool {
+        self.pressable(id) || self.draggable(id)
+    }
+
+    fn drag_callback(&self, id: u16, allow_disabled: bool) -> Option<u16> {
+        if !self.row_can_receive(id) {
+            return None;
+        }
+        match self.tree.nodes.get(&id) {
+            Some(Node::Box { drag, disabled, .. })
+                if *drag != 0 && (allow_disabled || !disabled) =>
+            {
+                Some(*drag)
+            }
+            _ => None,
+        }
+    }
+
+    fn flush_drag_move(&mut self) {
+        if self.drag_moves_inflight > 0 || !self.backlog.is_empty() || !self.can_send_now() {
+            return;
+        }
+        let Some(point) = self.pending_drag_move.take() else {
+            return;
+        };
+        let Some(drag) = self.node_drag else {
+            return;
+        };
+        let Some(callback) = self.drag_callback(drag.id, false) else {
+            self.node_drag = None;
+            return;
+        };
+        let queued = self.queued_payload(
+            callback,
+            EventPayload::Drag {
+                phase: 1,
+                x: point[0],
+                y: point[1],
+                sx: drag.start[0],
+                sy: drag.start[1],
+                dx: point[0] - drag.start[0],
+                dy: point[1] - drag.start[1],
+            },
+        );
+        if self.callback_guards.get(&queued.callback) != queued.guard.as_ref() {
+            return;
+        }
+        self.bridge
+            .events
+            .try_send(queued.into_inbox())
+            .expect("event queue");
+        self.pending += 1;
+        self.drag_moves_inflight += 1;
+        self.inflight.push_back(Inflight::DragMove);
+        self.sent_at = Some(Instant::now());
+    }
+
+    // Ends the active node drag, flushing any coalesced move before sending `"end"`.
+    // Returns `(had_drag, moved)`.
+    fn finish_node_drag(&mut self, allow_disabled: bool) -> (bool, bool) {
+        let Some(drag) = self.node_drag.take() else {
+            self.pending_drag_move = None;
+            return (false, false);
+        };
+        let pending_move = self.pending_drag_move.take();
+        if let Some(callback) = self.drag_callback(drag.id, allow_disabled) {
+            if let Some(point) = pending_move {
+                self.send_payload(
+                    callback,
+                    EventPayload::Drag {
+                        phase: 1,
+                        x: point[0],
+                        y: point[1],
+                        sx: drag.start[0],
+                        sy: drag.start[1],
+                        dx: point[0] - drag.start[0],
+                        dy: point[1] - drag.start[1],
+                    },
+                );
+            }
+            self.send_payload(
+                callback,
+                EventPayload::Drag {
+                    phase: 2,
+                    x: drag.last[0],
+                    y: drag.last[1],
+                    sx: drag.start[0],
+                    sy: drag.start[1],
+                    dx: drag.last[0] - drag.start[0],
+                    dy: drag.last[1] - drag.start[1],
+                },
+            );
+        }
+        (true, drag.moved)
+    }
+
+    fn node_cursor(&self, id: u16) -> Option<Cursor> {
+        let node = self.tree.nodes.get(&id)?;
+        if matches!(node, Node::Box { disabled: true, .. }) {
+            return Some(Cursor::NotAllowed);
+        }
+        if let Some(paint) = node.paint()
+            && let Some(cursor) = self.variant(id, paint, false).cursor.or(paint.cursor)
+        {
+            return Some(cursor);
+        }
+        match node {
+            Node::Input { .. } => Some(Cursor::Text),
+            Node::Box { press, .. } if *press != 0 => Some(Cursor::Pointer),
+            _ => None,
+        }
+    }
+
+    /// Pointer shape for what is under the pointer, or for the node currently being dragged.
+    pub fn cursor(&self) -> Cursor {
+        if let Some(drag) = self.node_drag
+            && self.row_can_receive(drag.id)
+        {
+            return self
+                .tree
+                .nodes
+                .get(&drag.id)
+                .and_then(Node::paint)
+                .and_then(|paint| self.variant(drag.id, paint, false).cursor.or(paint.cursor))
+                .unwrap_or(Cursor::Default);
+        }
+        let Some(point) = self.pointer else {
+            return Cursor::Default;
+        };
+        let top = self.top_hit_indexed(point);
+        let top_pair = top.map(|(_, id, layer)| (id, layer));
+        if let Some(cursor) = self.cursor_rects.iter().rev().find_map(|c| {
+            if !contains(c.rect, point)
+                || !self.row_input_at(c.id, Some(point))
+                || self.covered(top_pair, c.layer, c.id)
+            {
+                return None;
+            }
+            if let Some((top_idx, _, top_layer)) = top
+                && (c.layer < top_layer || (c.layer == top_layer && c.after_hits <= top_idx))
+            {
+                return None;
+            }
+            self.node_cursor(c.id)
+        }) {
+            return cursor;
+        }
+        self.primary_target(point)
+            .and_then(|id| self.node_cursor(id))
+            .unwrap_or(Cursor::Default)
+    }
+
     /// The pointer moved. Returns the cursor shape for what is under it.
     pub fn pointer_move(&mut self, point: Option<[f32; 2]>) -> Cursor {
+        let point = point.filter(|p| p.iter().all(|v| v.is_finite()));
         self.pointer = point;
-        self.refresh_hover();
+        if let Some(mut drag) = self.node_drag {
+            if let Some(p) = point {
+                if self.drag_callback(drag.id, false).is_some() {
+                    if p != drag.last {
+                        drag.last = p;
+                        drag.moved = true;
+                        self.node_drag = Some(drag);
+                        self.pending_drag_move = Some(p);
+                        self.flush_drag_move();
+                    }
+                } else {
+                    self.node_drag = None;
+                    self.pending_drag_move = None;
+                    self.refresh_hover();
+                }
+            }
+        } else {
+            self.refresh_hover();
+        }
         if let (Some((id, grab)), Some(p)) = (self.drag, point)
             && self.row_can_receive(id)
             && let Some(s) = self.scrolls.iter().find(|s| s.id == id)
@@ -1836,7 +2488,6 @@ impl Host {
             self.motion.release(id, Channel::Scroll);
             self.scroll.insert(id, offset);
         }
-        let hit = point.and_then(|p| self.hit(p));
         if let (Some(id), Some(p)) = (self.focused, point)
             && self.pressed.is_none()
             && self.editor_dragging
@@ -1848,33 +2499,51 @@ impl Host {
                 select: PointSelection::Extend,
             }]);
         }
-        match hit.and_then(|id| self.tree.nodes.get(&id)) {
-            Some(Node::Input { .. }) => Cursor::Text,
-            Some(Node::Box { disabled: true, .. }) => Cursor::NotAllowed,
-            Some(Node::Box { press, .. }) if *press != 0 => Cursor::Pointer,
-            _ => Cursor::Default,
-        }
+        self.cursor()
     }
 
     /// Primary button pressed. `select` comes from the click count (word, all) and modifiers.
     pub fn pointer_down(&mut self, select: PointSelection) {
         let Some(point) = self.pointer else { return };
+        self.finish_node_drag(false);
         self.dismiss_outside(point);
         self.pressed_groups = self.hovered_groups.clone();
         if self.press_scrollbar(point) {
             return;
         }
-        let hit = self.hit(point);
-        match hit.and_then(|id| self.tree.nodes.get(&id)) {
+        let target = self.primary_target(point);
+        match target.and_then(|id| self.tree.nodes.get(&id)) {
             Some(Node::Input { .. }) => {
-                let id = hit.unwrap();
+                let id = target.unwrap();
                 self.focus(Some(id));
                 let (x, y) = self.field_point(id, point);
                 self.edit(&[EditorEvent::Point { x, y, select }]);
                 self.editor_dragging = true;
             }
             _ => {
-                self.pressed = hit.filter(|id| self.pressable(*id));
+                self.pressed = target.filter(|id| self.pressable(*id));
+                if let Some(id) = target
+                    && let Some(callback) = self.drag_callback(id, false)
+                {
+                    self.node_drag = Some(NodeDrag {
+                        id,
+                        start: point,
+                        last: point,
+                        moved: false,
+                    });
+                    self.send_payload(
+                        callback,
+                        EventPayload::Drag {
+                            phase: 0,
+                            x: point[0],
+                            y: point[1],
+                            sx: point[0],
+                            sy: point[1],
+                            dx: 0.,
+                            dy: 0.,
+                        },
+                    );
+                }
                 if self.pressed.is_none() {
                     self.focus(None);
                 }
@@ -1887,10 +2556,11 @@ impl Host {
         self.editor_dragging = false;
         self.drag = None;
         self.pressed_groups.clear();
-        let Some(id) = self.pressed.take() else {
-            return;
-        };
-        if self.pointer.and_then(|p| self.hit(p)) == Some(id)
+        let (had_drag, moved) = self.finish_node_drag(false);
+        let pressed = self.pressed.take();
+        if let Some(id) = pressed
+            && !moved
+            && self.pointer.and_then(|p| self.primary_target(p)) == Some(id)
             && let Some(Node::Box { press, .. }) = self.tree.nodes.get(&id)
         {
             let callback = *press;
@@ -1898,6 +2568,21 @@ impl Host {
                 callback,
                 text: String::new(),
             });
+        }
+        if had_drag {
+            self.refresh_hover();
+        }
+    }
+
+    /// Cancels any active pointer press or drag (e.g. when the window loses focus).
+    pub fn pointer_cancel(&mut self) {
+        self.editor_dragging = false;
+        self.drag = None;
+        self.pressed = None;
+        self.pressed_groups.clear();
+        let (had_drag, _) = self.finish_node_drag(false);
+        if had_drag {
+            self.refresh_hover();
         }
     }
 
@@ -1924,16 +2609,21 @@ impl Host {
         if let Some(id) = target
             && let Some(Node::Box { contextmenu, .. }) = self.tree.nodes.get(&id)
         {
-            let text = serde_json::json!({ "x": point[0], "y": point[1] }).to_string();
-            self.send(Event {
-                callback: *contextmenu,
-                text,
-            });
+            self.send_payload(
+                *contextmenu,
+                EventPayload::ContextMenu {
+                    x: point[0],
+                    y: point[1],
+                },
+            );
         }
     }
 
-    /// Escape was pressed: every box that is drawn with a `dismiss` callback is asked to close.
+    /// Escape was pressed: dismisses the development error overlay if shown, otherwise asks every box with a `dismiss` callback to close.
     pub fn escape(&mut self) {
+        if self.dev_error.take().is_some() {
+            return;
+        }
         let ids: Vec<u16> = self.dismiss_rects.iter().map(|(id, _, _)| *id).collect();
         for id in ids {
             self.dismiss(id);
@@ -2016,11 +2706,18 @@ impl Host {
             text,
             selection,
             multiline,
+            purpose,
             ..
         }) = id.and_then(|id| self.tree.nodes.get(&id))
         {
-            let (text, selection, multiline) = (text.clone(), *selection, *multiline);
+            let (text, selection, multiline, password) = (
+                text.clone(),
+                *selection,
+                *multiline,
+                *purpose == InputPurpose::Password,
+            );
             self.editor.reset(&text, selection, multiline);
+            self.editor.set_password(password);
             self.published = (text, selection);
             self.editor_key = None;
         }
@@ -2036,6 +2733,28 @@ impl Host {
         self.focused.is_some_and(|id| self.row_can_receive(id))
     }
 
+    /// Cross-platform IME state for the focused field (purpose, whether IME is allowed, and surrounding text).
+    pub fn ime_state(&self) -> ImeState {
+        let Some(id) = self.focused.filter(|&id| self.row_can_receive(id)) else {
+            return ImeState {
+                allowed: false,
+                purpose: InputPurpose::Normal,
+                surrounding: None,
+            };
+        };
+        let purpose = match self.tree.nodes.get(&id) {
+            Some(Node::Input { purpose, .. }) => *purpose,
+            _ => InputPurpose::Normal,
+        };
+        let allowed = purpose != InputPurpose::Password;
+        let surrounding = allowed.then(|| self.editor.surrounding_text(4000));
+        ImeState {
+            allowed,
+            purpose,
+            surrounding,
+        }
+    }
+
     pub fn composing(&self) -> bool {
         self.focused() && self.editor.composing()
     }
@@ -2049,7 +2768,9 @@ impl Host {
         let composing = self.editor.composing()
             || events.iter().any(|e| match e {
                 EditorEvent::Commit(_) => true,
-                EditorEvent::Preedit { text, .. } => !text.is_empty(),
+                EditorEvent::Preedit { text, .. } | EditorEvent::PreeditSegments { text, .. } => {
+                    !text.is_empty()
+                }
                 _ => false,
             });
         // Motions wrap where the field is laid out, which may be before the next frame draws it.
@@ -2072,12 +2793,13 @@ impl Host {
                     submit,
                     multiline,
                     submit_on_enter,
+                    retain_on_submit,
                     ..
                 }) = self.tree.nodes.get(&id)
                 else {
                     continue;
                 };
-                let (submit, multiline, submit_on_enter) = (*submit, *multiline, *submit_on_enter);
+                let (submit, multiline, submit_on_enter, retain_on_submit) = (*submit, *multiline, *submit_on_enter, *retain_on_submit);
                 if composing {
                     continue;
                 }
@@ -2085,7 +2807,7 @@ impl Host {
                     self.editor.handle(&mut self.text, &EditorEvent::LineBreak);
                 } else if submit != 0 {
                     let text = self.editor.text().into_owned();
-                    if multiline {
+                    if multiline && !retain_on_submit {
                         // A multi-line field clears itself as it submits, as the chat does: the app hears of the cleared field first.
                         self.editor.reset("", [0, 0], true);
                         self.publish(id);
@@ -2198,8 +2920,18 @@ impl Host {
 
     // ---------- Frame ----------
 
+    /// Sends `{"jsnirViewport":[width,height]}` to `onHost` on the first frame, on
+    /// logical size changes, and after VM replacement. Offscreen frames use the same units.
+    pub fn enable_viewport_reporting(&mut self) {
+        self.viewport_reporting = true;
+    }
+
     /// Lays out the tree for the window and returns what to draw.
     pub fn frame(&mut self, width: f32, height: f32, scale: f32, max_side: usize) -> Frame {
+        if self.viewport_reporting && self.reported_viewport != Some([width, height]) {
+            self.reported_viewport = Some([width, height]);
+            self.push(serde_json::json!({"jsnirViewport": [width, height]}).to_string());
+        }
         let now = self.now();
         let (mut frame, mut placements) = self.render(width, height, scale, max_side, now);
         // A glide keeps hover frozen until it has been over for SCROLL_HOVER_IDLE_MS.
@@ -2209,12 +2941,13 @@ impl Host {
         if now < self.hover_frozen_until {
             // Keeps drawing until the idle time is over, so hover is then recomputed.
             frame.animating = true;
-        } else if self.refresh_hover() {
+        } else if self.node_drag.is_none() && self.refresh_hover() {
             // A layout change may have moved what is under the pointer. Draw changed hover at once and discard
             // placements from the provisional pass.
             (frame, placements) = self.render(width, height, scale, max_side, now);
         }
         self.commit_list_viewports();
+        frame.animating |= self.measure_virtual_rows();
         self.publish_placements(placements);
         self.publish_list_delta();
         frame
@@ -2223,7 +2956,11 @@ impl Host {
     fn publish_list_delta(&mut self) {
         // Start only at the head of the ordered lane. Until the answer is applied,
         // later callbacks stay on the UI side and cannot observe speculative state.
-        if self.pending != 0 || !self.backlog.is_empty() || self.list_error.is_some() {
+        if self.pending != 0
+            || !self.backlog.is_empty()
+            || self.pending_drag_move.is_some()
+            || self.list_error.is_some()
+        {
             return;
         }
         let ids: Vec<_> = self
@@ -2268,7 +3005,7 @@ impl Host {
                         .try_send(Inbox::List(payload))
                         .expect("event queue");
                     self.pending += 1;
-                    self.inflight.push_back(false);
+                    self.inflight.push_back(Inflight::Event);
                     self.list_ticket = Some(ticket);
                 }
                 Err(error) => self.fail_list(format!("virtual List payload: {error}")),
@@ -2303,6 +3040,7 @@ impl Host {
         self.list_error = Some(error);
         self.backlog.clear();
         self.timers.clear();
+        self.pending_drag_move = None;
     }
 
     fn commit_list_viewports(&mut self) {
@@ -2331,6 +3069,28 @@ impl Host {
         }
     }
 
+    fn measure_virtual_rows(&mut self) -> bool {
+        let mut any = false;
+        for (&node, (_, list)) in &mut self.virtual_lists {
+            if !list.measured { continue; }
+            let mut changed = false;
+            for row in self.layout.visible_rows(node) {
+                let (_, key) = self.bound_rows[row];
+                let height = self.tree.rect(*row)[3].max(1.);
+                if list.rows.height(key).is_some_and(|before| (before - height).abs() > 0.01) {
+                    changed |= list.rows.update_height(key, height) == Some(true);
+                }
+            }
+            if changed {
+                if list.follow_tail { list.rows.set_viewport(list.rows.total(), list.rows.extent()); }
+                list.window_dirty = true;
+                if let Some(auto) = &mut list.auto { auto.ready = false; }
+                any = true;
+            }
+        }
+        any
+    }
+
     fn render(
         &mut self,
         width: f32,
@@ -2347,6 +3107,8 @@ impl Host {
         let mut items = Vec::new();
         let mut hits = std::mem::take(&mut self.hits);
         hits.clear();
+        let mut cursors = std::mem::take(&mut self.cursor_rects);
+        cursors.clear();
         let mut scrolls = std::mem::take(&mut self.scrolls);
         scrolls.clear();
         let mut groups = std::mem::take(&mut self.group_rects);
@@ -2374,6 +3136,7 @@ impl Host {
             let mut walker = Walker {
                 items: &mut items,
                 hits: &mut hits,
+                cursors: &mut cursors,
                 scrolls: &mut scrolls,
                 groups: &mut groups,
                 hovers: &mut hovers,
@@ -2393,11 +3156,15 @@ impl Host {
             looping = walker.looping;
         }
         self.hits = hits;
+        self.cursor_rects = cursors;
         self.scrolls = scrolls;
         self.publish_scrolls();
         self.group_rects = groups;
         self.hover_rects = hovers;
         self.dismiss_rects = dismissers;
+        if self.dev_error.is_some() {
+            self.render_dev_error(&mut items, [0., 0., width, height]);
+        }
         (
             Frame {
                 items,
@@ -2406,6 +3173,228 @@ impl Host {
             },
             placements,
         )
+    }
+
+    fn render_dev_error(&mut self, items: &mut Vec<Item>, window: Rect) {
+        let Some(error) = self.dev_error.clone() else {
+            return;
+        };
+        let [_, _, width, height] = window;
+        // Translucent dark backdrop covering the whole window.
+        items.push(Item::Fill {
+            rect: window,
+            radius: [0.; 4],
+            top: [10, 12, 18, 215],
+            bottom: [10, 12, 18, 215],
+            clip: window,
+            round_clip: None,
+            mask: None,
+        });
+
+        let pad = 20.;
+        let card_w = (width - 64.).clamp(240., 760.).min(width - 16.).max(120.);
+        let content_w = (card_w - pad * 2.).max(80.);
+        let title_style = TextStyle::of(
+            &crate::tree::Font {
+                size: Some(16.),
+                weight: Some(700),
+                line_height: Some(1.35),
+                ..Default::default()
+            },
+            [248, 113, 113, 255],
+        );
+        let loc_style = TextStyle::of(
+            &crate::tree::Font {
+                size: Some(13.),
+                weight: Some(600),
+                line_height: Some(1.4),
+                ..Default::default()
+            },
+            [251, 191, 36, 255],
+        );
+        let body_style = TextStyle::of(
+            &crate::tree::Font {
+                size: Some(13.5),
+                weight: Some(400),
+                line_height: Some(1.45),
+                ..Default::default()
+            },
+            [241, 245, 249, 255],
+        );
+        let frame_style = TextStyle::of(
+            &crate::tree::Font {
+                size: Some(12.5),
+                weight: Some(400),
+                line_height: Some(1.45),
+                ..Default::default()
+            },
+            [203, 213, 225, 255],
+        );
+        let hint_style = TextStyle::of(
+            &crate::tree::Font {
+                size: Some(12.),
+                weight: Some(400),
+                line_height: Some(1.35),
+                ..Default::default()
+            },
+            [148, 163, 184, 255],
+        );
+
+        let mut measure = |text: &str, max_w: f32, style: &TextStyle| -> f32 {
+            self.text
+                .measure_styled(&node_spans(text, None), Some(max_w), style)[1]
+                .max(style.line_height)
+        };
+
+        let title_h = measure(&error.title, content_w, &title_style);
+        let loc_h = error
+            .location
+            .as_deref()
+            .map(|l| measure(l, content_w, &loc_style));
+        let msg_h = measure(&error.message, content_w, &body_style);
+        let frame_pad = 12.;
+        let frame_h = error
+            .frame
+            .as_deref()
+            .map(|f| measure(f, (content_w - frame_pad * 2.).max(60.), &frame_style));
+        let hint = "Press Esc to dismiss · save a file to reload";
+        let hint_h = measure(hint, content_w, &hint_style);
+
+        let mut inner_h = title_h + 10. + msg_h + 14. + hint_h;
+        if let Some(h) = loc_h {
+            inner_h += h + 6.;
+        }
+        if let Some(h) = frame_h {
+            inner_h += h + frame_pad * 2. + 12.;
+        }
+        let card_h = (inner_h + pad * 2. + 4.).min((height - 48.).max(140.));
+        let card_x = ((width - card_w) / 2.).max(8.);
+        let card_y = ((height - card_h) / 2.).clamp(16., 72.);
+        let card = [card_x, card_y, card_w, card_h];
+        let card_radius = [10.; 4];
+        let card_clip = intersect(card, window);
+
+        items.push(Item::Shadow {
+            rect: card,
+            radius: 10.,
+            shadow: ShadowSpec {
+                y: 12.,
+                blur: 32.,
+                spread: 0.,
+                color: [0, 0, 0, 160],
+            },
+            clip: window,
+            round_clip: None,
+        });
+        items.push(Item::Fill {
+            rect: card,
+            radius: card_radius,
+            top: [24, 27, 36, 255],
+            bottom: [20, 23, 31, 255],
+            clip: window,
+            round_clip: None,
+            mask: None,
+        });
+        // Red top bar clipped to the rounded card corners.
+        items.push(Item::Fill {
+            rect: [card_x, card_y, card_w, 4.],
+            radius: [0.; 4],
+            top: [239, 68, 68, 255],
+            bottom: [239, 68, 68, 255],
+            clip: card_clip,
+            round_clip: Some((card, card_radius)),
+            mask: None,
+        });
+        items.push(Item::Inset {
+            rect: card,
+            radius: card_radius,
+            spread: 1.,
+            offset: [0., 0.],
+            color: [255, 255, 255, 24],
+            clip: window,
+            round_clip: None,
+            mask: None,
+        });
+
+        let mut y = card_y + pad + 4.;
+        let x = card_x + pad;
+        items.push(Item::Text {
+            rect: [x, y, content_w, title_h],
+            text: error.title,
+            spans: None,
+            style: title_style,
+            wrap: true,
+            zoom: 1.,
+            clip: card_clip,
+            round_clip: Some((card, card_radius)),
+        });
+        y += title_h + 6.;
+
+        if let (Some(loc), Some(h)) = (error.location, loc_h) {
+            items.push(Item::Text {
+                rect: [x, y, content_w, h],
+                text: loc,
+                spans: None,
+                style: loc_style,
+                wrap: true,
+                zoom: 1.,
+                clip: card_clip,
+                round_clip: Some((card, card_radius)),
+            });
+            y += h + 6.;
+        }
+
+        items.push(Item::Text {
+            rect: [x, y, content_w, msg_h],
+            text: error.message,
+            spans: None,
+            style: body_style,
+            wrap: true,
+            zoom: 1.,
+            clip: card_clip,
+            round_clip: Some((card, card_radius)),
+        });
+        y += msg_h + 12.;
+
+        if let (Some(frame), Some(h)) = (error.frame, frame_h) {
+            let well = [x, y, content_w, h + frame_pad * 2.];
+            items.push(Item::Fill {
+                rect: well,
+                radius: [6.; 4],
+                top: [14, 16, 23, 255],
+                bottom: [14, 16, 23, 255],
+                clip: card_clip,
+                round_clip: Some((card, card_radius)),
+                mask: None,
+            });
+            items.push(Item::Text {
+                rect: [
+                    x + frame_pad,
+                    y + frame_pad,
+                    (content_w - frame_pad * 2.).max(60.),
+                    h,
+                ],
+                text: frame,
+                spans: None,
+                style: frame_style,
+                wrap: true,
+                zoom: 1.,
+                clip: intersect(well, card_clip),
+                round_clip: Some((well, [6.; 4])),
+            });
+            y += well[3] + 12.;
+        }
+
+        items.push(Item::Text {
+            rect: [x, y, content_w, hint_h],
+            text: hint.into(),
+            spans: None,
+            style: hint_style,
+            wrap: true,
+            zoom: 1.,
+            clip: card_clip,
+            round_clip: Some((card, card_radius)),
+        });
     }
 
     fn publish_placements(&mut self, placements: Vec<(u16, Placement)>) {
@@ -2446,28 +3435,17 @@ impl Host {
         let mut ops = Vec::new();
         let mut events = Vec::new();
         for s in &self.scrolls {
-            if s.list_generation.is_some() {
-                continue;
-            }
             let scroll = [s.top, s.max + s.view, s.view];
             let before = self.tree.scroll(s.id);
             if before == scroll {
                 continue;
             }
             ops.push(Op::SetScroll { id: s.id, scroll });
-            if before[0] != s.top
-                && let Some(Node::Box {
-                    scroll: callback, ..
-                }) = self.tree.nodes.get(&s.id)
+            if (s.list_generation.is_some() || before[0] != s.top)
+                && let Some(Node::Box { scroll: callback, .. } | Node::List { scroll: callback, .. }) = self.tree.nodes.get(&s.id)
                 && *callback != 0
             {
-                events.push(Event {
-                    callback: *callback,
-                    text: format!(
-                        r#"{{"top":{},"height":{},"client":{}}}"#,
-                        scroll[0], scroll[1], scroll[2]
-                    ),
-                });
+                events.push((*callback, scroll));
             }
         }
         if ops.is_empty() {
@@ -2476,8 +3454,15 @@ impl Host {
         let batch = Batch { base: 0, ops };
         self.tree.apply_ui(batch.clone()).expect("scroll batch");
         let _ = self.bridge.log.send(Log::Ui(batch));
-        for event in events {
-            self.send(event);
+        for (callback, [top, height, client]) in events {
+            self.send_payload(
+                callback,
+                EventPayload::Scroll {
+                    top,
+                    height,
+                    client,
+                },
+            );
         }
     }
 
@@ -2492,7 +3477,10 @@ impl Host {
     // a hover callback. Calls the hover callbacks of the boxes it entered or left. Returns whether any of it changed.
     fn refresh_hover(&mut self) -> bool {
         let top = self.pointer.and_then(|p| self.top_hit(p));
-        let hovered = top.map(|(id, _)| id).filter(|id| self.pressable(*id));
+        let hovered = self
+            .pointer
+            .and_then(|p| self.primary_target(p))
+            .filter(|id| self.interactive(*id));
         let groups: Vec<u16> = self
             .group_rects
             .iter()
@@ -2551,9 +3539,10 @@ impl Host {
             let hovered = self.hovered_groups.contains(&g);
             (hovered, hovered && self.pressed_groups.contains(&g))
         };
+        let dragging = self.node_drag.is_some_and(|d| d.id == id);
         let own = (
-            self.hovered == Some(id),
-            self.pressed == Some(id) && self.hovered == Some(id),
+            self.hovered == Some(id) || dragging,
+            (self.pressed == Some(id) && self.hovered == Some(id)) || dragging,
         );
         let (ancestor_hover, ancestor_active) =
             self.nearest_group(id).map_or((false, false), group);
@@ -2606,6 +3595,7 @@ impl Host {
                     height: v.height.or(out.height),
                     width: v.width.or(out.width),
                     underline: v.underline.or(out.underline),
+                    cursor: v.cursor.or(out.cursor),
                 };
             }
         }
@@ -2671,7 +3661,7 @@ impl Host {
                     rows.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
                     Some(
                         rows.into_iter()
-                            .map(|(row, top, pixels)| (row, (top - offset) as f32, pixels as f32))
+                            .map(|(row, top, pixels)| (row, (top - offset) as f32, (!list.measured).then_some(pixels as f32)))
                             .collect(),
                     )
                 })
@@ -2914,6 +3904,7 @@ impl Context {
 struct Walker<'a> {
     items: &'a mut Vec<Item>,
     hits: &'a mut Vec<Hit>,
+    cursors: &'a mut Vec<CursorHit>,
     scrolls: &'a mut Vec<Scroll>,
     groups: &'a mut Vec<(u16, Rect, i32)>,
     hovers: &'a mut Vec<(u16, Rect, i32)>,
@@ -3271,18 +4262,47 @@ impl Walker<'_> {
                 let color = inner.color(edge);
                 if let Some(sides) = paint.edge_sides {
                     // Each side is a band inside the rectangle. The bands do not overlap, so a translucent edge
-                    // does not darken where two meet. With a radius, a band is the rounded ring clipped to its
-                    // strip, so the outer corners stay round; without one, it is a plain rectangle.
+                    // does not darken where two meet. Without a radius, a band is a plain rectangle. With one, each
+                    // piece is the rounded ring clipped to it: the straight strips, and each corner square (radius
+                    // by radius) drawn once, by the top or bottom side if it has a width, else by the left or right.
+                    // So a corner keeps its arc even when only one of its sides has an edge.
                     let [top, right, bottom, left] = sides.map(|w| w * inner.k);
                     let [x, y, w, h] = screen;
-                    let middle = (h - top - bottom).max(0.);
-                    let bands = [
-                        (top, [x, y, w, top]),
-                        (bottom, [x, y + h - bottom, w, bottom]),
-                        (left, [x, y + top, left, middle]),
-                        (right, [x + w - right, y + top, right, middle]),
-                    ];
-                    for (width, strip) in bands {
+                    let pieces: Vec<(f32, Rect)> = if radius.iter().any(|&r| r > 0.) {
+                        let [tl, tr, br, bl] = radius;
+                        let corner = |r: f32, across: f32, along: f32| {
+                            [r.max(across).min(w / 2.), r.max(along).min(h / 2.)]
+                        };
+                        let [tl_w, tl_h] = corner(tl, left, top);
+                        let [tr_w, tr_h] = corner(tr, right, top);
+                        let [br_w, br_h] = corner(br, right, bottom);
+                        let [bl_w, bl_h] = corner(bl, left, bottom);
+                        let owner = |vertical: f32, horizontal: f32| {
+                            if vertical > 0. { vertical } else { horizontal }
+                        };
+                        vec![
+                            (top, [x + tl_w, y, w - tl_w - tr_w, top]),
+                            (bottom, [x + bl_w, y + h - bottom, w - bl_w - br_w, bottom]),
+                            (left, [x, y + tl_h, left, h - tl_h - bl_h]),
+                            (right, [x + w - right, y + tr_h, right, h - tr_h - br_h]),
+                            (owner(top, left), [x, y, tl_w, tl_h]),
+                            (owner(top, right), [x + w - tr_w, y, tr_w, tr_h]),
+                            (
+                                owner(bottom, right),
+                                [x + w - br_w, y + h - br_h, br_w, br_h],
+                            ),
+                            (owner(bottom, left), [x, y + h - bl_h, bl_w, bl_h]),
+                        ]
+                    } else {
+                        let middle = (h - top - bottom).max(0.);
+                        vec![
+                            (top, [x, y, w, top]),
+                            (bottom, [x, y + h - bottom, w, bottom]),
+                            (left, [x, y + top, left, middle]),
+                            (right, [x + w - right, y + top, right, middle]),
+                        ]
+                    };
+                    for (width, strip) in pieces {
                         if width <= 0. || strip[2] <= 0. || strip[3] <= 0. {
                             continue;
                         }
@@ -3480,6 +4500,7 @@ impl Walker<'_> {
                 placeholder,
                 placeholder_color,
                 multiline,
+                purpose,
                 ..
             } => {
                 self.hits.push(Hit {
@@ -3556,7 +4577,9 @@ impl Walker<'_> {
                         inner.k,
                         line[3],
                     ];
-                    *self.ime_area = Some(caret);
+                    if *purpose != InputPurpose::Password {
+                        *self.ime_area = Some(caret);
+                    }
                     let caret = (frame.caret_visible && !host.hide_caret).then_some(caret);
                     self.items.push(Item::Editor {
                         rect: if *multiline { content } else { line },
@@ -3577,9 +4600,14 @@ impl Walker<'_> {
                         (clip, round_clip),
                     );
                 } else if *multiline {
+                    let display = if *purpose == InputPurpose::Password {
+                        mask_text(text)
+                    } else {
+                        text.clone()
+                    };
                     // Unfocused, the wrapped text is drawn whole and shifted up by the scroll; the clip shows the visible part.
                     let height = host.text.measure_styled(
-                        &node_spans(text, None),
+                        &node_spans(&display, None),
                         Some(width + WRAP_SLACK),
                         &style,
                     )[1]
@@ -3604,7 +4632,7 @@ impl Walker<'_> {
                             content[2],
                             height * inner.k,
                         ],
-                        text: text.clone(),
+                        text: display,
                         spans: None,
                         style,
                         wrap: true,
@@ -3613,9 +4641,14 @@ impl Walker<'_> {
                         round_clip,
                     });
                 } else {
+                    let display = if *purpose == InputPurpose::Password {
+                        mask_text(text)
+                    } else {
+                        text.clone()
+                    };
                     self.items.push(Item::Text {
                         rect: line,
-                        text: text.clone(),
+                        text: display,
                         spans: None,
                         style,
                         wrap: false,
@@ -3627,7 +4660,8 @@ impl Walker<'_> {
             }
             _ => {}
         }
-        if matches!(node, Node::Box { press, contextmenu, .. } if press != 0 || contextmenu != 0) {
+        if matches!(node, Node::Box { press, contextmenu, drag, .. } if press != 0 || contextmenu != 0 || drag != 0)
+        {
             self.hits.push(Hit {
                 rect: intersect(screen, clip),
                 id,
@@ -3646,6 +4680,19 @@ impl Walker<'_> {
                 self.dismissers.push((id, rect, self.layer));
             }
         }
+        let has_cursor = paint.cursor.is_some()
+            || [&paint.hover, &paint.active, &paint.focus]
+                .into_iter()
+                .flatten()
+                .any(|v| v.cursor.is_some());
+        if has_cursor {
+            self.cursors.push(CursorHit {
+                rect: intersect(screen, clip),
+                id,
+                layer: self.layer,
+                after_hits: self.hits.len(),
+            });
+        }
         let mut child = inner;
         if node.style().is_some_and(|s| s.clip || s.scroll) {
             child.clip = intersect(clip, screen);
@@ -3656,14 +4703,15 @@ impl Walker<'_> {
         }
         let virtual_list = host.virtual_lists.get(&id).map(|&(generation, ref list)| {
             if list.auto.is_some() {
+                let (offset, extent) = list.frame_viewport(layout_rect[3]);
                 self.scrolls.push(Scroll {
                     id,
                     layer: self.layer,
                     rect: intersect(screen, clip),
                     k: inner.k,
-                    top: 0.,
-                    max: 0.,
-                    view: layout_rect[3],
+                    top: offset as f32,
+                    max: list.max_offset(extent) as f32,
+                    view: extent as f32,
                     bar: None,
                     list_generation: Some(generation),
                 });
@@ -4227,7 +5275,7 @@ mod tests {
     }
 
     #[test]
-    fn edge_sides_draw_one_band_per_side_and_a_rounded_one_as_a_ring_clipped_to_it() {
+    fn edge_sides_draw_one_band_per_side_and_a_rounded_one_as_ring_pieces_that_keep_the_corners() {
         let mut host = Host::new(
             crate::apps::BORDERS.into(),
             "{}".into(),
@@ -4252,24 +5300,38 @@ mod tests {
             })
             .collect();
         assert_eq!(bands, [[x, y + height - 1., width, 1.]]);
-        // The rounded box's 2 px bottom is the ring clipped to a 2 px strip: one ring, clipped to that strip.
+        // The rounded box's 2 px bottom is the ring clipped to the straight strip between the corners, and to
+        // each bottom corner square, so the line keeps its arcs: three pieces, nothing on the top corners.
+        let round = find(&host, |n| {
+            n.paint()
+                .is_some_and(|p| p.edge_sides == Some([0., 0., 2., 0.]))
+        });
+        let [rx, ry, _, rh] = host.tree.rect(round);
         let rings: Vec<Rect> = frame
             .items
             .iter()
             .filter_map(|item| match item {
                 Item::Inset {
-                    color, clip, rect, ..
-                } if *color == red && clip[3] == 2. => {
-                    assert_eq!(rect[2], width);
+                    color,
+                    clip,
+                    rect,
+                    spread,
+                    ..
+                } if *color == red => {
+                    assert_eq!((rect[2], *spread), (width, 2.));
                     Some(*clip)
                 }
                 _ => None,
             })
             .collect();
-        assert_eq!(rings.len(), 1, "{rings:?}");
-        assert!(
-            rings[0][1] > y,
-            "the ring's strip is at the bottom: {rings:?}"
+        let bottom = ry + rh;
+        assert_eq!(
+            rings,
+            [
+                [rx + 8., bottom - 2., width - 16., 2.],
+                [rx + width - 8., bottom - 8., 8., 8.],
+                [rx, bottom - 8., 8., 8.],
+            ]
         );
     }
 
@@ -5072,6 +6134,22 @@ mod tests {
         assert!((caret[3] - line_height).abs() < 0.01, "{caret:?}");
     }
 
+    // A field can take the focus in the same batch that creates it, as a popout's search does.
+    #[test]
+    fn a_focus_operation_takes_the_field_before_the_first_edit() {
+        let script = r#"function jsnirMount() { jsnir.batch(JSON.stringify({ ops: [
+            { op: 'create', id: 1, node: { kind: 'column' } },
+            { op: 'create', id: 2, parent: 1, node: { kind: 'input', text: 'x' } },
+            { op: 'focus', id: 2 },
+        ] })); }"#;
+        let mut host = Host::new(script.into(), "{}".into(), TextEngine::default());
+        settle(&mut host);
+        assert_eq!(host.focused, Some(2));
+        host.edit(&[EditorEvent::Insert("!".into())]);
+        settle(&mut host);
+        assert_eq!(field(&host).1, "!x");
+    }
+
     // The overlay app: its panels are the fixed nodes anchored to a node, found by that anchor.
     // A focused multi-line field 200 px wide, with 20 px lines, no padding and room for four lines (`apps::COMPOSER`).
     fn composer() -> (Host, u16) {
@@ -5730,11 +6808,63 @@ mod tests {
         function jsnirEvent(_, text) { jsnir.batch(text); }
     "#;
 
+    #[test]
+    fn a_recycled_id_is_laid_out_under_its_new_parent() {
+        const APP: &str = r#"
+            function jsnirMount() {
+                jsnir.batch(JSON.stringify({ ops: [
+                    { op: 'create', id: 1, node: { kind: 'column' } },
+                    { op: 'create', id: 2, parent: 1, node: { kind: 'column', style: { height: 20 } } },
+                    { op: 'create', id: 4, parent: 2, node: { kind: 'column', style: { height: 5 } } },
+                    { op: 'create', id: 3, parent: 1, node: { kind: 'column', style: { height: 30 } } }
+                ] }));
+            }
+            function jsnirEvent(_, text) { jsnir.batch(text); }
+        "#;
+        let mut host = Host::new(APP.into(), "{}".into(), TextEngine::default());
+        settle(&mut host);
+        // 2 goes with 4; 4 comes back under 3, and 5 is created and removed in the same batch.
+        host.push(r#"{"ops":[{"op":"remove","id":2},
+            {"op":"create","id":4,"parent":3,"node":{"kind":"column","style":{"height":7}}},
+            {"op":"create","id":5,"parent":1,"node":{"kind":"column","style":{"height":40}}},
+            {"op":"remove","id":5}]}"#.into());
+        settle(&mut host);
+        assert_eq!(host.tree.parent(4), Some(3));
+        let three = host.screen_rect(3).unwrap();
+        let four = host.screen_rect(4).unwrap();
+        assert_eq!((four[1], four[3]), (three[1], 7.), "4 sits at the top of 3: {three:?} {four:?}");
+        assert_eq!(three[1], 0., "2 and 5 left no room above 3");
+    }
+
+    #[test]
+    fn a_recycled_id_does_not_inherit_a_removed_lists_mount() {
+        const APP: &str = r#"
+            function jsnirMount() {
+                jsnir.batch(JSON.stringify({ ops: [{ op: 'create', id: 1, node: { kind: 'column' } }] }));
+            }
+            function jsnirEvent(_, text) { jsnir.batch(text); }
+        "#;
+        let mut host = Host::new(APP.into(), "{}".into(), TextEngine::default());
+        settle(&mut host);
+        // 2 is mounted as a virtual list, removed, and its ID comes back as a plain column in the same batch.
+        host.push(r#"{"ops":[{"op":"create","id":2,"parent":1,"node":{"kind":"list","style":{"height":20}}},
+            {"op":"virtuallist","id":2,"name":"messages"},
+            {"op":"remove","id":2},
+            {"op":"create","id":2,"parent":1,"node":{"kind":"column"}}]}"#.into());
+        settle(&mut host);
+        assert!(matches!(host.tree.nodes.get(&2), Some(Node::Column { .. })));
+        assert!(!host.list_mounts.contains_key(&2));
+    }
+
     fn list_host() -> Host {
         Host::new(LIST_APP.into(), "{}".into(), TextEngine::default())
     }
 
     fn virtual_list_script() -> String {
+        fixture_script("virtual-list")
+    }
+
+    fn fixture_script(app: &str) -> String {
         struct Scratch(std::path::PathBuf);
         impl Drop for Scratch {
             fn drop(&mut self) {
@@ -5764,7 +6894,7 @@ mod tests {
                 "--jsxFactory",
                 "h",
                 "app/sdk.ts",
-                "app/virtual-list.tsx",
+                &format!("app/{app}.tsx"),
                 "--outDir",
             ])
             .arg(&dir.0)
@@ -5777,7 +6907,29 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         std::fs::read_to_string(dir.0.join("sdk.js")).unwrap()
-            + &std::fs::read_to_string(dir.0.join("virtual-list.js")).unwrap()
+            + &std::fs::read_to_string(dir.0.join(format!("{app}.js"))).unwrap()
+    }
+
+    #[test]
+    fn sdk_removes_a_for_row_whose_cleanup_throws() {
+        let mut host = Host::new(fixture_script("cleanup-throw"), "{}".into(), TextEngine::default());
+        settle(&mut host);
+        assert!(texts(&host).contains(&"row drop".into()));
+        host.push("{}".into());
+        settle(&mut host);
+        assert!(!texts(&host).contains(&"row drop".into()));
+        assert!(texts(&host).contains(&"row keep".into()));
+    }
+
+    #[test]
+    fn sdk_frees_the_ids_of_mounts_nested_in_a_removed_one() {
+        let mut host = Host::new(fixture_script("remount"), "{}".into(), TextEngine::default());
+        settle(&mut host);
+        for _ in 0..10 {
+            host.push("{}".into());
+            settle(&mut host);
+        }
+        assert!(texts(&host).contains(&"nested 10".into()));
     }
 
     #[test]
@@ -5852,7 +7004,7 @@ mod tests {
         let updates = &host.bridge.updates;
         let batch = updates.recv_timeout(Duration::from_secs(1)).unwrap();
         host.pending -= 1;
-        assert_eq!(host.inflight.pop_front(), Some(false));
+        assert_eq!(host.inflight.pop_front(), Some(Inflight::Event));
         batch
     }
 
@@ -6685,5 +7837,596 @@ mod tests {
             status.ends_with(&format!("columns {}", offset as i32)),
             "{status} against {offset}"
         );
+    }
+
+    #[test]
+    fn dragging_a_resize_handle_delivers_start_move_end_and_resizes_a_pane() {
+        let script = r#"
+            var log = [];
+            var base = 100;
+            function jsnirMount() {
+                jsnir.batch(JSON.stringify({ ops: [
+                    { op: 'create', id: 1, node: { kind: 'column', style: { width: 400, height: 200 } } },
+                    { op: 'create', id: 5, parent: 1, node: { kind: 'box', style: { direction: 'row', width: 400, height: 100 } } },
+                    { op: 'create', id: 2, parent: 5, node: { kind: 'box', style: { width: 100, height: 100, shrink: 0 } } },
+                    { op: 'create', id: 3, parent: 5, node: { kind: 'box', style: { width: 6, height: 100, shrink: 0 },
+                        paint: { cursor: 'ewResize' }, drag: 1 } },
+                    { op: 'create', id: 4, parent: 1, node: { kind: 'text', text: '[]' } },
+                ] }));
+            }
+            function jsnirEvent(cb, text) {
+                if (cb !== 1) return;
+                var e = JSON.parse(text);
+                log.push(e);
+                if (e.phase === 'start') {
+                    base = jsnir.columns.width[2];
+                } else if (e.phase === 'move') {
+                    var w = Math.max(40, Math.min(300, base + e.dx));
+                    jsnir.batch(JSON.stringify({ ops: [{ op: 'setstyle', id: 2, style: { width: w, height: 100, shrink: 0 } }] }));
+                }
+                jsnir.setText(4, JSON.stringify(log));
+            }
+        "#;
+        let mut host = Host::new(script.into(), "{}".into(), TextEngine::default());
+        settle(&mut host);
+
+        assert_eq!(host.pointer_move(Some([50., 50.])), Cursor::Default);
+        assert_eq!(host.pointer_move(Some([103., 50.])), Cursor::EwResize);
+
+        host.pointer_down(PointSelection::Place);
+        assert_eq!(host.cursor(), Cursor::EwResize);
+        settle(&mut host);
+
+        // Move far outside the 6 px handle: cursor stays locked and pane resizes.
+        assert_eq!(host.pointer_move(Some([180., 75.])), Cursor::EwResize);
+        settle(&mut host);
+        assert_eq!(host.tree.rect(2)[2], 177.);
+
+        // Leaving the window mid-drag keeps the drag alive until release.
+        assert_eq!(host.pointer_move(None), Cursor::EwResize);
+        host.pointer_up();
+        assert_eq!(host.cursor(), Cursor::Default);
+        settle(&mut host);
+
+        let log: Vec<serde_json::Value> = serde_json::from_str(&texts(&host)[0]).unwrap();
+        assert_eq!(log.len(), 3, "{log:?}");
+        assert_eq!(
+            log[0],
+            serde_json::json!({"phase":"start","x":103,"y":50,"startX":103,"startY":50,"dx":0,"dy":0})
+        );
+        assert_eq!(
+            log[1],
+            serde_json::json!({"phase":"move","x":180,"y":75,"startX":103,"startY":50,"dx":77,"dy":25})
+        );
+        assert_eq!(
+            log[2],
+            serde_json::json!({"phase":"end","x":180,"y":75,"startX":103,"startY":50,"dx":77,"dy":25})
+        );
+    }
+
+    #[test]
+    fn rapid_drag_moves_coalesce_and_deliver_the_final_position_before_end() {
+        let script = r#"
+            var log = [];
+            function jsnirMount() {
+                jsnir.batch(JSON.stringify({ ops: [
+                    { op: 'create', id: 1, node: { kind: 'box', style: { width: 100, height: 100 }, drag: 1 } },
+                    { op: 'create', id: 2, parent: 1, node: { kind: 'text', text: '[]' } },
+                ] }));
+            }
+            function jsnirEvent(cb, text) {
+                if (cb !== 1) return;
+                log.push(JSON.parse(text));
+                jsnir.setText(2, JSON.stringify(log));
+            }
+        "#;
+        let mut host = Host::new(script.into(), "{}".into(), TextEngine::default());
+        settle(&mut host);
+
+        host.pointer_move(Some([10., 10.]));
+        host.pointer_down(PointSelection::Place);
+        // Many rapid moves without polling in between: only the first goes in flight immediately,
+        // and the rest coalesce down to the latest position before `end`.
+        for step in 1..=20 {
+            host.pointer_move(Some([10. + step as f32 * 5., 10.]));
+        }
+        host.pointer_up();
+        settle(&mut host);
+
+        let log: Vec<serde_json::Value> = serde_json::from_str(&texts(&host)[0]).unwrap();
+        assert_eq!(log.first().unwrap()["phase"], "start");
+        assert_eq!(log.last().unwrap()["phase"], "end");
+        assert_eq!(log.last().unwrap()["x"], 110.0);
+        assert_eq!(log.last().unwrap()["dx"], 100.0);
+        let before_end = &log[log.len() - 2];
+        assert_eq!(before_end["phase"], "move");
+        assert_eq!(before_end["x"], 110.0);
+        assert!(log.len() <= 4, "expected coalescing, got {} events", log.len());
+    }
+
+    #[test]
+    fn drag_and_press_on_the_same_box_clicks_without_motion_and_suppresses_click_after_drag() {
+        let script = r#"
+            var log = [];
+            function jsnirMount() {
+                jsnir.batch(JSON.stringify({ ops: [
+                    { op: 'create', id: 1, node: { kind: 'box', style: { width: 100, height: 100 }, press: 1, drag: 2 } },
+                    { op: 'create', id: 2, parent: 1, node: { kind: 'text', text: '[]' } },
+                ] }));
+            }
+            function jsnirEvent(cb, text) {
+                log.push(cb === 1 ? 'press' : JSON.parse(text).phase);
+                jsnir.setText(2, JSON.stringify(log));
+            }
+        "#;
+        let mut host = Host::new(script.into(), "{}".into(), TextEngine::default());
+        settle(&mut host);
+
+        // Press and release without moving: drag start+end plus press.
+        host.pointer_move(Some([20., 20.]));
+        host.pointer_down(PointSelection::Place);
+        host.pointer_up();
+        settle(&mut host);
+        assert_eq!(texts(&host)[0], r#"["start","end","press"]"#);
+
+        // Press, drag away, return inside the box, release: press is suppressed.
+        host.pointer_down(PointSelection::Place);
+        host.pointer_move(Some([50., 20.]));
+        host.pointer_move(Some([20., 20.]));
+        host.pointer_up();
+        settle(&mut host);
+        let log: Vec<String> = serde_json::from_str(&texts(&host)[0]).unwrap();
+        assert_eq!(
+            log.iter().filter(|e| e.as_str() == "press").count(),
+            1,
+            "{log:?}"
+        );
+        assert_eq!(log.last().unwrap(), "end");
+    }
+
+    #[test]
+    fn disabled_cancelled_and_removed_drags_end_cleanly() {
+        let script = r#"
+            var log = [];
+            function jsnirMount() {
+                jsnir.batch(JSON.stringify({ ops: [
+                    { op: 'create', id: 1, node: { kind: 'column', style: { width: 200, height: 200 } } },
+                    { op: 'create', id: 2, parent: 1, node: { kind: 'box', style: { width: 100, height: 40 },
+                        paint: { cursor: 'ewResize' }, drag: 1 } },
+                    { op: 'create', id: 3, parent: 1, node: { kind: 'box', style: { width: 100, height: 40 },
+                        paint: { cursor: 'ewResize' }, drag: 2, disabled: true } },
+                    { op: 'create', id: 4, parent: 1, node: { kind: 'text', text: '[]' } },
+                ] }));
+            }
+            function jsnirEvent(cb, text) {
+                if (cb === 0) {
+                    var msg = JSON.parse(text);
+                    jsnir.batch(JSON.stringify({ ops: msg.ops }));
+                    return;
+                }
+                log.push([cb, JSON.parse(text).phase]);
+                jsnir.setText(4, JSON.stringify(log));
+            }
+        "#;
+        let mut host = Host::new(script.into(), "{}".into(), TextEngine::default());
+        settle(&mut host);
+
+        // Disabled box rejects drag and shows NotAllowed.
+        assert_eq!(host.pointer_move(Some([20., 60.])), Cursor::NotAllowed);
+        host.pointer_down(PointSelection::Place);
+        host.pointer_move(Some([60., 60.]));
+        host.pointer_up();
+        settle(&mut host);
+        assert_eq!(texts(&host)[0], "[]");
+
+        // pointer_cancel sends "end" and releases cursor lock.
+        assert_eq!(host.pointer_move(Some([20., 20.])), Cursor::EwResize);
+        host.pointer_down(PointSelection::Place);
+        host.pointer_move(Some([80., 20.]));
+        host.pointer_cancel();
+        assert_eq!(host.cursor(), Cursor::EwResize);
+        settle(&mut host);
+        assert_eq!(texts(&host)[0], r#"[[1,"start"],[1,"move"],[1,"end"]]"#);
+
+        // Disabling mid-drag sends "end" and stops further moves.
+        host.pointer_move(Some([20., 20.]));
+        host.pointer_down(PointSelection::Place);
+        settle(&mut host);
+        host.push(r#"{"ops":[{"op":"setdisabled","id":2,"disabled":true}]}"#.into());
+        settle(&mut host);
+        host.pointer_move(Some([90., 20.]));
+        host.pointer_up();
+        settle(&mut host);
+        assert_eq!(
+            texts(&host)[0],
+            r#"[[1,"start"],[1,"move"],[1,"end"],[1,"start"],[1,"end"]]"#
+        );
+
+        // Re-enable, start dragging, then remove mid-drag: no further moves or crashes.
+        host.push(r#"{"ops":[{"op":"setdisabled","id":2,"disabled":false}]}"#.into());
+        settle(&mut host);
+        host.pointer_move(Some([20., 20.]));
+        host.pointer_down(PointSelection::Place);
+        settle(&mut host);
+        host.push(r#"{"ops":[{"op":"remove","id":2}]}"#.into());
+        settle(&mut host);
+        // After removing id 2, the disabled id 3 shifted up into y 0..40; moving outside it yields Default.
+        assert_eq!(host.pointer_move(Some([50., 20.])), Cursor::NotAllowed);
+        assert_eq!(host.pointer_move(Some([150., 20.])), Cursor::Default);
+        host.pointer_up();
+        settle(&mut host);
+        assert_eq!(
+            texts(&host)[0],
+            r#"[[1,"start"],[1,"move"],[1,"end"],[1,"start"],[1,"end"],[1,"start"]]"#
+        );
+    }
+
+    #[test]
+    fn drag_respects_layers_contextmenu_children_and_variant_cursors() {
+        let script = r#"
+            var log = [];
+            function jsnirMount() {
+                jsnir.batch(JSON.stringify({ ops: [
+                    { op: 'create', id: 1, node: { kind: 'box', style: { width: 200, height: 200 } } },
+                    { op: 'create', id: 2, parent: 1, node: { kind: 'box', style: { width: 120, height: 80 },
+                        paint: { cursor: 'grab', active: { cursor: 'grabbing' } }, drag: 1 } },
+                    { op: 'create', id: 3, parent: 2, node: { kind: 'box', style: { width: 60, height: 40 },
+                        contextmenu: 2 } },
+                    { op: 'create', id: 4, parent: 1, node: { kind: 'box',
+                        style: { position: 'fixed', left: 80, top: 0, width: 80, height: 80, layer: 1 } } },
+                    { op: 'create', id: 5, parent: 1, node: { kind: 'box', style: { width: 100, height: 40 }, press: 3 } },
+                    { op: 'create', id: 6, parent: 5, node: { kind: 'box', style: { width: 40, height: 20 },
+                        paint: { cursor: 'nsResize' } } },
+                    { op: 'create', id: 7, parent: 1, node: { kind: 'text', text: '[]' } },
+                ] }));
+            }
+            function jsnirEvent(cb, text) {
+                log.push([cb, text]);
+                jsnir.setText(7, JSON.stringify(log));
+            }
+        "#;
+        let mut host = Host::new(script.into(), "{}".into(), TextEngine::default());
+        settle(&mut host);
+
+        // Hovering over the contextmenu-only child inside the draggable box shows the parent's grab cursor,
+        // and dragging starts on the parent with the active grabbing cursor.
+        assert_eq!(host.pointer_move(Some([20., 20.])), Cursor::Grab);
+        host.pointer_down(PointSelection::Place);
+        assert_eq!(host.cursor(), Cursor::Grabbing);
+        assert_eq!(host.pointer_move(Some([50., 30.])), Cursor::Grabbing);
+        host.pointer_up();
+        assert_eq!(host.cursor(), Cursor::Grab);
+        settle(&mut host);
+        let log: Vec<(u16, String)> = serde_json::from_str(&texts(&host)[0]).unwrap();
+        assert_eq!(log.len(), 3, "{log:?}");
+        assert!(log.iter().all(|(cb, _)| *cb == 1));
+
+        // The higher layer (id 4, x 80..160) covers the right part of the draggable box (id 2, x 0..120).
+        assert_eq!(host.pointer_move(Some([100., 20.])), Cursor::Default);
+        host.pointer_down(PointSelection::Place);
+        host.pointer_move(Some([110., 20.]));
+        host.pointer_up();
+        settle(&mut host);
+        let log: Vec<(u16, String)> = serde_json::from_str(&texts(&host)[0]).unwrap();
+        assert_eq!(log.len(), 3, "covered region must not start a drag");
+
+        // Nested cursor override inside a pressable box (id 5 at y 80..120, child id 6 at x 0..40, y 80..100).
+        assert_eq!(host.pointer_move(Some([10., 90.])), Cursor::NsResize);
+        assert_eq!(host.pointer_move(Some([60., 90.])), Cursor::Pointer);
+    }
+
+    #[test]
+    fn sdk_on_drag_resizes_a_box_through_tsx() {
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let out = std::process::Command::new("mktemp")
+            .arg("-d")
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let dir = Scratch(String::from_utf8(out.stdout).unwrap().trim().into());
+        let app = dir.0.join("drag.tsx");
+        std::fs::write(
+            &app,
+            r#"
+function ResizeApp(): Element {
+    var width = signal(120);
+    var status = signal("idle");
+    var base = 120;
+    return (
+        <Column style={{ width: 400, height: 200 }}>
+            <Row style={{ width: 400, height: 100 }}>
+                <Box style={() => ({ width: width.value, height: 100, shrink: 0 })} />
+                <Box
+                    style={{ width: 6, height: 100, shrink: 0 }}
+                    paint={{ cursor: "colResize" }}
+                    onDrag={(e: DragEvent) => {
+                        if (e.phase === "start") {
+                            base = width.value;
+                            status.value = "dragging";
+                        } else if (e.phase === "move") {
+                            width.value = Math.max(60, Math.min(300, base + e.dx));
+                        } else {
+                            status.value = "done " + width.value;
+                        }
+                    }}
+                />
+            </Row>
+            <Text>{status}</Text>
+        </Column>
+    );
+}
+mount(ResizeApp);
+"#,
+        )
+        .unwrap();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        std::fs::copy(root.join("app/jsnir.d.ts"), dir.0.join("jsnir.d.ts")).unwrap();
+        std::fs::copy(root.join("app/sdk.ts"), dir.0.join("sdk.ts")).unwrap();
+        let out_dir = dir.0.join("out");
+        let output = std::process::Command::new(crate::typescript::compiler(root))
+            .current_dir(&dir.0)
+            .args([
+                "--ignoreConfig",
+                "--strict",
+                "--target",
+                "es2020",
+                "--lib",
+                "es2020",
+                "--types",
+                "./jsnir.d.ts",
+                "--jsx",
+                "react",
+                "--jsxFactory",
+                "h",
+                "sdk.ts",
+                "drag.tsx",
+                "--outDir",
+            ])
+            .arg(&out_dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let script = std::fs::read_to_string(out_dir.join("sdk.js")).unwrap()
+            + &std::fs::read_to_string(out_dir.join("drag.js")).unwrap();
+        let mut host = Host::new(script, "{}".into(), TextEngine::default());
+        settle(&mut host);
+
+        assert_eq!(host.pointer_move(Some([123., 50.])), Cursor::ColResize);
+        host.pointer_down(PointSelection::Place);
+        settle(&mut host);
+        assert!(texts(&host).contains(&"dragging".into()));
+
+        assert_eq!(host.pointer_move(Some([203., 50.])), Cursor::ColResize);
+        host.pointer_up();
+        settle(&mut host);
+        assert!(texts(&host).contains(&"done 200".into()), "{:?}", texts(&host));
+    }
+
+    #[test]
+    fn dev_overlay_hard_reload_and_keyed_signals_work_together() {
+        let sdk = include_str!("../app/sdk.ts");
+        let _ = sdk;
+        // Build a minimal script using keyed reload state to verify soft vs hard reload + DevError overlay.
+        let v1 = r#"
+            var saved = typeof __jsnirPreviousState === 'string' ? JSON.parse(__jsnirPreviousState) : [];
+            var byKey = {};
+            for (var i = 0; i < saved.length; i++) if (saved[i].key) byKey[saved[i].key] = saved[i];
+            var count = byKey['count'] && byKey['count'].initial === '0' ? byKey['count'].value : 0;
+            function jsnirReloadState() { return JSON.stringify([{ key: 'count', initial: '0', value: count }]); }
+            function jsnirMount() {
+                jsnir.batch(JSON.stringify({ ops: [
+                    { op: 'create', id: 1, node: { kind: 'box', style: { width: 200, height: 80 }, press: 1 } },
+                    { op: 'create', id: 2, parent: 1, node: { kind: 'text', text: 'v1:' + count } },
+                ] }));
+            }
+            function jsnirEvent(cb) {
+                if (cb === 1) { count += 1; jsnir.setText(2, 'v1:' + count); }
+            }
+        "#;
+        let v2 = r#"
+            var saved = typeof __jsnirPreviousState === 'string' ? JSON.parse(__jsnirPreviousState) : [];
+            var byKey = {};
+            for (var i = 0; i < saved.length; i++) if (saved[i].key) byKey[saved[i].key] = saved[i];
+            var extra = byKey['extra'] && byKey['extra'].initial === '9' ? byKey['extra'].value : 9;
+            var count = byKey['count'] && byKey['count'].initial === '0' ? byKey['count'].value : 0;
+            function jsnirReloadState() { return JSON.stringify([
+                { key: 'extra', initial: '9', value: extra },
+                { key: 'count', initial: '0', value: count },
+            ]); }
+            function jsnirMount() {
+                jsnir.batch(JSON.stringify({ ops: [
+                    { op: 'create', id: 1, node: { kind: 'box', style: { width: 200, height: 80 }, press: 1 } },
+                    { op: 'create', id: 2, parent: 1, node: { kind: 'text', text: 'v2:' + extra + ':' + count } },
+                ] }));
+            }
+            function jsnirEvent(cb) {
+                if (cb === 1) { count += 1; jsnir.setText(2, 'v2:' + extra + ':' + count); }
+            }
+        "#;
+
+        let mut host = Host::new(v1.into(), "{}".into(), TextEngine::default());
+        host.enable_dev_overlay(true);
+        settle(&mut host);
+        assert!(texts(&host).contains(&"v1:0".into()));
+
+        // Click twice -> count = 2.
+        for _ in 0..2 {
+            host.pointer_move(Some([20., 20.]));
+            host.pointer_down(PointSelection::Place);
+            host.pointer_up();
+            settle(&mut host);
+        }
+        assert!(texts(&host).contains(&"v1:2".into()));
+
+        // Failed reload populates the native DevError overlay and keeps v1 alive.
+        assert!(host.reload("function jsnirMount() { throw new Error('boom'); }".into()));
+        settle(&mut host);
+        assert!(host.dev_error().is_some());
+        let frame = host.frame(640., 480., 1., 4096);
+        assert!(
+            frame
+                .items
+                .iter()
+                .any(|item| matches!(item, Item::Text { text, .. } if text.contains("boom"))),
+            "overlay must draw the error text"
+        );
+        // Escape dismisses the error overlay.
+        host.escape();
+        assert!(host.dev_error().is_none());
+
+        // Set a synthetic compile error, then soft-reload v2: keyed signal preserves count=2 AND clears overlay!
+        host.set_dev_error(Some(DevError {
+            title: "Syntax error".into(),
+            message: "Unexpected token".into(),
+            location: Some("src/app.tsx:4:10".into()),
+            frame: Some("> 4 | const x = ;".into()),
+        }));
+        assert!(host.reload(v2.into()));
+        settle(&mut host);
+        assert!(host.dev_error().is_none());
+        assert!(texts(&host).contains(&"v2:9:2".into()), "{:?}", texts(&host));
+
+        // Hard reload resets state back to count=0.
+        assert!(host.hard_reload(v2.into()));
+        settle(&mut host);
+        assert!(texts(&host).contains(&"v2:9:0".into()), "{:?}", texts(&host));
+    }
+
+    #[test]
+    fn bounded_wait_lands_fast_reply_in_first_poll_and_never_stalls_slow_handler() {
+        let fast_script = r#"
+            var n = 0;
+            function jsnirMount() {
+                jsnir.batch(JSON.stringify({ ops: [
+                    { op: 'create', id: 1, node: { kind: 'box', style: { width: 100, height: 40 }, press: 1 } },
+                    { op: 'create', id: 2, parent: 1, node: { kind: 'text', text: '0' } },
+                ] }));
+            }
+            function jsnirEvent(cb) {
+                if (cb === 1) { n += 1; jsnir.setText(2, '' + n); }
+            }
+        "#;
+        let mut host = Host::new(fast_script.into(), "{}".into(), TextEngine::default());
+        host.set_wait_budget(Duration::from_millis(5));
+        settle(&mut host);
+        // Warm up the VM thread, then assert every click lands on the very first `poll()`.
+        host.pointer_move(Some([20., 20.]));
+        for expected in 1..=20 {
+            host.pointer_down(PointSelection::Place);
+            host.pointer_up();
+            host.poll();
+            assert!(!host.busy(), "fast click #{expected} should land in the same poll");
+            assert_eq!(host.tree.text(2), Some(expected.to_string().as_str()));
+        }
+
+        // Slow request handler: bounded wait returns promptly and subsequent polls don't block at all.
+        let slow_script = r#"
+            function jsnirMount() {
+                jsnir.batch(JSON.stringify({ ops: [
+                    { op: 'create', id: 1, node: { kind: 'box', style: { width: 100, height: 40 }, press: 1 } },
+                    { op: 'create', id: 2, parent: 1, node: { kind: 'text', text: 'idle' } },
+                ] }));
+            }
+            function jsnirEvent(cb) {
+                if (cb === 1) {
+                    var res = jsnirRequest('slow');
+                    jsnir.setText(2, res);
+                }
+            }
+        "#;
+        let mut slow = Host::with_request_handler(
+            slow_script.into(),
+            "{}".into(),
+            TextEngine::default(),
+            |_| {
+                std::thread::sleep(Duration::from_millis(120));
+                Ok("done".into())
+            },
+        )
+        .unwrap();
+        slow.set_wait_budget(Duration::from_micros(800));
+        settle(&mut slow);
+        slow.pointer_move(Some([20., 20.]));
+        slow.pointer_down(PointSelection::Place);
+        slow.pointer_up();
+        let t0 = Instant::now();
+        slow.poll();
+        assert!(
+            slow.busy() && t0.elapsed() < Duration::from_millis(40),
+            "first poll waited {:?}",
+            t0.elapsed()
+        );
+        let t1 = Instant::now();
+        slow.poll();
+        assert!(
+            t1.elapsed() < Duration::from_millis(5),
+            "second poll past budget waited {:?}",
+            t1.elapsed()
+        );
+        settle(&mut slow);
+        assert_eq!(slow.tree.text(2), Some("done"));
+    }
+
+    #[test]
+    fn password_input_disables_ime_masks_unfocused_text_and_blocks_copy() {
+        let script = r#"
+            function jsnirMount() {
+                jsnir.batch(JSON.stringify({ ops: [
+                    { op: 'create', id: 1, node: { kind: 'column', style: { width: 300, height: 120 } } },
+                    { op: 'create', id: 2, parent: 1, node: { kind: 'input', text: 'hunter2', purpose: 'password', style: { width: 200, height: 32 } } },
+                    { op: 'create', id: 3, parent: 1, node: { kind: 'input', text: 'hello 茶', purpose: 'search', style: { width: 200, height: 32 } } },
+                ] }));
+            }
+        "#;
+        let mut host = Host::new(script.into(), "{}".into(), TextEngine::default());
+        settle(&mut host);
+
+        // Unfocused password input draws masked bullets, never plaintext.
+        let frame = host.frame(300., 120., 1., 4096);
+        assert!(
+            frame
+                .items
+                .iter()
+                .any(|item| matches!(item, Item::Text { text, .. } if text == "•••••••")),
+            "expected masked password bullets"
+        );
+        assert!(
+            !frame
+                .items
+                .iter()
+                .any(|item| matches!(item, Item::Text { text, .. } if text == "hunter2")),
+            "password plaintext must never be drawn"
+        );
+
+        // Focusing password field sets purpose=Password, disables IME, omits ime_area, and blocks Copy.
+        host.focus(Some(2));
+        let state = host.ime_state();
+        assert!(!state.allowed);
+        assert_eq!(state.purpose, InputPurpose::Password);
+        assert!(state.surrounding.is_none());
+        let focused_frame = host.frame(300., 120., 1., 4096);
+        assert!(focused_frame.ime_area.is_none());
+        let out = host.edit(&[EditorEvent::SelectAll, EditorEvent::Copy]);
+        assert!(out.clipboard.is_none());
+
+        // Focusing search field enables IME, exposes surrounding text, and sets ime_area.
+        host.focus(Some(3));
+        let state = host.ime_state();
+        assert!(state.allowed);
+        assert_eq!(state.purpose, InputPurpose::Search);
+        let surrounding = state.surrounding.expect("surrounding text");
+        assert_eq!(surrounding.text, "hello 茶");
+        let search_frame = host.frame(300., 120., 1., 4096);
+        assert!(search_frame.ime_area.is_some());
     }
 }

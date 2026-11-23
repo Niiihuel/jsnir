@@ -70,9 +70,9 @@ fn run_external(mut args: impl Iterator<Item = OsString>) -> Result<()> {
             _ => return Err(USAGE.into()),
         }
     }
-    let script =
-        fs::read_to_string(&source).map_err(|error| format!("{}: {error}", source.display()))?;
-    let host = Host::try_new(script, "{}".into(), TextEngine::default())
+    let bytes =
+        fs::read(&source).map_err(|error| format!("{}: {error}", source.display()))?;
+    let host = Host::try_new_auto(bytes, "{}".into(), TextEngine::default())
         .map_err(|error| format!("{}: {error}", source.display()))?;
     open(host, &title, size, false, output.as_deref())
 }

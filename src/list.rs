@@ -312,6 +312,34 @@ impl List {
         self.keys.contains_key(&key)
     }
 
+    pub(crate) fn height(&self, key: u64) -> Option<f32> {
+        let root = self.root.as_ref()?;
+        Some(root.span_at((0., root.total), *self.keys.get(&key)?).2 as f32)
+    }
+
+    pub(crate) fn top(&self, key: u64) -> Option<f64> {
+        let root = self.root.as_ref()?;
+        Some(root.span_at((0., root.total), *self.keys.get(&key)?).0)
+    }
+
+    /// Reorders or splices the index, preserving measured heights and the first retained visible row's position.
+    pub(crate) fn reordered(&self, index: &[(u64, f32)]) -> Option<Self> {
+        let mut result = Self::default();
+        for &(key, estimate) in index {
+            if !result.append(key, self.height(key).unwrap_or(estimate)) {
+                return None;
+            }
+        }
+        let offset = self.visible().into_iter().find_map(|(key, previous, _)| {
+            let root = result.root.as_ref()?;
+            let order = *result.keys.get(&key)?;
+            let top = root.span_at((0., root.total), order).0;
+            Some(top - (previous - self.offset))
+        }).unwrap_or(self.offset);
+        result.set_viewport(offset, self.extent);
+        Some(result)
+    }
+
     /// Look up one key in a half-open window, which may be a tentative layout viewport.
     pub(crate) fn visible_row_at(&self, key: u64, offset: f64, extent: f64) -> Option<(f64, f64)> {
         let end = offset + extent;

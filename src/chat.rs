@@ -34,9 +34,11 @@ impl App for ChatJs {
     fn handle(&mut self, e: Event, _: &Tree) -> Vec<Op> {
         or_log(self.0.try_call("jsnirEvent", (e.callback, e.text)))
     }
-    fn reload(&mut self, js: &str) -> Result<Vec<Op>, String> {
-        // The old VM's signals carry over to the new one. If the new script fails to load, the old one keeps running.
-        let state = self.0.try_invoke::<String>("jsnirReloadState", ()).ok();
+    fn reload(&mut self, js: &str, preserve_state: bool) -> Result<Vec<Op>, String> {
+        // The old VM's signals carry over to the new one when preserving state. If the new script fails to load, the old one keeps running.
+        let state = preserve_state
+            .then(|| self.0.try_invoke::<String>("jsnirReloadState", ()).ok())
+            .flatten();
         let vm = Vm::try_load(js, self.1.clone(), state.as_deref())?;
         let mount = vm.try_call("jsnirMount", ())?;
         self.0 = vm;
@@ -84,6 +86,7 @@ impl App for ChatRust {
                 HISTORY,
                 Some(2),
                 Node::List {
+                    scroll: 0,
                     children: vec![],
                     style: style(0., 0., 1., None),
                 },
@@ -100,6 +103,8 @@ impl App for ChatRust {
                     placeholder_color: None,
                     multiline: false,
                     submit_on_enter: false,
+                    retain_on_submit: false,
+                    purpose: Default::default(),
                     style: style(0., 0., 0., Some(34.)),
                     font: Font::default(),
                     paint: Box::default(),
@@ -260,7 +265,7 @@ impl Chat {
         }
         self.bridge
             .events
-            .try_send(Inbox::Reload(js))
+            .try_send(Inbox::Reload(js, true))
             .expect("event queue");
         self.pending += 1;
         self.reload_started = Some(Instant::now());

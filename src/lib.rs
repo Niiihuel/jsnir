@@ -70,18 +70,21 @@ pub mod apps {
     pub const RELOAD: &str = include_str!(concat!(env!("OUT_DIR"), "/reload.js"));
 }
 
-use contract::Columns;
+use contract::{Columns, CommandBuffer};
 use rquickjs::{CatchResultExt, Ctx, Exception, Function, function::IntoArgs};
 use std::{
     cell::RefCell,
+    collections::{HashMap, VecDeque},
     rc::Rc,
-    sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel},
+    sync::{
+        Arc, Mutex,
+        mpsc::{Receiver, SyncSender, channel, sync_channel},
+    },
     thread,
     time::Duration,
 };
 #[cfg(feature = "examples")]
 use std::{
-    collections::VecDeque,
     fs::File,
     io::{BufWriter, Write},
     path::Path,
@@ -111,13 +114,159 @@ macro_rules! def {
     }};
 }
 
+/// Magic header for precompiled JSNIR QuickJS bytecode bundles (`.jsbc`).
+pub const BYTECODE_MAGIC: &[u8; 8] = b"JSNRBC01";
+
+/// Input script for a VM: UTF-8 JavaScript source or precompiled QuickJS bytecode (`JSNRBC01`).
+#[derive(Debug, Clone)]
+pub enum ScriptBundle {
+    Source(String),
+    Bytecode(Vec<u8>),
+}
+
+impl ScriptBundle {
+    /// Detects whether `bytes` starts with [`BYTECODE_MAGIC`]; otherwise interprets it as UTF-8 JS source.
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, String> {
+        if bytes.starts_with(BYTECODE_MAGIC) {
+            Ok(Self::Bytecode(bytes))
+        } else {
+            String::from_utf8(bytes)
+                .map(Self::Source)
+                .map_err(|e| format!("script is neither JSNIR bytecode nor valid UTF-8: {e}"))
+        }
+    }
+}
+
+/// Compiles a JS bundle (SDK + app) ahead of time into QuickJS bytecode (`JSNRBC01` header + raw bytecode).
+/// Loading the resulting bytes skips JS parsing completely on startup.
+pub fn compile_bytecode(js: &str) -> Result<Vec<u8>, String> {
+    let rt = rquickjs::Runtime::new().map_err(|e| format!("VM out of memory: {e}"))?;
+    let ctx = rquickjs::Context::full(&rt).map_err(|e| format!("VM out of memory: {e}"))?;
+    ctx.with(|c| {
+        let res: rquickjs::Result<Vec<u8>> = (|| {
+            let filename = std::ffi::CString::new("<jsnir-bundle>").unwrap();
+            let flags = (rquickjs::qjs::JS_EVAL_TYPE_GLOBAL
+                | rquickjs::qjs::JS_EVAL_FLAG_COMPILE_ONLY) as i32;
+            let raw = c.as_raw().as_ptr();
+            let mut src = Vec::with_capacity(js.len() + 1);
+            src.extend_from_slice(js.as_bytes());
+            src.push(0);
+            // SAFETY: `src` is null-terminated with length `js.len()` and lives across `JS_Eval`.
+            let func = unsafe {
+                rquickjs::qjs::JS_Eval(
+                    raw,
+                    src.as_ptr().cast(),
+                    js.len() as _,
+                    filename.as_ptr(),
+                    flags,
+                )
+            };
+            if unsafe { rquickjs::qjs::JS_IsException(func) } {
+                return Err(rquickjs::Error::Exception);
+            }
+            let mut len = std::mem::MaybeUninit::uninit();
+            // SAFETY: `func` is a valid compiled JS bytecode function owned by `raw`.
+            let buf = unsafe {
+                let b = rquickjs::qjs::JS_WriteObject(
+                    raw,
+                    len.as_mut_ptr(),
+                    func,
+                    rquickjs::qjs::JS_WRITE_OBJ_BYTECODE as i32,
+                );
+                rquickjs::qjs::JS_FreeValue(raw, func);
+                b
+            };
+            if buf.is_null() {
+                return Err(rquickjs::Error::Exception);
+            }
+            let len = unsafe { len.assume_init() };
+            let mut out = Vec::with_capacity(BYTECODE_MAGIC.len() + len as usize);
+            out.extend_from_slice(BYTECODE_MAGIC);
+            // SAFETY: QuickJS returned `len` valid bytes at `buf`.
+            out.extend_from_slice(unsafe { std::slice::from_raw_parts(buf, len as usize) });
+            unsafe { rquickjs::qjs::js_free(raw, buf.cast()) };
+            Ok(out)
+        })();
+        res.catch(&c).map_err(|e| e.to_string())
+    })
+}
+
+fn eval_bytecode(c: &Ctx<'_>, bytes: &[u8]) -> rquickjs::Result<()> {
+    let payload = bytes
+        .strip_prefix(BYTECODE_MAGIC)
+        .ok_or_else(|| Exception::throw_type(c, "invalid JSNIR bytecode header"))?;
+    let raw = c.as_raw().as_ptr();
+    // SAFETY: Without `JS_READ_OBJ_ROM_DATA`, QuickJS copies bytecode into VM-owned memory.
+    let obj = unsafe {
+        rquickjs::qjs::JS_ReadObject(
+            raw,
+            payload.as_ptr(),
+            payload.len() as _,
+            rquickjs::qjs::JS_READ_OBJ_BYTECODE as i32,
+        )
+    };
+    if unsafe { rquickjs::qjs::JS_IsException(obj) } {
+        return Err(rquickjs::Error::Exception);
+    }
+    let val = unsafe { rquickjs::qjs::JS_EvalFunction(raw, obj) };
+    if unsafe { rquickjs::qjs::JS_IsException(val) } {
+        return Err(rquickjs::Error::Exception);
+    }
+    unsafe { rquickjs::qjs::JS_FreeValue(raw, val) };
+    Ok(())
+}
+
+/// Engine-agnostic boundary between the JSNIR host protocol and the underlying JavaScript VM.
+/// Default implementation is [`Vm`] (QuickJS-ng); optional JIT or V8 backends can implement this trait
+/// without changing `Host`, `Tree`, or the TSX SDK.
+pub(crate) trait JsEngine {
+    fn sync(&mut self, view: &Tree, ids: Option<&[u16]>);
+    fn call_mount(&self) -> Result<Vec<Op>, String>;
+    fn call_event(&self, callback: u16, text: &str, guard: Option<&str>) -> Result<Vec<Op>, String>;
+    fn call_drag(
+        &self,
+        callback: u16,
+        phase: u8,
+        x: f32,
+        y: f32,
+        sx: f32,
+        sy: f32,
+        dx: f32,
+        dy: f32,
+        guard: Option<&str>,
+    ) -> Result<Vec<Op>, String>;
+    fn call_scroll(
+        &self,
+        callback: u16,
+        top: f32,
+        height: f32,
+        client: f32,
+        guard: Option<&str>,
+    ) -> Result<Vec<Op>, String>;
+    fn call_context_menu(
+        &self,
+        callback: u16,
+        x: f32,
+        y: f32,
+        guard: Option<&str>,
+    ) -> Result<Vec<Op>, String>;
+    fn call_placement(&self, text: &str) -> Result<Vec<Op>, String>;
+    fn call_virtual_list(&self, delta: &str) -> Result<(String, Vec<Op>), String>;
+    fn reload_state(&self) -> Option<String>;
+}
+
 /// A QuickJS VM. It is created and used on the app thread only; the UI thread never touches it.
 struct Vm {
+    // Persistent JS roots (`columns`, `_cmd`) MUST be declared before `ctx` and `_rt` so they drop
+    // while `ctx` is still alive and `JS_FreeRuntime` sees an empty GC object list.
+    columns: Columns,
+    _cmd: CommandBuffer,
     ctx: rquickjs::Context,
     // Native `jsnir` functions push operations here; the call that triggered them collects the batch.
     ops: Rc<RefCell<Vec<Op>>>,
-    // Numeric view data that JS reads without crossing the boundary (`jsnir.columns`).
-    columns: Columns,
+    has_jsnir_drag: bool,
+    has_jsnir_scroll: bool,
+    has_jsnir_context_menu: bool,
     signatures: Vec<String>,
     _rt: rquickjs::Runtime,
 }
@@ -149,11 +298,24 @@ impl Vm {
         previous: Option<&str>,
         configure: impl for<'js> FnOnce(&Ctx<'js>) -> rquickjs::Result<()>,
     ) -> Result<Self, String> {
+        Self::try_load_bundle(
+            &ScriptBundle::Source(js.to_string()),
+            replica,
+            previous,
+            configure,
+        )
+    }
+    fn try_load_bundle(
+        bundle: &ScriptBundle,
+        replica: Rc<RefCell<Replica>>,
+        previous: Option<&str>,
+        configure: impl for<'js> FnOnce(&Ctx<'js>) -> rquickjs::Result<()>,
+    ) -> Result<Self, String> {
         let rt = rquickjs::Runtime::new().expect("VM out of memory");
         let ctx = rquickjs::Context::full(&rt).expect("VM out of memory");
         let ops: Rc<RefCell<Vec<Op>>> = Rc::default();
         let mut sigs = Vec::new();
-        let columns = ctx.with(|c| {
+        let (columns, cmd, has_jsnir_drag, has_jsnir_scroll, has_jsnir_context_menu) = ctx.with(|c| {
             let r = (|| {
                 let jsnir = rquickjs::Object::new(c.clone())?;
                 // Frequent writes are plain calls with numbers, no JSON. rquickjs rejects numbers outside
@@ -178,6 +340,25 @@ impl Vm {
                         Ok(())
                     }
                 );
+                // Binary command buffer: flushes `words` packed u32/f32 commands from `jsnir.cmd` without JSON.
+                let (cmd, cmd_reader) = CommandBuffer::install(&c, &jsnir)?;
+                let sink = ops.clone();
+                def!(
+                    jsnir,
+                    c,
+                    sigs,
+                    "commit",
+                    |ctx: Ctx, words: u32| -> rquickjs::Result<()> {
+                        let mut ops = sink.borrow_mut();
+                        cmd_reader
+                            .decode(words as usize, &mut ops)
+                            .map_err(|e| Exception::throw_type(&ctx, &format!("invalid cmd: {e}")))
+                    }
+                );
+                // An error the app survives, such as a cleanup that threw while its subtree was removed.
+                def!(jsnir, c, sigs, "report", |message: String| -> () {
+                    eprintln!("app error, the event keeps its changes: {message}")
+                });
                 let sink = ops.clone();
                 def!(jsnir, c, sigs, "setText", |id: u16, text: String| -> () {
                     sink.borrow_mut().push(Op::SetText { id, text })
@@ -193,8 +374,15 @@ impl Vm {
                 }
                 let columns = Columns::install(&c, &jsnir)?;
                 configure(&c)?;
-                c.eval::<(), _>(js)?;
-                Ok(columns)
+                match bundle {
+                    ScriptBundle::Source(js) => c.eval::<(), _>(js.as_str())?,
+                    ScriptBundle::Bytecode(bytes) => eval_bytecode(&c, bytes)?,
+                }
+                let globals = c.globals();
+                let has_drag = globals.get::<_, Function>("jsnirDrag").is_ok();
+                let has_scroll = globals.get::<_, Function>("jsnirScroll").is_ok();
+                let has_context_menu = globals.get::<_, Function>("jsnirContextMenu").is_ok();
+                Ok((columns, cmd, has_drag, has_scroll, has_context_menu))
             })();
             r.catch(&c).map_err(|e| e.to_string())
         })?;
@@ -202,6 +390,10 @@ impl Vm {
             ctx,
             ops,
             columns,
+            _cmd: cmd,
+            has_jsnir_drag,
+            has_jsnir_scroll,
+            has_jsnir_context_menu,
             signatures: sigs,
             _rt: rt,
         })
@@ -242,6 +434,103 @@ impl Vm {
     #[cfg(all(test, feature = "examples"))]
     fn call(&self, name: &str, args: impl for<'js> IntoArgs<'js>) -> Vec<Op> {
         self.try_call(name, args).unwrap_or_else(|e| panic!("{e}"))
+    }
+}
+
+impl JsEngine for Vm {
+    fn sync(&mut self, view: &Tree, ids: Option<&[u16]>) {
+        Vm::sync(self, view, ids)
+    }
+    fn call_mount(&self) -> Result<Vec<Op>, String> {
+        self.try_call("jsnirMount", ())
+    }
+    fn call_event(&self, callback: u16, text: &str, guard: Option<&str>) -> Result<Vec<Op>, String> {
+        match guard {
+            Some(guard) => self.try_call("jsnirEvent", (callback, text, guard)),
+            None => self.try_call("jsnirEvent", (callback, text)),
+        }
+    }
+    fn call_drag(
+        &self,
+        callback: u16,
+        phase: u8,
+        x: f32,
+        y: f32,
+        sx: f32,
+        sy: f32,
+        dx: f32,
+        dy: f32,
+        guard: Option<&str>,
+    ) -> Result<Vec<Op>, String> {
+        if self.has_jsnir_drag {
+            match guard {
+                Some(guard) => {
+                    self.try_call("jsnirDrag", (callback, phase, x, y, sx, sy, guard))
+                }
+                None => self.try_call("jsnirDrag", (callback, phase, x, y, sx, sy)),
+            }
+        } else {
+            let phase_str = match phase {
+                0 => "start",
+                1 => "move",
+                _ => "end",
+            };
+            let json = serde_json::json!({
+                "phase": phase_str,
+                "x": x,
+                "y": y,
+                "startX": sx,
+                "startY": sy,
+                "dx": dx,
+                "dy": dy,
+            })
+            .to_string();
+            self.call_event(callback, &json, guard)
+        }
+    }
+    fn call_scroll(
+        &self,
+        callback: u16,
+        top: f32,
+        height: f32,
+        client: f32,
+        guard: Option<&str>,
+    ) -> Result<Vec<Op>, String> {
+        if self.has_jsnir_scroll {
+            match guard {
+                Some(guard) => self.try_call("jsnirScroll", (callback, top, height, client, guard)),
+                None => self.try_call("jsnirScroll", (callback, top, height, client)),
+            }
+        } else {
+            let json = format!(r#"{{"top":{top},"height":{height},"client":{client}}}"#);
+            self.call_event(callback, &json, guard)
+        }
+    }
+    fn call_context_menu(
+        &self,
+        callback: u16,
+        x: f32,
+        y: f32,
+        guard: Option<&str>,
+    ) -> Result<Vec<Op>, String> {
+        if self.has_jsnir_context_menu {
+            match guard {
+                Some(guard) => self.try_call("jsnirContextMenu", (callback, x, y, guard)),
+                None => self.try_call("jsnirContextMenu", (callback, x, y)),
+            }
+        } else {
+            let json = serde_json::json!({ "x": x, "y": y }).to_string();
+            self.call_event(callback, &json, guard)
+        }
+    }
+    fn call_placement(&self, text: &str) -> Result<Vec<Op>, String> {
+        self.try_call("jsnirPlacement", (text,))
+    }
+    fn call_virtual_list(&self, delta: &str) -> Result<(String, Vec<Op>), String> {
+        self.try_call_with::<String>("jsnirVirtualList", (delta,))
+    }
+    fn reload_state(&self) -> Option<String> {
+        self.try_invoke::<String>("jsnirReloadState", ()).ok()
     }
 }
 
@@ -302,6 +591,7 @@ fn rust_mount() -> Batch {
                     contextmenu: 0,
                     dismiss: 0,
                     scroll: 0,
+                    drag: 0,
                 },
             ),
             create(2, Some(1), Node::Label { value: 0 }),
@@ -319,18 +609,127 @@ pub struct Event {
     pub callback: u16,
     pub text: String,
 }
-/// Message from the UI to the app thread: an event, or new code for a live reload.
+/// Message from the UI to the app thread: an event, a zero-JSON numeric event, or new code for a live reload.
 enum Inbox {
     Event(Event),
     Guarded(Event, String),
+    Drag {
+        callback: u16,
+        guard: Option<String>,
+        phase: u8,
+        x: f32,
+        y: f32,
+        sx: f32,
+        sy: f32,
+        dx: f32,
+        dy: f32,
+    },
+    Scroll {
+        callback: u16,
+        guard: Option<String>,
+        top: f32,
+        height: f32,
+        client: f32,
+    },
+    ContextMenu {
+        callback: u16,
+        guard: Option<String>,
+        x: f32,
+        y: f32,
+    },
     List(String),
-    Reload(String),
+    Reload(String, bool),
 }
 /// Ordered log from the UI to the app thread's replica.
 enum Log {
     Answer(bool),
     Ui(Batch),
 }
+
+#[derive(Default)]
+struct UiCoalesced {
+    rects: HashMap<u16, [f32; 4]>,
+    scrolls: HashMap<u16, [f32; 3]>,
+    inputs: HashMap<u16, (String, [u32; 2])>,
+    other: Vec<Op>,
+}
+impl UiCoalesced {
+    fn merge(&mut self, ops: Vec<Op>) {
+        for op in ops {
+            match op {
+                Op::SetRect { id, rect } => {
+                    self.rects.insert(id, rect);
+                }
+                Op::SetScroll { id, scroll } => {
+                    self.scrolls.insert(id, scroll);
+                }
+                Op::SetInput {
+                    id,
+                    text,
+                    selection,
+                } => {
+                    self.inputs.insert(id, (text, selection));
+                }
+                other => self.other.push(other),
+            }
+        }
+    }
+    fn into_batch(self) -> Batch {
+        let mut ops = Vec::with_capacity(
+            self.rects.len() + self.scrolls.len() + self.inputs.len() + self.other.len(),
+        );
+        for (id, rect) in self.rects {
+            ops.push(Op::SetRect { id, rect });
+        }
+        for (id, scroll) in self.scrolls {
+            ops.push(Op::SetScroll { id, scroll });
+        }
+        for (id, (text, selection)) in self.inputs {
+            ops.push(Op::SetInput {
+                id,
+                text,
+                selection,
+            });
+        }
+        ops.extend(self.other);
+        Batch { base: 0, ops }
+    }
+}
+
+enum LogEntry {
+    Answer(bool),
+    Ui(UiCoalesced),
+}
+
+/// Ordered UI→App log that coalesces repeated `SetRect`, `SetScroll`, and `SetInput` updates per node
+/// while preserving strict causal barriers around every `Log::Answer`.
+#[derive(Clone, Default)]
+struct CoalescingLog(Arc<Mutex<VecDeque<LogEntry>>>);
+impl CoalescingLog {
+    fn send(&self, entry: Log) -> Result<(), ()> {
+        let mut queue = self.0.lock().expect("log lock");
+        match entry {
+            Log::Answer(accepted) => queue.push_back(LogEntry::Answer(accepted)),
+            Log::Ui(batch) => {
+                if batch.ops.is_empty() {
+                    return Ok(());
+                }
+                if let Some(LogEntry::Ui(pending)) = queue.back_mut() {
+                    pending.merge(batch.ops);
+                } else {
+                    let mut coalesced = UiCoalesced::default();
+                    coalesced.merge(batch.ops);
+                    queue.push_back(LogEntry::Ui(coalesced));
+                }
+            }
+        }
+        Ok(())
+    }
+    fn drain(&self) -> VecDeque<LogEntry> {
+        std::mem::take(&mut *self.0.lock().expect("log lock"))
+    }
+}
+
 type ListBindings = Vec<(u64, u16)>;
 
 struct Bridge {
@@ -339,8 +738,8 @@ struct Bridge {
     // Outcome of each reload, sent before the batch that carries it.
     reports: Receiver<Result<(), String>>,
     list_replies: Receiver<Result<ListBindings, String>>,
-    // Unbounded so the UI never blocks when it writes to the log.
-    log: Sender<Log>,
+    // Coalescing ordered log: never blocks the UI thread and stays bounded per node between events.
+    log: CoalescingLog,
 }
 /// Most events the UI keeps in flight; the event queue has the same capacity, so `try_send` cannot fail below it.
 const MAX_PENDING: u16 = 64;
@@ -352,13 +751,46 @@ trait App {
     fn guarded(&mut self, _event: Event, _guard: String) -> Vec<Op> {
         Vec::new()
     }
+    fn handle_drag(
+        &mut self,
+        _callback: u16,
+        _guard: Option<String>,
+        _phase: u8,
+        _x: f32,
+        _y: f32,
+        _sx: f32,
+        _sy: f32,
+        _dx: f32,
+        _dy: f32,
+    ) -> Vec<Op> {
+        Vec::new()
+    }
+    fn handle_scroll(
+        &mut self,
+        _callback: u16,
+        _guard: Option<String>,
+        _top: f32,
+        _height: f32,
+        _client: f32,
+    ) -> Vec<Op> {
+        Vec::new()
+    }
+    fn handle_context_menu(
+        &mut self,
+        _callback: u16,
+        _guard: Option<String>,
+        _x: f32,
+        _y: f32,
+    ) -> Vec<Op> {
+        Vec::new()
+    }
     fn list(&mut self, _delta: String) -> Result<(ListBindings, Vec<Op>), String> {
         Err("this app does not implement virtual List".into())
     }
     /// The view changed in these nodes (or in all of them with `None`). JS apps copy it to their columns.
     fn sync(&mut self, _view: &Tree, _ids: Option<&[u16]>) {}
     /// Replaces the app code and returns the new mount. On failure the previous app keeps running.
-    fn reload(&mut self, _js: &str) -> Result<Vec<Op>, String> {
+    fn reload(&mut self, _js: &str, _preserve_state: bool) -> Result<Vec<Op>, String> {
         Err("this app does not support live reload".into())
     }
 }
@@ -382,7 +814,8 @@ fn spawn_app(
     let (init, boot) = sync_channel::<Result<Batch, String>>(1);
     let (events, rx) = sync_channel::<Inbox>(MAX_PENDING.into());
     let (tx, updates) = sync_channel(MAX_PENDING.into());
-    let (log, entries) = channel();
+    let log = CoalescingLog::default();
+    let entries = log.clone();
     let (report, reports) = channel();
     let (list_reply, list_replies) = channel();
     thread::spawn(move || {
@@ -408,17 +841,25 @@ fn spawn_app(
             return;
         }
         for message in rx {
-            if matches!(message, Inbox::Event(_) | Inbox::Guarded(..)) {
+            if matches!(
+                message,
+                Inbox::Event(_)
+                    | Inbox::Guarded(..)
+                    | Inbox::Drag { .. }
+                    | Inbox::Scroll { .. }
+                    | Inbox::ContextMenu { .. }
+            ) {
                 thread::sleep(delay);
             }
             // Catch up with the log. JS is not running, so the columns can be written.
             let (mut ids, mut all) = (Vec::new(), false);
-            for entry in entries.try_iter() {
+            for entry in entries.drain() {
                 match entry {
-                    Log::Answer(accepted) => all |= replica.borrow_mut().answered(accepted),
-                    Log::Ui(batch) => {
+                    LogEntry::Answer(accepted) => all |= replica.borrow_mut().answered(accepted),
+                    LogEntry::Ui(coalesced) => {
+                        let batch = coalesced.into_batch();
                         ids.extend(touched(&batch.ops));
-                        replica.borrow_mut().foreign(batch)
+                        replica.borrow_mut().foreign(batch);
                     }
                 }
             }
@@ -429,6 +870,30 @@ fn spawn_app(
             let ops = match message {
                 Inbox::Event(event) => app.handle(event, &replica.borrow().view),
                 Inbox::Guarded(event, guard) => app.guarded(event, guard),
+                Inbox::Drag {
+                    callback,
+                    guard,
+                    phase,
+                    x,
+                    y,
+                    sx,
+                    sy,
+                    dx,
+                    dy,
+                } => app.handle_drag(callback, guard, phase, x, y, sx, sy, dx, dy),
+                Inbox::Scroll {
+                    callback,
+                    guard,
+                    top,
+                    height,
+                    client,
+                } => app.handle_scroll(callback, guard, top, height, client),
+                Inbox::ContextMenu {
+                    callback,
+                    guard,
+                    x,
+                    y,
+                } => app.handle_context_menu(callback, guard, x, y),
                 Inbox::List(delta) => match app.list(delta) {
                     Ok((binds, ops)) => {
                         let _ = list_reply.send(Ok(binds));
@@ -440,7 +905,7 @@ fn spawn_app(
                     }
                 },
                 // The new app replaces the old one in a single batch: remove the root, then mount.
-                Inbox::Reload(js) => match app.reload(&js) {
+                Inbox::Reload(js, preserve_state) => match app.reload(&js, preserve_state) {
                     Ok(mount) => {
                         let _ = report.send(Ok(()));
                         let root = replica.borrow().view.root;
@@ -477,7 +942,7 @@ fn spawn_app(
                 Ok(()) if let Some(ids) = list_ids => app.sync(&replica.borrow().view, Some(&ids)),
                 Ok(()) if removed => app.sync(&replica.borrow().view, None),
                 Ok(()) => app.sync(&replica.borrow().view, Some(&touched(&batch.ops))),
-                Err(e) => eprintln!("invalid batch from the app ({e}): the UI will reject it"),
+                Err(e) => { eprintln!("invalid batch from the app ({e}): the UI will reject it"); let st = replica.borrow(); for (i,op) in batch.ops.iter().enumerate() { if let tree::Op::Create{id,parent:Some(p),..} = op { if st.view.nodes.get(p).is_none() { eprintln!("DBGBAD #{i} create {id} under missing {p}; earlier ops on {p}: {:?}", batch.ops[..i].iter().filter(|o| format!("{o:?}").contains(&format!("id: {p},")) || format!("{o:?}").contains(&format!("id: {p} "))).map(|o| format!("{o:?}").chars().take(80).collect::<String>()).collect::<Vec<_>>()); break; } } } }
             }
             if tx.send(batch).is_err() {
                 break;
@@ -1059,5 +1524,198 @@ mod tests {
             );
         }
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn binary_command_buffer_decodes_all_ops_without_json() {
+        let vm = Vm::load(
+            r#"
+            function jsnirMount() {
+                var u = jsnir.cmd;
+                var f = jsnir.cmdF32;
+                var p = 0;
+                // OP_SET(1, id=2, value=42)
+                u[p++] = 1; u[p++] = 2; u[p++] = 42;
+                // OP_SET_DISABLED(2, id=3, disabled=1)
+                u[p++] = 2; u[p++] = 3; u[p++] = 1;
+                // OP_REMOVE(3, id=4)
+                u[p++] = 3; u[p++] = 4;
+                // OP_MOVE(4, id=5, before=None)
+                u[p++] = 4; u[p++] = 5; u[p++] = 0xffffffff;
+                // OP_FOCUS(5, id=6)
+                u[p++] = 5; u[p++] = 6;
+                // OP_AFTER(6, cb=7, ms=125.5)
+                u[p++] = 6; u[p++] = 7; f[p++] = 125.5;
+                // OP_SCROLL_TO(7, id=8, flags=offset|smooth=9, offset=320)
+                u[p++] = 7; u[p++] = 8; u[p++] = 9; f[p++] = 320.0;
+                // OP_SET_STYLE(8, id=9, mask=width(1)|height(2)|layer(1<<11), flags=row(1)|clip(1<<8))
+                u[p++] = 8; u[p++] = 9; u[p++] = 1 | 2 | (1 << 11); u[p++] = 1 | (1 << 8);
+                f[p++] = 240.0; f[p++] = 80.0; u[p++] = (-2 | 0) >>> 0;
+                // OP_SET_PAINT(9, id=10, mask=bg(1)|opacity(1<<7)|cursor(1<<14))
+                u[p++] = 9; u[p++] = 10; u[p++] = 1 | (1 << 7) | (1 << 14);
+                u[p++] = 0x112233ff >>> 0; f[p++] = 0.75; u[p++] = 7; // ColResize
+                jsnir.commit(p);
+            }
+            "#,
+            Rc::default(),
+        );
+        let ops = vm.call_mount().unwrap();
+        assert_eq!(ops.len(), 9);
+        assert_eq!(ops[0], Op::Set { id: 2, value: 42 });
+        assert_eq!(
+            ops[1],
+            Op::SetDisabled {
+                id: 3,
+                disabled: true
+            }
+        );
+        assert_eq!(ops[2], Op::Remove { id: 4 });
+        assert_eq!(
+            ops[3],
+            Op::Move {
+                id: 5,
+                before: None
+            }
+        );
+        assert_eq!(ops[4], Op::Focus { id: 6 });
+        assert_eq!(
+            ops[5],
+            Op::After {
+                ms: 125.5,
+                callback: 7
+            }
+        );
+        assert_eq!(
+            ops[6],
+            Op::ScrollTo {
+                id: 8,
+                offset: Some(320.0),
+                to: None,
+                smooth: true
+            }
+        );
+        assert_eq!(
+            ops[7],
+            Op::SetStyle {
+                id: 9,
+                style: tree::Style {
+                    direction: tree::Axis::Row,
+                    clip: true,
+                    width: Some(240.0),
+                    height: Some(80.0),
+                    layer: Some(-2),
+                    ..Default::default()
+                }
+            }
+        );
+        assert_eq!(
+            ops[8],
+            Op::SetPaint {
+                id: 10,
+                paint: Box::new(tree::Paint {
+                    background: Some(0x112233ff),
+                    opacity: Some(0.75),
+                    cursor: Some(tree::Cursor::ColResize),
+                    ..Default::default()
+                })
+            }
+        );
+    }
+
+    #[test]
+    fn coalescing_log_merges_repeated_ui_updates_and_preserves_answer_barriers() {
+        let log = CoalescingLog::default();
+        for i in 0..100u32 {
+            let _ = log.send(Log::Ui(Batch {
+                base: 0,
+                ops: vec![
+                    Op::SetRect {
+                        id: 2,
+                        rect: [0., 0., i as f32, 20.],
+                    },
+                    Op::SetScroll {
+                        id: 2,
+                        scroll: [i as f32, 500., 100.],
+                    },
+                    Op::SetInput {
+                        id: 3,
+                        text: format!("v{i}"),
+                        selection: [i, i],
+                    },
+                ],
+            }));
+        }
+        let _ = log.send(Log::Answer(true));
+        for i in 0..50u32 {
+            let _ = log.send(Log::Ui(Batch {
+                base: 0,
+                ops: vec![Op::SetRect {
+                    id: 2,
+                    rect: [1., 2., (100 + i) as f32, 30.],
+                }],
+            }));
+        }
+        let mut drained = log.drain();
+        assert_eq!(drained.len(), 3, "expected [Ui, Answer, Ui]");
+        let first = match drained.pop_front().unwrap() {
+            LogEntry::Ui(u) => u.into_batch(),
+            _ => panic!("expected Ui entry"),
+        };
+        assert_eq!(first.ops.len(), 3);
+        assert!(first.ops.contains(&Op::SetRect {
+            id: 2,
+            rect: [0., 0., 99., 20.]
+        }));
+        assert!(first.ops.contains(&Op::SetScroll {
+            id: 2,
+            scroll: [99., 500., 100.]
+        }));
+        assert!(first.ops.contains(&Op::SetInput {
+            id: 3,
+            text: "v99".into(),
+            selection: [99, 99]
+        }));
+        assert!(matches!(drained.pop_front().unwrap(), LogEntry::Answer(true)));
+        let second = match drained.pop_front().unwrap() {
+            LogEntry::Ui(u) => u.into_batch(),
+            _ => panic!("expected second Ui entry"),
+        };
+        assert_eq!(
+            second.ops,
+            vec![Op::SetRect {
+                id: 2,
+                rect: [1., 2., 149., 30.]
+            }]
+        );
+    }
+
+    #[test]
+    fn bytecode_aot_roundtrip_mounts_and_handles_events() {
+        let js = r#"
+            var n = 0;
+            function jsnirMount() {
+                jsnir.batch(JSON.stringify({ ops: [
+                    { op: 'create', id: 1, node: { kind: 'box', style: { width: 100, height: 40 }, press: 1 } },
+                    { op: 'create', id: 2, parent: 1, node: { kind: 'text', text: 'count:0' } },
+                ] }));
+            }
+            function jsnirEvent(cb) {
+                if (cb === 1) { n += 1; jsnir.setText(2, 'count:' + n); }
+            }
+        "#;
+        let bytecode = compile_bytecode(js).expect("compile bytecode");
+        assert!(bytecode.starts_with(BYTECODE_MAGIC));
+
+        let mut host =
+            host::Host::try_new_auto(bytecode, "{}".into(), text::TextEngine::default())
+                .expect("mount bytecode");
+        host.frame(200., 100., 1., 4096);
+        assert_eq!(host.tree.text(2), Some("count:0"));
+
+        host.pointer_move(Some([20., 20.]));
+        host.pointer_down(editor::PointSelection::Place);
+        host.pointer_up();
+        host.poll();
+        assert_eq!(host.tree.text(2), Some("count:1"));
     }
 }

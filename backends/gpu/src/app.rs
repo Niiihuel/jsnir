@@ -1,17 +1,17 @@
 //! A window that runs any TSX app through `jsnir::host::Host`: winit input in, wgpu frames out.
 use crate::{
     Result,
-    input::{Clicks, Clipboard, ImeArea, KeyInput, editor_key, ime_event},
+    input::{Clicks, Clipboard, KeyInput, PlatformIme, editor_key, ime_event},
     renderer::Renderer,
     surface::{self, Surface},
     view::View,
 };
 use jsnir::{
     editor::EditorEvent,
-    host::{Cursor, Host},
+    host::{Cursor, DevError, Host},
 };
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU32, Ordering},
@@ -39,13 +39,14 @@ pub struct AppWindow {
     modifiers: ModifiersState,
     clicks: Clicks,
     clipboard: Clipboard,
-    ime_area: ImeArea,
+    ime: PlatformIme,
     window_focused: bool,
-    ime_enabled: bool,
+    cursor_shape: Cursor,
     wake: Option<Instant>,
     // Messages from `Pusher`; None when the program has no channel (`open`).
     inbox: Option<Receiver<Message>>,
     shared: Arc<Shared>,
+    dropped_files: Vec<PathBuf>,
     error: Option<Box<dyn std::error::Error>>,
 }
 
@@ -61,12 +62,13 @@ impl AppWindow {
             modifiers: ModifiersState::empty(),
             clicks: Clicks::default(),
             clipboard: Clipboard::default(),
-            ime_area: ImeArea::default(),
+            ime: PlatformIme::default(),
             window_focused: true,
-            ime_enabled: false,
+            cursor_shape: Cursor::Default,
             wake: None,
             inbox: None,
             shared: Arc::default(),
+            dropped_files: Vec::new(),
             error: None,
         }
     }
@@ -94,15 +96,11 @@ impl AppWindow {
         self.host.push(format!(r#"{{"jsnirScale":{scale}}}"#));
     }
 
-    // The platform input method is on only while a field has focus.
+    // The platform input method is on only while a non-password field has focus.
     fn sync_ime(&mut self) {
-        let enabled = self.window_focused && self.host.focused();
-        if enabled != self.ime_enabled
-            && let Some(surface) = &self.surface
-        {
-            surface.window.set_ime_allowed(enabled);
-            self.ime_enabled = enabled;
-            self.ime_area.forget();
+        if let Some(surface) = &self.surface {
+            self.ime
+                .sync(&surface.window, self.window_focused, self.host.ime_state());
         }
     }
 
@@ -112,19 +110,20 @@ impl AppWindow {
             self.clipboard.set_text(text);
         }
         if output.interrupt_ime
-            && self.ime_enabled
             && let Some(surface) = &self.surface
         {
-            self.ime_area.forget();
-            surface.window.set_ime_allowed(false);
-            surface.window.set_ime_allowed(true);
+            self.ime.interrupt(&surface.window);
         }
+        self.sync_ime();
         self.request_redraw();
     }
 
     fn redraw(&mut self, events: &ActiveEventLoop) {
         self.wake = None;
         self.host.poll();
+        if let Some(update) = self.shared.on_frame.lock().unwrap().as_mut() {
+            update(&mut self.host);
+        }
         for result in std::iter::from_fn(|| self.host.take_reload_result()) {
             if let Err(error) = result {
                 eprintln!("jsnir: reload failed: {error}");
@@ -185,9 +184,9 @@ impl AppWindow {
         let draws = self
             .view
             .draws(&mut self.host, &surface.renderer, scene.items, scale);
-        if let (true, Some(area)) = (self.ime_enabled, scene.ime_area) {
-            self.ime_area.update(&surface.window, area);
-        }
+        self.ime
+            .sync(&surface.window, self.window_focused, self.host.ime_state());
+        self.ime.update_area(&surface.window, scene.ime_area);
         surface.renderer.draw(&frame.texture, pixels, scale, &draws);
         surface.window.pre_present_notify();
         surface.renderer.queue.present(frame);
@@ -198,6 +197,16 @@ impl AppWindow {
         if scene.animating || reconfigure {
             surface.window.request_redraw();
         }
+        self.sync_cursor(self.host.cursor());
+    }
+
+    fn sync_cursor(&mut self, next: Cursor) {
+        if next != self.cursor_shape
+            && let Some(surface) = &self.surface
+        {
+            surface.window.set_cursor(cursor_icon(next));
+            self.cursor_shape = next;
+        }
     }
 
     fn cursor(&mut self, position: Option<PhysicalPosition<f64>>) {
@@ -206,13 +215,8 @@ impl AppWindow {
             let p = p.to_logical::<f32>(surface.window.scale_factor());
             [p.x, p.y]
         });
-        let icon = match self.host.pointer_move(point) {
-            Cursor::Default => CursorIcon::Default,
-            Cursor::Pointer => CursorIcon::Pointer,
-            Cursor::Text => CursorIcon::Text,
-            Cursor::NotAllowed => CursorIcon::NotAllowed,
-        };
-        surface.window.set_cursor(icon);
+        let next = self.host.pointer_move(point);
+        self.sync_cursor(next);
         self.request_redraw();
     }
 
@@ -242,6 +246,7 @@ impl AppWindow {
             ElementState::Released => self.host.pointer_up(),
         }
         self.sync_ime();
+        self.sync_cursor(self.host.cursor());
         self.request_redraw();
     }
 
@@ -321,6 +326,8 @@ impl ApplicationHandler for AppWindow {
             WindowEvent::Focused(focused) => {
                 self.window_focused = focused;
                 if !focused {
+                    self.host.pointer_cancel();
+                    self.sync_cursor(self.host.cursor());
                     self.edit(&[EditorEvent::Preedit {
                         text: String::new(),
                         active: None,
@@ -345,6 +352,7 @@ impl ApplicationHandler for AppWindow {
                 self.request_redraw();
             }
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
+            WindowEvent::DroppedFile(path) => self.dropped_files.push(path),
             WindowEvent::KeyboardInput {
                 event,
                 is_synthetic: false,
@@ -361,7 +369,7 @@ impl ApplicationHandler for AppWindow {
         }
     }
 
-    fn user_event(&mut self, _: &ActiveEventLoop, _: ()) {
+    fn user_event(&mut self, events: &ActiveEventLoop, _: ()) {
         let Some(inbox) = &self.inbox else { return };
         for message in inbox.try_iter() {
             match message {
@@ -371,18 +379,44 @@ impl ApplicationHandler for AppWindow {
                 Message::Font(bytes) => self.host.add_font(bytes),
                 Message::DefaultFamily(family) => self.host.set_default_family(family),
                 Message::ReducedMotion(on) => self.host.set_reduced_motion(on),
-                Message::Reload(script) => {
-                    if !self.host.reload(script) {
+                Message::Reload {
+                    script,
+                    preserve_state,
+                } => {
+                    let ok = if preserve_state {
+                        self.host.reload(script)
+                    } else {
+                        self.host.hard_reload(script)
+                    };
+                    if !ok {
                         eprintln!(
                             "jsnir: reload failed: the app's event queue is full, send it again"
                         );
                     }
+                }
+                Message::DevOverlay(enabled) => self.host.enable_dev_overlay(enabled),
+                Message::DevError(error) => self.host.set_dev_error(error),
+                Message::Title(title) => {
+                    self.title = title;
+                    if let Some(surface) = &self.surface {
+                        surface.window.set_title(&self.title);
+                    }
+                }
+                Message::Close => {
+                    events.exit();
+                    return;
                 }
             }
         }
         self.request_redraw();
     }
     fn about_to_wait(&mut self, events: &ActiveEventLoop) {
+        if !self.dropped_files.is_empty() {
+            let paths = std::mem::take(&mut self.dropped_files);
+            if let Some(on_drop) = self.shared.on_drop.lock().unwrap().as_ref() {
+                on_drop(paths);
+            }
+        }
         let now = Instant::now();
         if self.wake.is_some_and(|wake| now >= wake) {
             self.wake = None;
@@ -393,6 +427,24 @@ impl ApplicationHandler for AppWindow {
             self.wake = Some(now + Duration::from_millis(4));
         }
         events.set_control_flow(self.wake.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
+    }
+}
+
+fn cursor_icon(cursor: Cursor) -> CursorIcon {
+    match cursor {
+        Cursor::Default => CursorIcon::Default,
+        Cursor::Pointer => CursorIcon::Pointer,
+        Cursor::Text => CursorIcon::Text,
+        Cursor::NotAllowed => CursorIcon::NotAllowed,
+        Cursor::Grab => CursorIcon::Grab,
+        Cursor::Grabbing => CursorIcon::Grabbing,
+        Cursor::Move => CursorIcon::Move,
+        Cursor::ColResize => CursorIcon::ColResize,
+        Cursor::RowResize => CursorIcon::RowResize,
+        Cursor::EwResize => CursorIcon::EwResize,
+        Cursor::NsResize => CursorIcon::NsResize,
+        Cursor::NeswResize => CursorIcon::NeswResize,
+        Cursor::NwseResize => CursorIcon::NwseResize,
     }
 }
 
@@ -457,20 +509,33 @@ enum Message {
     Font(Vec<u8>),
     DefaultFamily(String),
     ReducedMotion(bool),
-    Reload(String),
+    Reload {
+        script: String,
+        preserve_state: bool,
+    },
+    DevOverlay(bool),
+    DevError(Option<DevError>),
+    Title(String),
+    Close,
 }
 type ScaleCallback = Box<dyn Fn(f32) + Send>;
+type FrameCallback = Box<dyn FnMut(&mut Host) + Send>;
+type DropCallback = Box<dyn Fn(Vec<PathBuf>) + Send>;
 /// The window's scale factor and its `on_scale` callback, shared between the window and its `Pusher`s.
 struct Shared {
     // f32 bits; 1.0 until the window opens.
     scale: AtomicU32,
     on_scale: Mutex<Option<ScaleCallback>>,
+    on_frame: Mutex<Option<FrameCallback>>,
+    on_drop: Mutex<Option<DropCallback>>,
 }
 impl Default for Shared {
     fn default() -> Self {
         Self {
             scale: AtomicU32::new(1f32.to_bits()),
             on_scale: Mutex::new(None),
+            on_frame: Mutex::new(None),
+            on_drop: Mutex::new(None),
         }
     }
 }
@@ -502,6 +567,18 @@ impl Pusher {
     pub fn on_scale(&self, f: impl Fn(f32) + Send + 'static) {
         *self.shared.on_scale.lock().unwrap() = Some(Box::new(f));
     }
+    /// Runs a nonblocking native data binding on the window thread before layout.
+    pub fn on_frame(&self, update: impl FnMut(&mut Host) + Send + 'static) {
+        *self.shared.on_frame.lock().unwrap() = Some(Box::new(update));
+    }
+    /// Delivers the native paths of files dropped into the window to the Rust embedder.
+    pub fn on_file_drop(&self, handler: impl Fn(Vec<PathBuf>) + Send + 'static) {
+        *self.shared.on_drop.lock().unwrap() = Some(Box::new(handler));
+    }
+    /// Requests redraw after native data changed without a JS message.
+    pub fn redraw(&self) -> bool {
+        self.proxy.send_event(()).is_ok()
+    }
     /// Returns false once the window has closed.
     pub fn push(&self, json: String) -> bool {
         self.send(Message::Push(json))
@@ -530,7 +607,33 @@ impl Pusher {
     /// Replaces the app's code with `script` (SDK + app), keeping its state where it can (`Host::reload`). If the
     /// new code fails, the window prints `jsnir: reload failed` and the previous app keeps running.
     pub fn reload(&self, script: String) -> bool {
-        self.send(Message::Reload(script))
+        self.send(Message::Reload {
+            script,
+            preserve_state: true,
+        })
+    }
+    /// Replaces the app's code with `script` and resets all JS signals and native focus/scroll state (`Host::hard_reload`).
+    pub fn hard_reload(&self, script: String) -> bool {
+        self.send(Message::Reload {
+            script,
+            preserve_state: false,
+        })
+    }
+    /// Enables or disables automatic display of reload failures in the native error overlay.
+    pub fn enable_dev_overlay(&self, enabled: bool) -> bool {
+        self.send(Message::DevOverlay(enabled))
+    }
+    /// Shows or clears the native development error overlay above the app.
+    pub fn dev_error(&self, error: Option<DevError>) -> bool {
+        self.send(Message::DevError(error))
+    }
+    /// Updates the native window title.
+    pub fn title(&self, title: String) -> bool {
+        self.send(Message::Title(title))
+    }
+    /// Closes the window cleanly from another thread (e.g. a dev CLI shortcut).
+    pub fn close(&self) -> bool {
+        self.send(Message::Close)
     }
     fn send(&self, message: Message) -> bool {
         self.tx.send(message).is_ok() && self.proxy.send_event(()).is_ok()

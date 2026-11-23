@@ -8,6 +8,42 @@ use cosmic_text::{
 use std::{borrow::Cow, ops::Range};
 use unicode_segmentation::UnicodeSegmentation;
 
+/// Window of text surrounding the caret/selection for cross-platform IME protocols:
+/// - Linux Wayland `zwp_text_input_v3` consumes `text` (<= 4000 UTF-8 bytes), `cursor_byte`, and `anchor_byte`.
+/// - Windows TSF and macOS `NSTextInputClient` consume `cursor_utf16` and `anchor_utf16`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SurroundingText {
+    pub text: String,
+    /// Caret (head) offset inside `text`, in UTF-8 bytes.
+    pub cursor_byte: usize,
+    /// Selection anchor offset inside `text`, in UTF-8 bytes.
+    pub anchor_byte: usize,
+    /// Caret (head) offset inside `text`, in UTF-16 code units.
+    pub cursor_utf16: usize,
+    /// Selection anchor offset inside `text`, in UTF-16 code units.
+    pub anchor_utf16: usize,
+    /// Start of `text` within the full field text, in UTF-8 bytes.
+    pub window_byte_offset: usize,
+}
+
+/// Visual style of a preedit clause during CJK / dead-key composition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreeditStyle {
+    /// Unconverted / inactive clause: 1 px underline.
+    Underline,
+    /// Target / active conversion clause: 2 px thick underline.
+    ThickUnderline,
+    /// Highlighted range within the preedit string.
+    Selection,
+}
+
+/// One styled range within a preedit string. `range` uses character indices in the preedit text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreeditSegment {
+    pub range: Range<usize>,
+    pub style: PreeditStyle,
+}
+
 #[derive(Debug)]
 pub enum EditorEvent {
     Insert(String),
@@ -34,10 +70,23 @@ pub enum EditorEvent {
         text: String,
         active: Option<Range<usize>>,
     },
+    /// Multi-clause preedit (Japanese / Chinese / Korean IMEs with active conversion segments).
+    PreeditSegments {
+        text: String,
+        segments: Vec<PreeditSegment>,
+        cursor: Option<usize>,
+    },
     Commit(String),
+    /// Deletes `before` and `after` Unicode scalar values around the selection.
     DeleteSurrounding {
         before: usize,
         after: usize,
+    },
+    /// Deletes `before_bytes` and `after_bytes` UTF-8 bytes around the selection (Wayland `zwp_text_input_v3`).
+    /// Unaligned byte lengths are clamped safely to UTF-8 character boundaries.
+    DeleteSurroundingBytes {
+        before_bytes: usize,
+        after_bytes: usize,
     },
     Cancel,
     /// Enter: the host submits a field with it, or breaks the line of a multi-line field that does not submit.
@@ -50,7 +99,11 @@ impl EditorEvent {
     pub(crate) fn involves_ime(&self) -> bool {
         matches!(
             self,
-            Self::Preedit { .. } | Self::Commit(_) | Self::DeleteSurrounding { .. }
+            Self::Preedit { .. }
+                | Self::PreeditSegments { .. }
+                | Self::Commit(_)
+                | Self::DeleteSurrounding { .. }
+                | Self::DeleteSurroundingBytes { .. }
         )
     }
 }
@@ -132,6 +185,8 @@ struct EditRecord {
 struct Preedit {
     text: String,
     active: Option<Range<usize>>,
+    segments: Vec<PreeditSegment>,
+    cursor: Option<usize>,
 }
 
 pub struct LineEditor {
@@ -139,6 +194,8 @@ pub struct LineEditor {
     // Style the text is shaped in: the field's font.
     style: TextStyle,
     multiline: bool,
+    // Password fields mask displayed glyphs with '•', block Copy/Cut, and suppress IME surrounding text.
+    password: bool,
     // Height of the visible text, which Page Up and Page Down move by.
     page: f32,
     // Set by each event: the next frame keeps the caret in view.
@@ -159,6 +216,7 @@ impl Default for LineEditor {
             inner: empty_editor("", &TextStyle::default()),
             style: TextStyle::default(),
             multiline: false,
+            password: false,
             page: 0.,
             follow: false,
             preedit: None,
@@ -263,6 +321,95 @@ impl LineEditor {
 
     pub fn composing(&self) -> bool {
         self.preedit.is_some()
+    }
+
+    /// Enables or disables password masking (`•` glyphs, Copy/Cut blocked, surrounding text withheld).
+    pub fn set_password(&mut self, password: bool) {
+        if self.password != password {
+            self.password = password;
+            if password {
+                self.preedit = None;
+            }
+            self.invalidate();
+        }
+    }
+
+    pub fn is_password(&self) -> bool {
+        self.password
+    }
+
+    /// Returns a UTF-8 char-boundary-safe window of text surrounding the caret/selection (at most `max_bytes`
+    /// UTF-8 bytes), with both UTF-8 byte offsets (Wayland `zwp_text_input_v3`) and UTF-16 code-unit offsets
+    /// (Windows TSF / macOS). Returns an empty window when `password` is enabled.
+    pub fn surrounding_text(&self, max_bytes: usize) -> SurroundingText {
+        if self.password || max_bytes == 0 {
+            return SurroundingText::default();
+        }
+        let full = self.text();
+        let selected = self.selected_bytes();
+        let caret = self.caret();
+        let buffer = self.buffer();
+        let backwards = match caret.selection {
+            Selection::Normal(anchor) | Selection::Line(anchor) | Selection::Word(anchor) => {
+                offset_of(buffer, caret.cursor) < offset_of(buffer, anchor)
+            }
+            Selection::None => false,
+        };
+        let (head, anchor) = if backwards {
+            (selected.start, selected.end)
+        } else {
+            (selected.end, selected.start)
+        };
+
+        let (win_start, win_end) = if full.len() <= max_bytes {
+            (0, full.len())
+        } else {
+            let sel_len = selected.end - selected.start;
+            let mid = if sel_len <= max_bytes {
+                (selected.start + selected.end) / 2
+            } else {
+                head
+            };
+            let mut raw_start = mid.saturating_sub(max_bytes / 2);
+            let mut raw_end = (raw_start + max_bytes).min(full.len());
+            raw_start = raw_end.saturating_sub(max_bytes);
+            if sel_len <= max_bytes {
+                if raw_start > selected.start {
+                    raw_start = selected.start;
+                    raw_end = (raw_start + max_bytes).min(full.len());
+                } else if raw_end < selected.end {
+                    raw_end = selected.end;
+                    raw_start = raw_end.saturating_sub(max_bytes);
+                }
+            }
+            let mut start = raw_start;
+            while start < full.len() && !full.is_char_boundary(start) {
+                start += 1;
+            }
+            let mut end = raw_end;
+            while end > start && !full.is_char_boundary(end) {
+                end -= 1;
+            }
+            if start > end {
+                (end, end)
+            } else {
+                (start, end)
+            }
+        };
+
+        let slice = &full[win_start..win_end];
+        let cursor_byte = head.clamp(win_start, win_end) - win_start;
+        let anchor_byte = anchor.clamp(win_start, win_end) - win_start;
+        let cursor_utf16 = slice[..cursor_byte].encode_utf16().count();
+        let anchor_utf16 = slice[..anchor_byte].encode_utf16().count();
+        SurroundingText {
+            text: slice.to_owned(),
+            cursor_byte,
+            anchor_byte,
+            cursor_utf16,
+            anchor_utf16,
+            window_byte_offset: win_start,
+        }
     }
 
     fn selected_bytes(&self) -> Range<usize> {
@@ -488,6 +635,29 @@ impl LineEditor {
                 .map_or(0, |(i, _)| i)
         });
         let end = selected.end + byte_at(&text[selected.end..], after);
+        self.delete_surrounding_byte_range(selected, start, end);
+    }
+
+    fn delete_surrounding_bytes(&mut self, before_bytes: usize, after_bytes: usize) {
+        let selected = self.selected_bytes();
+        let text = self.text();
+        let mut start = selected.start.saturating_sub(before_bytes);
+        while start > 0 && !text.is_char_boundary(start) {
+            start -= 1;
+        }
+        let mut end = selected.end.saturating_add(after_bytes).min(text.len());
+        while end < text.len() && !text.is_char_boundary(end) {
+            end += 1;
+        }
+        self.delete_surrounding_byte_range(selected, start, end);
+    }
+
+    fn delete_surrounding_byte_range(
+        &mut self,
+        selected: Range<usize>,
+        start: usize,
+        end: usize,
+    ) {
         let removed_before = selected.start - start;
         if removed_before == 0 && selected.end == end {
             return;
@@ -535,10 +705,32 @@ impl LineEditor {
         self.follow = true;
         match event {
             EditorEvent::Preedit { text, active } => {
+                if self.password {
+                    return output;
+                }
                 let text = clean(text, self.multiline);
                 self.preedit = (!text.is_empty()).then(|| Preedit {
                     text: text.into_owned(),
                     active: active.clone(),
+                    segments: Vec::new(),
+                    cursor: None,
+                });
+                self.invalidate();
+            }
+            EditorEvent::PreeditSegments {
+                text,
+                segments,
+                cursor,
+            } => {
+                if self.password {
+                    return output;
+                }
+                let text = clean(text, self.multiline);
+                self.preedit = (!text.is_empty()).then(|| Preedit {
+                    text: text.into_owned(),
+                    active: None,
+                    segments: segments.clone(),
+                    cursor: *cursor,
                 });
                 self.invalidate();
             }
@@ -549,7 +741,17 @@ impl LineEditor {
                 self.insert(text);
             }
             EditorEvent::DeleteSurrounding { before, after } => {
-                self.delete_surrounding(*before, *after);
+                if !self.password {
+                    self.delete_surrounding(*before, *after);
+                }
+            }
+            EditorEvent::DeleteSurroundingBytes {
+                before_bytes,
+                after_bytes,
+            } => {
+                if !self.password {
+                    self.delete_surrounding_bytes(*before_bytes, *after_bytes);
+                }
             }
             EditorEvent::Cancel | EditorEvent::Point { .. } => {
                 if self.preedit.take().is_some() {
@@ -557,7 +759,6 @@ impl LineEditor {
                     output.interrupt_ime = true;
                 }
                 if let EditorEvent::Point { x, y, select } = *event {
-                    self.inner.shape_as_needed(engine.fonts(), false);
                     let x = x + self.scroll_x;
                     // A single-line field takes the middle of its line, whatever the height of the press.
                     let y = if self.multiline {
@@ -565,23 +766,58 @@ impl LineEditor {
                     } else {
                         self.style.line_height / 2.
                     };
-                    if let Some(mut cursor) = self.buffer().hit(x, y) {
-                        cursor.index = grapheme_edge(
-                            self.buffer().lines[cursor.line].text(),
-                            cursor.index,
-                            cursor.affinity == Affinity::Before,
-                        );
-                        let selection = match select {
-                            PointSelection::Place => Selection::None,
-                            PointSelection::Extend => match self.inner.selection() {
-                                Selection::None => Selection::Normal(self.inner.cursor()),
-                                selection => selection,
-                            },
-                            PointSelection::Word => Selection::Word(cursor),
-                            PointSelection::All => Selection::Line(cursor),
-                        };
-                        self.inner.set_cursor(cursor);
-                        self.inner.set_selection(selection);
+                    if self.password {
+                        let real = self.text().into_owned();
+                        let masked = mask_text(&real);
+                        let wrap = self.buffer().size().0;
+                        if self.preview.is_none() {
+                            self.preview = Some(engine.shape(&masked, &self.style, wrap));
+                        }
+                        let preview = self.preview.as_ref().expect("masked preview is shaped");
+                        if let Some(mut hit) = preview.hit(x, y) {
+                            hit.index = grapheme_edge(
+                                preview.lines[hit.line].text(),
+                                hit.index,
+                                hit.affinity == Affinity::Before,
+                            );
+                            let masked_byte = offset_of(preview, hit);
+                            let char_idx = masked[..masked_byte].chars().count();
+                            let real_byte = byte_at(&real, char_idx);
+                            let cursor = cursor_at(self.buffer(), real_byte);
+                            let selection = match select {
+                                PointSelection::Place => Selection::None,
+                                PointSelection::Extend => match self.inner.selection() {
+                                    Selection::None => Selection::Normal(self.inner.cursor()),
+                                    selection => selection,
+                                },
+                                // Do not expose word boundaries inside password fields.
+                                PointSelection::Word | PointSelection::All => {
+                                    Selection::Line(cursor)
+                                }
+                            };
+                            self.inner.set_cursor(cursor);
+                            self.inner.set_selection(selection);
+                        }
+                    } else {
+                        self.inner.shape_as_needed(engine.fonts(), false);
+                        if let Some(mut cursor) = self.buffer().hit(x, y) {
+                            cursor.index = grapheme_edge(
+                                self.buffer().lines[cursor.line].text(),
+                                cursor.index,
+                                cursor.affinity == Affinity::Before,
+                            );
+                            let selection = match select {
+                                PointSelection::Place => Selection::None,
+                                PointSelection::Extend => match self.inner.selection() {
+                                    Selection::None => Selection::Normal(self.inner.cursor()),
+                                    selection => selection,
+                                },
+                                PointSelection::Word => Selection::Word(cursor),
+                                PointSelection::All => Selection::Line(cursor),
+                            };
+                            self.inner.set_cursor(cursor);
+                            self.inner.set_selection(selection);
+                        }
                     }
                 } else if !output.interrupt_ime {
                     self.inner.set_selection(Selection::None);
@@ -601,6 +837,9 @@ impl LineEditor {
                 self.inner.set_cursor(end);
             }
             EditorEvent::Copy | EditorEvent::Cut => {
+                if self.password {
+                    return output;
+                }
                 let range = self.selected_bytes();
                 if !range.is_empty() {
                     output.clipboard = Some(self.text()[range.clone()].to_owned());
@@ -655,7 +894,9 @@ impl LineEditor {
         self.set_wrap(engine.fonts(), wrap);
         self.page = size[1];
         let follow = std::mem::take(&mut self.follow);
-        let (cursor, selected, composition) = if let Some(preedit) = &self.preedit {
+        let mut selection_ranges: Vec<Range<usize>> = Vec::new();
+        let mut underline_ranges: Vec<(Range<usize>, f32)> = Vec::new();
+        let (cursor, caret_visible) = if let Some(preedit) = &self.preedit {
             let replace = self.selected_bytes();
             let start = replace.start;
             let end = start + preedit.text.len();
@@ -664,20 +905,58 @@ impl LineEditor {
                 display.replace_range(replace, &preedit.text);
                 self.preview = Some(engine.shape(&display, &self.style, wrap));
             }
-            let selected = preedit
-                .active
-                .as_ref()
-                .map(|range| {
-                    start + byte_at(&preedit.text, range.start)
-                        ..start + byte_at(&preedit.text, range.end)
-                })
-                .unwrap_or(end..end);
+            if preedit.segments.is_empty() {
+                if let Some(range) = preedit.active.as_ref() {
+                    selection_ranges.push(
+                        start + byte_at(&preedit.text, range.start)
+                            ..start + byte_at(&preedit.text, range.end),
+                    );
+                }
+                underline_ranges.push((start..end, 1.));
+            } else {
+                for seg in &preedit.segments {
+                    let s = start + byte_at(&preedit.text, seg.range.start);
+                    let e = start + byte_at(&preedit.text, seg.range.end);
+                    if s >= e {
+                        continue;
+                    }
+                    match seg.style {
+                        PreeditStyle::Underline => underline_ranges.push((s..e, 1.)),
+                        PreeditStyle::ThickUnderline => underline_ranges.push((s..e, 2.)),
+                        PreeditStyle::Selection => selection_ranges.push(s..e),
+                    }
+                }
+            }
             let preview = self.preview.as_ref().expect("the preview is shaped");
-            let at = cursor_at(preview, end);
+            let caret_byte = preedit
+                .cursor
+                .map_or(end, |c| start + byte_at(&preedit.text, c));
+            let at = cursor_at(preview, caret_byte);
+            let visible = preedit.cursor.is_some() || preedit.active.is_some();
             (
                 Cursor::new_with_affinity(at.line, at.index, Affinity::Before),
-                selected,
-                start..end,
+                visible,
+            )
+        } else if self.password {
+            let real = self.text().into_owned();
+            let masked = mask_text(&real);
+            if self.preview.is_none() {
+                self.preview = Some(engine.shape(&masked, &self.style, wrap));
+            }
+            let preview = self.preview.as_ref().expect("masked preview is shaped");
+            let caret_char = real[..offset_of(self.buffer(), self.inner.cursor())]
+                .chars()
+                .count();
+            let sel = self.selected_bytes();
+            let sel_start = byte_at(&masked, real[..sel.start].chars().count());
+            let sel_end = byte_at(&masked, real[..sel.end].chars().count());
+            if sel_start < sel_end {
+                selection_ranges.push(sel_start..sel_end);
+            }
+            let at = cursor_at(preview, byte_at(&masked, caret_char));
+            (
+                Cursor::new_with_affinity(at.line, at.index, Affinity::Before),
+                true,
             )
         } else {
             if self.multiline {
@@ -685,7 +964,11 @@ impl LineEditor {
             } else if !self.text().is_empty() {
                 self.inner.shape_as_needed(engine.fonts(), false);
             }
-            (self.inner.cursor(), self.selected_bytes(), 0..0)
+            let sel = self.selected_bytes();
+            if !sel.is_empty() {
+                selection_ranges.push(sel);
+            }
+            (self.inner.cursor(), true)
         };
         let buffer = self.preview.as_ref().unwrap_or_else(|| self.buffer());
         let (caret, caret_top) = caret_at(buffer, cursor);
@@ -735,11 +1018,16 @@ impl LineEditor {
         } else {
             None
         };
-        let selection = rows(buffer, selected, [scroll_x, top], width);
-        let composition = rows(buffer, composition, [scroll_x, top], width)
-            .into_iter()
-            .map(|[x, y, w, h]| [x, y + h - 1., w, 1.])
-            .collect();
+        let mut selection = Vec::new();
+        for range in selection_ranges {
+            selection.extend(rows(buffer, range, [scroll_x, top], width));
+        }
+        let mut composition = Vec::new();
+        for (range, thickness) in underline_ranges {
+            for [x, y, w, h] in rows(buffer, range, [scroll_x, top], width) {
+                composition.push([x, y + h - thickness, w, thickness]);
+            }
+        }
         self.scroll_x = scroll_x;
         self.scroll_y = top;
         EditorFrame {
@@ -747,10 +1035,7 @@ impl LineEditor {
             bitmap,
             caret_x: caret - scroll_x,
             caret_y: caret_top - top,
-            caret_visible: self
-                .preedit
-                .as_ref()
-                .is_none_or(|preedit| preedit.active.is_some()),
+            caret_visible,
             line_height,
             selection,
             composition,
@@ -758,6 +1043,12 @@ impl LineEditor {
             content_height,
         }
     }
+}
+
+pub(crate) fn mask_text(text: &str) -> String {
+    text.chars()
+        .map(|c| if c == '\n' { '\n' } else { '•' })
+        .collect()
 }
 
 fn empty_editor(text: &str, style: &TextStyle) -> Editor<'static> {
@@ -996,4 +1287,162 @@ fn spans(run: &LayoutRun<'_>, bytes: Range<usize>, scroll_x: f32, width: f32) ->
         }
     }
     merged
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn surrounding_text_clamps_utf8_boundaries_and_reports_utf16_offsets() {
+        let mut engine = TextEngine::default();
+        let mut editor = LineEditor::default();
+        // 'a' (1B/1u16), '茶' (3B/1u16), '😀' (4B/2u16), 'z' (1B/1u16) => total 9 UTF-8 bytes, 5 UTF-16 units.
+        editor.reset("a茶😀z", [1, 3], false);
+        let full = editor.surrounding_text(4000);
+        assert_eq!(full.text, "a茶😀z");
+        assert_eq!((full.anchor_byte, full.cursor_byte), (1, 8));
+        assert_eq!((full.anchor_utf16, full.cursor_utf16), (1, 4));
+        assert_eq!(full.window_byte_offset, 0);
+
+        // Tight max_bytes window must never split multi-byte UTF-8 codepoints.
+        editor.reset("hello 茶😀 world", [7, 7], false);
+        let small = editor.surrounding_text(6);
+        assert!(small.text.len() <= 6, "{small:?}");
+        assert!(small.text.is_char_boundary(small.cursor_byte));
+        assert!(small.text.is_char_boundary(small.anchor_byte));
+
+        // Backward selection swaps anchor and cursor offsets properly.
+        editor.handle(
+            &mut engine,
+            &EditorEvent::Move {
+                direction: Direction::Left,
+                extend: true,
+            },
+        );
+        let back = editor.surrounding_text(4000);
+        assert!(back.cursor_byte < back.anchor_byte);
+        assert!(back.cursor_utf16 < back.anchor_utf16);
+    }
+
+    #[test]
+    fn delete_surrounding_bytes_handles_multibyte_and_unaligned_lengths() {
+        let mut engine = TextEngine::default();
+        let mut editor = LineEditor::default();
+        // Place caret right after '茶' (char index 2, byte 4 in "a茶😀z").
+        editor.reset("a茶😀z", [2, 2], false);
+        // Wayland deletes exact 3 bytes before ('茶') and 4 bytes after ('😀').
+        editor.handle(
+            &mut engine,
+            &EditorEvent::DeleteSurroundingBytes {
+                before_bytes: 3,
+                after_bytes: 4,
+            },
+        );
+        assert_eq!(editor.text(), "az");
+        assert_eq!(editor.selection(), [1, 1]);
+
+        // Unaligned byte length inside a multi-byte char clamps safely without panicking.
+        editor.reset("a茶😀z", [2, 2], false);
+        editor.handle(
+            &mut engine,
+            &EditorEvent::DeleteSurroundingBytes {
+                before_bytes: 2,
+                after_bytes: 2,
+            },
+        );
+        assert_eq!(editor.text(), "az");
+    }
+
+    #[test]
+    fn preedit_segments_draws_thin_thick_underlines_and_selection() {
+        let mut engine = TextEngine::default();
+        let mut editor = LineEditor::default();
+        editor.reset("x", [1, 1], false);
+        editor.handle(
+            &mut engine,
+            &EditorEvent::PreeditSegments {
+                text: "nihongo".into(),
+                segments: vec![
+                    PreeditSegment {
+                        range: 0..2,
+                        style: PreeditStyle::ThickUnderline,
+                    },
+                    PreeditSegment {
+                        range: 2..5,
+                        style: PreeditStyle::Underline,
+                    },
+                    PreeditSegment {
+                        range: 5..7,
+                        style: PreeditStyle::Selection,
+                    },
+                ],
+                cursor: Some(2),
+            },
+        );
+        assert!(editor.composing());
+        let frame = editor.frame(
+            &mut engine,
+            &TextStyle::default(),
+            [300., 30.],
+            1.,
+            2048,
+            None,
+        );
+        assert!(frame.caret_visible);
+        assert!(
+            frame.composition.iter().any(|r| (r[3] - 2.).abs() < 0.01),
+            "expected 2px thick underline: {:?}",
+            frame.composition
+        );
+        assert!(
+            frame.composition.iter().any(|r| (r[3] - 1.).abs() < 0.01),
+            "expected 1px thin underline: {:?}",
+            frame.composition
+        );
+        assert!(
+            !frame.selection.is_empty(),
+            "expected selection highlight for PreeditStyle::Selection"
+        );
+    }
+
+    #[test]
+    fn password_mode_masks_glyphs_blocks_clipboard_and_hides_surrounding_text() {
+        let mut engine = TextEngine::default();
+        let mut editor = LineEditor::default();
+        editor.reset("secret", [0, 6], false);
+        editor.set_password(true);
+        assert!(editor.is_password());
+        assert_eq!(editor.text(), "secret");
+        assert_eq!(editor.surrounding_text(4000), SurroundingText::default());
+
+        // Copy and Cut are blocked in password mode.
+        let copy = editor.handle(&mut engine, &EditorEvent::Copy);
+        assert!(copy.clipboard.is_none());
+        let cut = editor.handle(&mut engine, &EditorEvent::Cut);
+        assert!(cut.clipboard.is_none());
+        assert_eq!(editor.text(), "secret");
+
+        // Preedit is suppressed in password mode.
+        editor.handle(
+            &mut engine,
+            &EditorEvent::Preedit {
+                text: "abc".into(),
+                active: Some(0..3),
+            },
+        );
+        assert!(!editor.composing());
+
+        // Frame renders without panicking and keeps selection rects aligned with masked bullets.
+        let frame = editor.frame(
+            &mut engine,
+            &TextStyle::default(),
+            [200., 30.],
+            1.,
+            2048,
+            None,
+        );
+        assert!(!frame.selection.is_empty());
+        assert!(frame.caret_x > 0.);
+    }
 }

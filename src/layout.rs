@@ -25,7 +25,7 @@ pub struct Layout {
     pinned: HashMap<u16, f32>,
     // Content height of each scroll node in the last computed layout.
     content: HashMap<u16, f32>,
-    row_sizes: HashMap<u16, (f32, f32)>,
+    row_sizes: HashMap<u16, (f32, Option<f32>)>,
     visible_rows: HashMap<u16, Vec<u16>>,
 }
 impl Default for Layout {
@@ -170,15 +170,14 @@ impl Layout {
     fn style(&self, tree: &Tree, id: u16, node: &Node) -> taffy::Style {
         let mut style = taffy_style(node, in_scroll(tree, id));
         if let Some(&(w, h)) = self.row_sizes.get(&id) {
-            style.size = Size {
-                width: length(w),
-                height: length(h),
-            };
-            style.min_size = Size {
-                width: length(w),
-                height: length(h),
-            };
-            style.max_size = style.min_size;
+            style.size.width = length(w);
+            style.min_size.width = length(w);
+            style.max_size.width = length(w);
+            if let Some(h) = h {
+                style.size.height = length(h);
+                style.min_size.height = length(h);
+                style.max_size.height = length(h);
+            }
         } else if is_fixed(node) && self.in_row(tree, id) {
             let s = node.style().unwrap();
             style.position = taffy::Position::Absolute;
@@ -188,7 +187,7 @@ impl Layout {
         style
     }
     pub(crate) fn attach_row(&mut self, tree: &Tree, row: u16) {
-        self.row_sizes.insert(row, (0., 0.));
+        self.row_sizes.insert(row, (0., Some(0.)));
         let mut stack = vec![row];
         while let Some(id) = stack.pop() {
             self.created(tree, id, tree.parent(id));
@@ -389,7 +388,7 @@ impl Layout {
         text: &mut TextEngine,
         width: f32,
         height: f32,
-        mut rows: impl FnMut(u16, f32) -> Option<Vec<(u16, f32, f32)>>,
+        mut rows: impl FnMut(u16, f32) -> Option<Vec<(u16, f32, Option<f32>)>>,
     ) -> Vec<(u16, [f32; 4])> {
         self.visible_rows.clear();
         let Some(root) = self.root else {
@@ -512,7 +511,7 @@ impl Layout {
                 .layout(self.get(id).expect("node in the layout"))
                 .expect("taffy: result");
             let rect = if let Some(&(w, h)) = self.row_sizes.get(&id) {
-                [px, py, w, h]
+                [px, py, w, h.unwrap_or(l.size.height)]
             } else {
                 [
                     px + l.location.x,
@@ -555,7 +554,7 @@ impl Layout {
                         node,
                         Size {
                             width: AvailableSpace::Definite(rect[2]),
-                            height: AvailableSpace::Definite(height),
+                            height: height.map_or(AvailableSpace::MaxContent, AvailableSpace::Definite),
                         },
                     );
                     stack.push((row, rect[0], rect[1] + top));

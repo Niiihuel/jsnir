@@ -274,6 +274,24 @@ contract_struct! {
         color: u32,
     }
 }
+contract_strings! {
+    /// Pointer shape over a node.
+    pub enum Cursor as "Cursor" {
+        Default,
+        Pointer,
+        Text,
+        NotAllowed,
+        Grab,
+        Grabbing,
+        Move,
+        ColResize,
+        RowResize,
+        EwResize,
+        NsResize,
+        NeswResize,
+        NwseResize,
+    }
+}
 contract_struct! {
     /// Paint overrides for an interaction state. Rust applies them without asking JS.
     pub struct Variant as "Variant" {
@@ -292,6 +310,8 @@ contract_struct! {
         width: Option<f32>,
         /// Underlines all the text of a `Text` while the variant is active (CSS `text-decoration: underline`).
         underline: Option<bool>,
+        /// Pointer shape while the variant is active.
+        cursor: Option<Cursor>,
     }
 }
 contract_struct! {
@@ -389,6 +409,8 @@ contract_struct! {
         focus: Option<Variant>,
         /// Scrollbar drawn over a `scroll` node's content.
         scrollbar: Option<Scrollbar>,
+        /// Pointer shape shown over the node (overrides the default pointer for interactive nodes).
+        cursor: Option<Cursor>,
     }
 }
 impl Paint {
@@ -501,6 +523,10 @@ contract_strings! {
     /// Built-in stroke icons (Hugeicons free, MIT).
     pub enum Icon as "IconName" { ArrowLeft, ArrowRight, Tick, CheckCircle }
 }
+contract_strings! {
+    /// Semantic purpose of a text input: controls platform IME mode and password masking.
+    pub enum InputPurpose as "InputPurpose" { Normal, Password, Search, Email, Number }
+}
 
 contract_enum! {
     /// Tree nodes. The app creates them on mount or in a batch.
@@ -513,7 +539,7 @@ contract_enum! {
         },
         /// Scrolling list: the backend draws only the visible rows.
         /// For layout it is a leaf: its items do not go through Taffy.
-        List { (skip) children: Vec<u16>, (default) style: Style },
+        List { (skip) children: Vec<u16>, (default) style: Style, (default) scroll: u16 },
         /// Counter label, drawn as three seven-segment digits.
         Label { value: u16 },
         Button { callback: u16 },
@@ -545,6 +571,10 @@ contract_enum! {
             (default) multiline: bool,
             /// In a multi-line field, Enter submits and Shift+Enter breaks the line.
             (default) submit_on_enter: bool,
+            /// Keep the text until the app accepts the submission.
+            (default) retain_on_submit: bool,
+            /// Semantic purpose of the field (e.g. `password` masks glyphs and disables IME).
+            (default) purpose: InputPurpose,
             (default) style: Style,
             (default) font: Font,
             (default) paint: Box<Paint>,
@@ -569,6 +599,10 @@ contract_enum! {
             /// Callback with the JSON `{"top":..,"height":..,"client":..}` of a `scroll` node (its offset, content height
             /// and box height, in logical pixels), at most once per frame and only when the offset changed. 0: none.
             (default) scroll: u16,
+            /// Callback for a primary-button drag starting on the box; its text is the JSON
+            /// `{"phase":"start"|"move"|"end","x":..,"y":..,"startX":..,"startY":..,"dx":..,"dy":..}` in window logical
+            /// pixels (`dx`/`dy` are the displacement from the start). 0: none.
+            (default) drag: u16,
         },
         /// A stroke icon of `size` × `size` logical pixels.
         Icon { icon: Icon, size: f32, stroke: f32, (default) style: Style, (default) paint: Box<Paint> },
@@ -590,6 +624,8 @@ contract_enum! {
         Move { id: u16, before: Option<u16> },
         Set { id: u16, value: u16 },
         SetText { id: u16, text: String },
+        /// Replace a text field only if its current text still matches `expected`.
+        SetField { id: u16, expected: String, text: String },
         /// Replaces the spans of a `Node::Text`.
         SetSpans { id: u16, spans: Vec<Span> },
         /// Changes the source of a `Node::Image`.
@@ -598,6 +634,8 @@ contract_enum! {
         SetPaint { id: u16, paint: Box<Paint> },
         SetStyle { id: u16, style: Style },
         SetDisabled { id: u16, disabled: bool },
+        /// Moves keyboard focus to a text field, as Discord's `autofocus`.
+        Focus { id: u16 },
         /// Removes the node and all its descendants. The node must exist before the batch.
         Remove { id: u16 },
         /// Calls `callback` once after `ms` milliseconds. It touches no node.
@@ -643,6 +681,7 @@ pub(crate) fn ts_decls() -> String {
         Keyframe::ts_decl(),
         Animation::ts_decl(),
         Shadow::ts_decl(),
+        Cursor::ts_decl(),
         Variant::ts_decl(),
         Starting::ts_decl(),
         Scrollbar::ts_decl(),
@@ -651,6 +690,7 @@ pub(crate) fn ts_decls() -> String {
         InlineImage::ts_decl(),
         Span::ts_decl(),
         Icon::ts_decl(),
+        InputPurpose::ts_decl(),
         Node::ts_decl(),
         Op::ts_decl(),
     ]
@@ -726,6 +766,7 @@ impl Op {
             Op::Create { id, parent, .. } => [Some(*id), *parent],
             Op::Set { id, .. }
             | Op::SetText { id, .. }
+            | Op::SetField { id, .. }
             | Op::SetSpans { id, .. }
             | Op::SetSource { id, .. }
             | Op::SetPaint { id, .. }
@@ -739,6 +780,7 @@ impl Op {
             Op::After { .. }
             | Op::ScrollTo { .. }
             | Op::VirtualList { .. }
+            | Op::Focus { .. }
             | Op::CallbackGuard { .. } => [None, None],
         }
     }
@@ -885,7 +927,7 @@ impl Tree {
                     if !self
                         .nodes
                         .get(id)
-                        .is_some_and(|n| n.style().is_some_and(|s| s.scroll))
+                        .is_some_and(|n| matches!(n, Node::List { .. }) || n.style().is_some_and(|s| s.scroll))
                     {
                         return Err("invalid_node");
                     }
@@ -897,14 +939,24 @@ impl Tree {
                     return Err("ui_only_op");
                 }
                 (Op::Remove { id }, false) => {
-                    // Only nodes that existed before the batch and that the batch has not removed yet.
-                    if self.nodes.get(id).is_none() || created.contains_key(id) {
+                    // A node as the batch sees it: one from before it, or one it created, and not removed yet. An app
+                    // that swaps content twice in one event removes a node created earlier in the same batch.
+                    if find(&self.nodes, &created, *id).is_none() {
                         return Err("invalid_node");
                     }
-                    if self.root == Some(*id) {
+                    // The root goes: the one from before the batch, or one the batch created (no parent of its own).
+                    let made = matches!(created.get(id), Some(Some(_)));
+                    if (self.root == Some(*id) && !created.contains_key(id))
+                        || (made && !created_parent.contains_key(id))
+                    {
                         has_root = false;
                     }
-                    created.extend(self.subtree(*id).into_iter().map(|i| (i, None)));
+                    if made {
+                        // Created by this batch: its id may be an old one reused, so the old subtree is not its own.
+                        created.insert(*id, None);
+                    } else {
+                        created.extend(self.subtree(*id).into_iter().map(|i| (i, None)));
+                    }
                     // Nodes this batch created under the removed subtree go with it.
                     loop {
                         let doomed: Vec<u16> = created_parent
@@ -935,7 +987,11 @@ impl Tree {
                         return Err("duplicate_id");
                     }
                     match parent {
-                        None if !has_root => has_root = true,
+                        None if !has_root => {
+                            has_root = true;
+                            // A reused id created as the root has no parent, whatever an earlier use of it had.
+                            created_parent.remove(id);
+                        }
                         Some(p)
                             if find(&self.nodes, &created, *p).is_some_and(Node::is_container) =>
                         {
@@ -1001,6 +1057,11 @@ impl Tree {
                         return Err("invalid_node");
                     }
                 }
+                (Op::SetField { id, .. }, false) => {
+                    if !matches!(find(&self.nodes, &created, *id), Some(Node::Input { .. })) {
+                        return Err("invalid_node");
+                    }
+                }
                 (Op::SetSource { id, .. }, false) => {
                     if !matches!(find(&self.nodes, &created, *id), Some(Node::Image { .. })) {
                         return Err("invalid_node");
@@ -1036,6 +1097,11 @@ impl Tree {
                 }
                 (Op::SetDisabled { id, .. }, false) => {
                     if !matches!(find(&self.nodes, &created, *id), Some(Node::Box { .. })) {
+                        return Err("invalid_node");
+                    }
+                }
+                (Op::Focus { id }, false) => {
+                    if !matches!(find(&self.nodes, &created, *id), Some(Node::Input { .. })) {
                         return Err("invalid_node");
                     }
                 }
@@ -1121,6 +1187,14 @@ impl Tree {
                         *text = new;
                     }
                 }
+                Op::SetField { id, expected, text: new } => {
+                    if let Some(Node::Input { text, selection, .. }) = self.nodes.get_mut(&id)
+                        && *text == expected
+                    {
+                        *selection = [new.encode_utf16().count() as u32; 2];
+                        *text = new;
+                    }
+                }
                 Op::SetSpans { id, spans: new } => {
                     if let Some(Node::Text { spans, .. }) = self.nodes.get_mut(&id) {
                         *spans = Some(new);
@@ -1146,7 +1220,10 @@ impl Tree {
                         *disabled = new;
                     }
                 }
-                Op::After { .. } | Op::VirtualList { .. } | Op::CallbackGuard { .. } => {}
+                Op::After { .. }
+                | Op::VirtualList { .. }
+                | Op::Focus { .. }
+                | Op::CallbackGuard { .. } => {}
                 Op::SetRect { id, rect } => {
                     let i = id as usize;
                     if self.rects.len() <= i {
@@ -1529,6 +1606,57 @@ mod tests {
         );
         assert_eq!(t.nodes[&2], label(7));
     }
+    #[test]
+    fn a_batch_can_remove_what_it_created_even_under_a_reused_id() {
+        let column = || Node::Column {
+            children: vec![],
+            style: Style::default(),
+        };
+        let create = |id, parent, node| Op::Create {
+            id,
+            parent,
+            before: None,
+            node,
+        };
+        let mut t = Tree::default();
+        t.apply(Batch {
+            base: 0,
+            ops: vec![create(1, None, column()), create(2, Some(1), column()), create(3, Some(2), column())],
+        })
+        .unwrap();
+        // A content swapped twice in one event: 2 (with 3) goes, 3 comes back as the new content's root with 4 under
+        // it, then that content goes too and 5 takes its place. 2 stays gone and 5 lives.
+        t.apply(Batch {
+            base: 1,
+            ops: vec![
+                Op::Remove { id: 2 },
+                create(3, Some(1), column()),
+                create(4, Some(3), column()),
+                Op::Remove { id: 3 },
+                create(5, Some(1), column()),
+            ],
+        })
+        .unwrap();
+        assert_eq!(t.children(1), &[5]);
+        assert!(t.nodes.get(&3).is_none() && t.nodes.get(&4).is_none());
+        // A root the batch created and removed leaves room for another; two live roots are still refused.
+        t.apply(Batch {
+            base: 2,
+            ops: vec![Op::Remove { id: 1 }, create(6, None, column()), Op::Remove { id: 6 }, create(7, None, column())],
+        })
+        .unwrap();
+        assert_eq!(t.root, Some(7));
+        assert_eq!(
+            t.apply(Batch { base: 3, ops: vec![create(8, None, column())] }),
+            Err("invalid_parent")
+        );
+        // Removing it a second time is still refused.
+        assert_eq!(
+            t.apply(Batch { base: 3, ops: vec![Op::Remove { id: 4 }] }),
+            Err("invalid_node")
+        );
+    }
+
     #[test]
     fn removing_a_parent_also_removes_what_the_batch_created_under_it() {
         let column = || Node::Column {

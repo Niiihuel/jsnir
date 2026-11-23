@@ -16,19 +16,35 @@ declare var __jsnirPreviousState: string | undefined;
 interface SavedValue {
     initial: string | undefined;
     value: unknown;
+    key?: string;
 }
 var previousState: SavedValue[] = typeof __jsnirPreviousState === "string" ? JSON.parse(__jsnirPreviousState) : [];
-var restorables: Array<{ initial: string | undefined; read: () => unknown }> = [];
-function restore<T>(initial: T, read: () => unknown): T {
-    var key = JSON.stringify(initial);
-    var previous = previousState[restorables.length];
-    restorables.push({ initial: key, read: read });
-    return previous !== undefined && key !== undefined && previous.initial === key ? (previous.value as T) : initial;
+var previousByKey = new Map<string, SavedValue>();
+for (var prevIdx = 0; prevIdx < previousState.length; prevIdx++) {
+    var entry = previousState[prevIdx];
+    if (entry.key !== undefined) previousByKey.set(entry.key, entry);
+}
+var keyCounts: { [key: string]: number } = {};
+var restorables: Array<{ initial: string | undefined; read: () => unknown; key?: string }> = [];
+function restore<T>(initial: T, read: () => unknown, key?: string): T {
+    var initJson = JSON.stringify(initial);
+    var slotKey: string | undefined = undefined;
+    var previous: SavedValue | undefined;
+    if (key !== undefined) {
+        var count = keyCounts[key] ?? 0;
+        keyCounts[key] = count + 1;
+        slotKey = count === 0 ? key : key + "#" + count;
+        previous = previousByKey.get(slotKey);
+    } else {
+        previous = previousState[restorables.length];
+    }
+    restorables.push({ initial: initJson, read: read, key: slotKey });
+    return previous !== undefined && initJson !== undefined && previous.initial === initJson ? (previous.value as T) : initial;
 }
 function jsnirReloadState(): string {
     return JSON.stringify(
         restorables.map(function (r) {
-            return { initial: r.initial, value: r.read() };
+            return r.key === undefined ? { initial: r.initial, value: r.read() } : { initial: r.initial, value: r.read(), key: r.key };
         }),
     );
 }
@@ -51,9 +67,13 @@ interface Scope {
     // Virtual rows are transient: neither payloads nor local signals belong in reload state.
     ids?: number[];
     cleanup?: Array<() => void>;
+    // Set by dispose: the scope's nodes left the screen with an ancestor's, or are about to with its own remove.
+    disposed?: boolean;
 }
 function childScope(transient = currentScope.ids !== undefined): Scope {
-    return { effects: [], callbacks: [], children: [], ids: transient ? [] : undefined };
+    // Born under a disposed scope (a deferred mount that runs after its owner left), it is disposed too: nothing it
+    // would mount has a parent on screen any more.
+    return { effects: [], callbacks: [], children: [], ids: transient ? [] : undefined, disposed: currentScope.disposed };
 }
 var currentScope: Scope = { effects: [], callbacks: [], children: [] };
 function inScope<T>(scope: Scope, body: () => T): T {
@@ -65,7 +85,17 @@ function inScope<T>(scope: Scope, body: () => T): T {
         currentScope = previous;
     }
 }
+// Reports an error the app survives. Nothing here may throw: formatting the value or handing it to Rust
+// (a lone surrogate is not valid UTF-8) falls back to a fixed message.
+function report(error: unknown): void {
+    try {
+        jsnir.report(error instanceof Error ? `${error.message}\n${error.stack ?? ""}` : String(error));
+    } catch (_) {
+        try { jsnir.report("a cleanup threw a value that cannot be printed"); } catch (_) { }
+    }
+}
 function dispose(scope: Scope): void {
+    scope.disposed = true;
     for (var i = 0; i < scope.effects.length; i++) scope.effects[i].disposed = true;
     for (var j = 0; j < scope.callbacks.length; j++) {
         var id = scope.callbacks[j];
@@ -73,8 +103,11 @@ function dispose(scope: Scope): void {
         if (guarded === undefined || guarded.scope === scope) unregister(id);
     }
     for (var k = 0; k < scope.children.length; k++) dispose(scope.children[k]);
-    scope.cleanup?.forEach(run => run());
-    scope.ids?.forEach(id => freeIds.push(id));
+    scope.cleanup?.forEach(run => {
+        // A throw here would drop the whole event's batch, removes included: report it and go on.
+        try { run(); } catch (error) { report(error); }
+    });
+    scope.ids?.forEach(id => retiring.push(id));
     scope.ids = undefined;
     scope.cleanup = undefined;
     scope.effects = [];
@@ -101,10 +134,10 @@ interface Signal<T> {
 /** A fixed value, a signal, or a function that reads signals. */
 type Source<T> = T | Signal<T> | (() => T);
 
-function signal<T>(initial: T): Signal<T> {
+function signal<T>(initial: T, key?: string): Signal<T> {
     var current: T = currentScope.ids !== undefined ? initial : restore(initial, function () {
         return current;
-    });
+    }, key);
     var subscribers: Effect[] = [];
     var s: Signal<T> = {
         get value() {
@@ -144,17 +177,29 @@ function flush(): void {
     }
 }
 function effect(body: () => void): void {
+    // A rerun can come from any flush, even one inside another subtree's mount: it runs in the scope that made it, so
+    // what it creates belongs there and not to whatever scope happened to be current.
+    var owner = currentScope;
     var e: Effect = function () {
         var previous = observer;
         observer = e;
         try {
-            body();
+            inScope(owner, body);
         } finally {
             observer = previous;
         }
     };
     currentScope.effects.push(e);
+    if (owner.disposed) {
+        e.disposed = true;
+        return;
+    }
     e();
+}
+
+/** Releases a resource when the component's mounted scope is removed. */
+function onCleanup(release: () => void): void {
+    (currentScope.cleanup ??= []).push(release);
 }
 function isSignal(source: unknown): boolean {
     return typeof source === "object" && source !== null && signals.has(source);
@@ -187,10 +232,10 @@ interface ListSignal<T> {
     push(item: T): void;
 }
 var listeners = new WeakMap<object, Array<(item: never) => void>>();
-function list<T>(initial: T[] = []): ListSignal<T> {
+function list<T>(initial: T[] = [], key?: string): ListSignal<T> {
     var items: T[] = restore(initial, function () {
         return items;
-    }).slice();
+    }, key).slice();
     var onPush: Array<(item: T) => void> = [];
     var l: ListSignal<T> = {
         items: items,
@@ -220,6 +265,9 @@ type Children = Child | Children[];
 
 var nextId = 1;
 var freeIds: number[] = [];
+// Ids of disposed nodes, reusable once the remove that takes them off the host has been sent.
+var retiring: number[] = [];
+var removing = 0;
 function newId(): number {
     if (freeIds.length === 0 && nextId > 65535) throw new RangeError("JSNIR supports up to 65,535 live nodes");
     var id = freeIds.length > 0 ? freeIds.pop() as number : nextId++;
@@ -227,6 +275,9 @@ function newId(): number {
     return id;
 }
 var handlers: Array<((text: string) => void) | undefined> = [];
+var dragHandlers: Array<((e: DragEvent) => void) | undefined> = [];
+var scrollHandlers: Array<((s: { top: number; height: number; client: number }) => void) | undefined> = [];
+var contextMenuHandlers: Array<((p: { x: number; y: number }) => void) | undefined> = [];
 var freeCallbacks: number[] = [];
 var placementTokens: { [callback: number]: string | undefined } = {};
 declare var __jsnirPlacementEpoch: string | undefined;
@@ -245,9 +296,33 @@ function register(handler: (text: string) => void): number {
     }
     return id;
 }
+function registerDrag(handler: (e: DragEvent) => void): number {
+    var id = register(function (text) {
+        handler(JSON.parse(text));
+    });
+    dragHandlers[id - 1] = handler;
+    return id;
+}
+function registerScroll(handler: (s: { top: number; height: number; client: number }) => void): number {
+    var id = register(function (text) {
+        handler(JSON.parse(text));
+    });
+    scrollHandlers[id - 1] = handler;
+    return id;
+}
+function registerContextMenu(handler: (p: { x: number; y: number }) => void): number {
+    var id = register(function (text) {
+        handler(JSON.parse(text));
+    });
+    contextMenuHandlers[id - 1] = handler;
+    return id;
+}
 function unregister(id: number): void {
     if (handlers[id - 1] === undefined) return;
     handlers[id - 1] = undefined;
+    dragHandlers[id - 1] = undefined;
+    scrollHandlers[id - 1] = undefined;
+    contextMenuHandlers[id - 1] = undefined;
     var guarded = rowCallbacks.get(id);
     if (guarded !== undefined) {
         rowCallbacks.delete(id);
@@ -258,7 +333,275 @@ function unregister(id: number): void {
     if (placementTokens[id] !== undefined) delete placementTokens[id];
     freeCallbacks.push(id);
 }
+
+// ---------- Binary Command Buffer ----------
+// Frequent ops are packed directly into the shared `jsnir.cmd` / `jsnir.cmdF32` ArrayBuffer and
+// flushed in one `jsnir.commit(words)` call without `JSON.stringify` or `serde_json`.
+var OP_SET = 1;
+var OP_SET_DISABLED = 2;
+var OP_REMOVE = 3;
+var OP_MOVE = 4;
+var OP_AFTER = 6;
+var OP_SCROLL_TO = 7;
+var OP_SET_STYLE = 8;
+var OP_SET_PAINT = 9;
+var CURSOR_CODES: { [k: string]: number | undefined } = {
+    default: 0,
+    pointer: 1,
+    text: 2,
+    notAllowed: 3,
+    grab: 4,
+    grabbing: 5,
+    move: 6,
+    colResize: 7,
+    rowResize: 8,
+    ewResize: 9,
+    nsResize: 10,
+    neswResize: 11,
+    nwseResize: 12,
+};
+var cmdPos = 0;
+var inMount = false;
+function flushCmd(): void {
+    if (cmdPos === 0) return;
+    var words = cmdPos;
+    cmdPos = 0;
+    jsnir.commit(words);
+}
+function reserveCmd(words: number): void {
+    if (cmdPos + words > jsnir.cmd.length) flushCmd();
+}
+function maybeFlushCmd(): void {
+    if (!batching && !inMount) flushCmd();
+}
+function emitSet(id: number, value: number): void {
+    if (!Number.isInteger(value) || value < 0 || value > 65535) {
+        flushCmd();
+        jsnir.set(id, value);
+        return;
+    }
+    reserveCmd(3);
+    var u = jsnir.cmd;
+    var p = cmdPos;
+    u[p] = OP_SET;
+    u[p + 1] = id;
+    u[p + 2] = value;
+    cmdPos = p + 3;
+    maybeFlushCmd();
+}
+function emitSetDisabled(id: number, disabled: boolean): void {
+    reserveCmd(3);
+    var u = jsnir.cmd;
+    var p = cmdPos;
+    u[p] = OP_SET_DISABLED;
+    u[p + 1] = id;
+    u[p + 2] = disabled ? 1 : 0;
+    cmdPos = p + 3;
+    maybeFlushCmd();
+}
+function emitRemove(id: number): void {
+    reserveCmd(2);
+    var u = jsnir.cmd;
+    var p = cmdPos;
+    u[p] = OP_REMOVE;
+    u[p + 1] = id;
+    cmdPos = p + 2;
+    maybeFlushCmd();
+}
+function emitMove(id: number, before: number | undefined): void {
+    reserveCmd(3);
+    var u = jsnir.cmd;
+    var p = cmdPos;
+    u[p] = OP_MOVE;
+    u[p + 1] = id;
+    u[p + 2] = before === undefined ? 0xffffffff : before;
+    cmdPos = p + 3;
+    maybeFlushCmd();
+}
+function emitAfter(callback: number, ms: number): void {
+    reserveCmd(3);
+    var u = jsnir.cmd;
+    var p = cmdPos;
+    u[p] = OP_AFTER;
+    u[p + 1] = callback;
+    jsnir.cmdF32[p + 2] = ms;
+    cmdPos = p + 3;
+    maybeFlushCmd();
+}
+function emitScrollTo(id: number, to: { offset?: number; to?: ScrollEdge; smooth?: boolean }): void {
+    reserveCmd(4);
+    var u = jsnir.cmd;
+    var p = cmdPos;
+    var flags = (to.offset !== undefined ? 1 : 0)
+        | (to.to !== undefined ? 2 : 0)
+        | (to.to === "end" ? 4 : 0)
+        | (to.smooth ? 8 : 0);
+    u[p] = OP_SCROLL_TO;
+    u[p + 1] = id;
+    u[p + 2] = flags;
+    jsnir.cmdF32[p + 3] = to.offset ?? 0;
+    cmdPos = p + 4;
+    maybeFlushCmd();
+}
+function emitSetStyle(id: number, s: Style): void {
+    if (
+        s.anchor !== undefined
+        || (Array.isArray(s.padding) && s.padding.length !== 4)
+        || (Array.isArray(s.margin) && s.margin.length !== 4)
+        || (s.follow !== undefined && (!Number.isInteger(s.follow) || s.follow < 0 || s.follow > 65535))
+    ) {
+        send([{ op: "setstyle", id: id, style: s }]);
+        return;
+    }
+    var flags = 0;
+    if (s.direction === "row") flags |= 1;
+    else if (s.direction !== undefined && s.direction !== "column") {
+        send([{ op: "setstyle", id: id, style: s }]);
+        return;
+    }
+    if (s.align !== undefined) {
+        if (s.align === "stretch") flags |= 1 << 1;
+        else if (s.align === "start") flags |= 2 << 1;
+        else if (s.align === "center") flags |= 3 << 1;
+        else if (s.align === "end") flags |= 4 << 1;
+        else { send([{ op: "setstyle", id: id, style: s }]); return; }
+    }
+    if (s.justify !== undefined && s.justify !== "start") {
+        if (s.justify === "center") flags |= 1 << 4;
+        else if (s.justify === "end") flags |= 2 << 4;
+        else if (s.justify === "between") flags |= 3 << 4;
+        else { send([{ op: "setstyle", id: id, style: s }]); return; }
+    }
+    if (s.position !== undefined && s.position !== "relative") {
+        if (s.position === "absolute") flags |= 1 << 6;
+        else if (s.position === "fixed") flags |= 2 << 6;
+        else { send([{ op: "setstyle", id: id, style: s }]); return; }
+    }
+    if (s.clip) flags |= 1 << 8;
+    if (s.scroll) flags |= 1 << 9;
+    if (s.scrollAnchor === "end") flags |= 1 << 10;
+    else if (s.scrollAnchor !== undefined && s.scrollAnchor !== "start") {
+        send([{ op: "setstyle", id: id, style: s }]);
+        return;
+    }
+    if (s.group) flags |= 1 << 11;
+
+    reserveCmd(26);
+    var u = jsnir.cmd;
+    var f = jsnir.cmdF32;
+    var start = cmdPos;
+    var p = start + 4;
+    var mask = 0;
+    if (s.width !== undefined) { mask |= 1 << 0; f[p++] = s.width; }
+    if (s.height !== undefined) { mask |= 1 << 1; f[p++] = s.height; }
+    if (s.grow !== undefined) { mask |= 1 << 2; f[p++] = s.grow; }
+    if (s.shrink !== undefined) { mask |= 1 << 3; f[p++] = s.shrink; }
+    if (s.basis !== undefined) { mask |= 1 << 4; f[p++] = s.basis; }
+    if (s.padding !== undefined) {
+        mask |= 1 << 5;
+        if (typeof s.padding === "number") {
+            f[p] = s.padding; f[p + 1] = s.padding; f[p + 2] = s.padding; f[p + 3] = s.padding;
+        } else {
+            f[p] = s.padding[0]; f[p + 1] = s.padding[1]; f[p + 2] = s.padding[2]; f[p + 3] = s.padding[3];
+        }
+        p += 4;
+    }
+    if (s.margin !== undefined) {
+        mask |= 1 << 6;
+        if (typeof s.margin === "number") {
+            f[p] = s.margin; f[p + 1] = s.margin; f[p + 2] = s.margin; f[p + 3] = s.margin;
+        } else {
+            f[p] = s.margin[0]; f[p + 1] = s.margin[1]; f[p + 2] = s.margin[2]; f[p + 3] = s.margin[3];
+        }
+        p += 4;
+    }
+    if (s.gap !== undefined) { mask |= 1 << 7; f[p++] = s.gap; }
+    if (s.left !== undefined) { mask |= 1 << 8; f[p++] = s.left; }
+    if (s.top !== undefined) { mask |= 1 << 9; f[p++] = s.top; }
+    if (s.follow !== undefined) { mask |= 1 << 10; u[p++] = s.follow; }
+    if (s.layer !== undefined) { mask |= 1 << 11; u[p++] = (s.layer | 0) >>> 0; }
+    if (s.minWidth !== undefined) { mask |= 1 << 12; f[p++] = s.minWidth; }
+    if (s.minHeight !== undefined) { mask |= 1 << 13; f[p++] = s.minHeight; }
+    if (s.maxWidth !== undefined) { mask |= 1 << 14; f[p++] = s.maxWidth; }
+    if (s.maxHeight !== undefined) { mask |= 1 << 15; f[p++] = s.maxHeight; }
+    u[start] = OP_SET_STYLE;
+    u[start + 1] = id;
+    u[start + 2] = mask;
+    u[start + 3] = flags;
+    cmdPos = p;
+    maybeFlushCmd();
+}
+function emitSetPaint(id: number, paint: Paint): void {
+    var cursorCode: number | undefined = undefined;
+    if (paint.cursor !== undefined) {
+        cursorCode = CURSOR_CODES[paint.cursor];
+        if (cursorCode === undefined) {
+            send([{ op: "setpaint", id: id, paint: paint }]);
+            return;
+        }
+    }
+    if (
+        paint.mask !== undefined
+        || paint.shadows !== undefined
+        || paint.transitions !== undefined
+        || paint.animations !== undefined
+        || paint.starting !== undefined
+        || paint.hover !== undefined
+        || paint.active !== undefined
+        || paint.focus !== undefined
+        || paint.scrollbar !== undefined
+        || (paint.gradient !== undefined && (!Array.isArray(paint.gradient) || paint.gradient.length !== 2))
+        || (Array.isArray(paint.radius) && paint.radius.length !== 4)
+        || (paint.edgeSides !== undefined && (!Array.isArray(paint.edgeSides) || paint.edgeSides.length !== 4))
+    ) {
+        send([{ op: "setpaint", id: id, paint: paint }]);
+        return;
+    }
+    reserveCmd(25);
+    var u = jsnir.cmd;
+    var f = jsnir.cmdF32;
+    var start = cmdPos;
+    var p = start + 3;
+    var mask = 0;
+    if (paint.background !== undefined) { mask |= 1 << 0; u[p++] = paint.background >>> 0; }
+    if (paint.gradient !== undefined) {
+        mask |= 1 << 1;
+        u[p++] = paint.gradient[0] >>> 0;
+        u[p++] = paint.gradient[1] >>> 0;
+    }
+    if (paint.radius !== undefined) {
+        mask |= 1 << 2;
+        if (typeof paint.radius === "number") {
+            f[p] = paint.radius; f[p + 1] = paint.radius; f[p + 2] = paint.radius; f[p + 3] = paint.radius;
+        } else {
+            f[p] = paint.radius[0]; f[p + 1] = paint.radius[1]; f[p + 2] = paint.radius[2]; f[p + 3] = paint.radius[3];
+        }
+        p += 4;
+    }
+    if (paint.edge !== undefined) { mask |= 1 << 3; u[p++] = paint.edge >>> 0; }
+    if (paint.edgeWidth !== undefined) { mask |= 1 << 4; f[p++] = paint.edgeWidth; }
+    if (paint.edgeSides !== undefined) {
+        mask |= 1 << 5;
+        f[p] = paint.edgeSides[0]; f[p + 1] = paint.edgeSides[1]; f[p + 2] = paint.edgeSides[2]; f[p + 3] = paint.edgeSides[3];
+        p += 4;
+    }
+    if (paint.highlight !== undefined) { mask |= 1 << 6; u[p++] = paint.highlight >>> 0; }
+    if (paint.opacity !== undefined) { mask |= 1 << 7; f[p++] = paint.opacity; }
+    if (paint.x !== undefined) { mask |= 1 << 8; f[p++] = paint.x; }
+    if (paint.y !== undefined) { mask |= 1 << 9; f[p++] = paint.y; }
+    if (paint.scale !== undefined) { mask |= 1 << 10; f[p++] = paint.scale; }
+    if (paint.brightness !== undefined) { mask |= 1 << 11; f[p++] = paint.brightness; }
+    if (paint.color !== undefined) { mask |= 1 << 12; u[p++] = paint.color >>> 0; }
+    if (paint.draw !== undefined) { mask |= 1 << 13; f[p++] = paint.draw; }
+    if (cursorCode !== undefined) { mask |= 1 << 14; u[p++] = cursorCode; }
+    u[start] = OP_SET_PAINT;
+    u[start + 1] = id;
+    u[start + 2] = mask;
+    cmdPos = p;
+    maybeFlushCmd();
+}
 function send(ops: Operation[]): void {
+    flushCmd();
     var batch: Batch = { ops: ops };
     jsnir.batch(JSON.stringify(batch));
 }
@@ -280,6 +623,9 @@ interface Mounted {
 /** Mounts `element` under `parent` in its own scope and sends it as one batch, before the sibling `before` if given. */
 function mountInto(parent: number, element: Element, before?: number): Mounted {
     var owner = currentScope;
+    // A deferred first mount (Dynamic, For, Popover) can run after its owner was disposed in the same event: its
+    // parent left the screen, so mounting would make zombie content whose later batches the UI rejects.
+    if (owner.disposed) return { id: -1, remove() {} };
     var scope = childScope();
     var transient = scope.ids !== undefined;
     owner.children.push(scope);
@@ -291,28 +637,45 @@ function mountInto(parent: number, element: Element, before?: number): Mounted {
     if (first === undefined || first.op !== "create") throw new Error("mountInto: the element created no node");
     if (before !== undefined) first.before = before;
     var id = first.id;
-    var created = transient ? [] : ops.filter((op) => op.op === "create").map((op) => (op as { id: number }).id);
+    if (!transient) {
+        var created = ops.filter((op) => op.op === "create").map((op) => (op as { id: number }).id);
+        // Freed on dispose, not only on remove: a parent's dispose must return the ids of mounts nested in it.
+        (scope.cleanup ??= []).push(() => { for (var i = 0; i < created.length; i++) retiring.push(created[i]); });
+    }
     send(ops);
     return {
         id: id,
         remove() {
-            dispose(scope);
-            if (transient) owner.children.splice(owner.children.indexOf(scope), 1);
-            send([{ op: "remove", id: id }]);
-            for (var i = 0; i < created.length; i++) freeIds.push(created[i]);
+            // Disposed with an ancestor: its nodes went with that ancestor's remove, and its ids may already belong
+            // to new nodes, so a late remove (a stale reference) must send nothing.
+            if (scope.disposed) {
+                if (transient) owner.children.splice(owner.children.indexOf(scope), 1);
+                return;
+            }
+            removing++;
+            try {
+                dispose(scope);
+            } finally {
+                // Even when a cleanup throws, the subtree leaves the screen.
+                if (transient) owner.children.splice(owner.children.indexOf(scope), 1);
+                emitRemove(id);
+                removing--;
+                // A remove nested in another's dispose must not free the outer's ids: its remove is not sent yet.
+                if (removing === 0) while (retiring.length > 0) freeIds.push(retiring.pop() as number);
+            }
         },
     };
 }
 /** Replaces a node's paint; properties with a transition animate from what is on screen. */
 function setPaint(id: number, paint: Paint): void {
-    send([{ op: "setpaint", id: id, paint: paint }]);
+    emitSetPaint(id, paint);
 }
 function setSpans(id: number, spans: Span[]): void {
     send([{ op: "setspans", id: id, spans: spans }]);
 }
 /** Scrolls a `scroll` node (its id from a `ref`) to `offset` pixels, or to its `start` or `end`. `smooth` glides there. */
 function scrollTo(id: number, to: { offset?: number; to?: ScrollEdge; smooth?: boolean }): void {
-    send([{ op: "scrollto", id: id, offset: to.offset, to: to.to, smooth: to.smooth ?? false }]);
+    emitScrollTo(id, to);
 }
 /** Calls `run` once after `ms` milliseconds. Rust keeps the timer; JS does not wait. */
 function after(ms: number, run: () => void): void {
@@ -320,10 +683,22 @@ function after(ms: number, run: () => void): void {
         unregister(callback);
         run();
     });
-    send([{ op: "after", ms: ms, callback: callback }]);
+    emitAfter(callback, ms);
 }
 
 // ---------- Components ----------
+
+type DragPhase = "start" | "move" | "end";
+/** Primary-button drag event in window logical pixels. `dx`/`dy` are the displacement from `startX`/`startY`. */
+interface DragEvent {
+    phase: DragPhase;
+    x: number;
+    y: number;
+    startX: number;
+    startY: number;
+    dx: number;
+    dy: number;
+}
 
 /** A container: flexbox layout (`style`), looks (`paint`) and an optional press callback. */
 function Box(props: {
@@ -338,6 +713,8 @@ function Box(props: {
     onDismiss?: () => void;
     /** A `scroll` box's offset changed: once per frame, with its offset and its content and box heights in pixels. */
     onScroll?: (s: { top: number; height: number; client: number }) => void;
+    /** Primary-button drag starting on the box: `"start"` on press, `"move"` as the pointer moves, `"end"` on release or cancel. */
+    onDrag?: (e: DragEvent) => void;
     disabled?: Source<boolean>;
     ref?: (id: number) => void;
     children?: Children;
@@ -347,13 +724,13 @@ function Box(props: {
             var id = newId();
             if (props.ref) props.ref(id);
             var style = bind(props.style ?? {}, function (s) {
-                send([{ op: "setstyle", id: id, style: s }]);
+                emitSetStyle(id, s);
             });
             var paint = bind(props.paint ?? {}, function (p) {
                 setPaint(id, p);
             });
             var disabled = bind(props.disabled ?? false, function (d) {
-                send([{ op: "setdisabled", id: id, disabled: d }]);
+                emitSetDisabled(id, d);
             });
             var press = props.onPress ? register(props.onPress) : 0;
             var onHover = props.onHover;
@@ -361,17 +738,15 @@ function Box(props: {
                 (onHover as (inside: boolean) => void)(text === "1");
             });
             var onContextMenu = props.onContextMenu;
-            var contextmenu = onContextMenu === undefined ? 0 : register(function (text) {
-                (onContextMenu as (p: { x: number; y: number }) => void)(JSON.parse(text));
-            });
+            var contextmenu = onContextMenu === undefined ? 0 : registerContextMenu(onContextMenu);
             var onDismiss = props.onDismiss;
             var dismiss = onDismiss === undefined ? 0 : register(function () {
                 (onDismiss as () => void)();
             });
             var onScroll = props.onScroll;
-            var scroll = onScroll === undefined ? 0 : register(function (text) {
-                (onScroll as (s: { top: number; height: number; client: number }) => void)(JSON.parse(text));
-            });
+            var scroll = onScroll === undefined ? 0 : registerScroll(onScroll);
+            var onDrag = props.onDrag;
+            var drag = onDrag === undefined ? 0 : registerDrag(onDrag);
             ops.push({
                 op: "create",
                 id: id,
@@ -386,6 +761,7 @@ function Box(props: {
                     contextmenu: contextmenu,
                     dismiss: dismiss,
                     scroll: scroll,
+                    drag: drag,
                 },
             });
             mountChildren(props.children, id, ops);
@@ -439,13 +815,16 @@ type VirtualPayload = {
 var virtualMounts = new Map<number, (delta: VirtualPayload) => [string, number][]>();
 
 /** Rust-indexed scrolling list. The embedder connects `name`; a row reads its latest payload via `item()`. */
-function VirtualList<T>(props: { name: string; style?: Style; children: (key: string, item: () => T) => Element }): Element {
+function VirtualList<T>(props: { name: string; style?: Style; ref?: (id: number) => void;
+    onScroll?: (s: { top: number; height: number; client: number }) => void; children: (key: string, item: () => T) => Element }): Element {
     return {
         mount(parent, ops) {
             var id = newId();
+            props.ref?.(id);
+            var scroll = props.onScroll === undefined ? 0 : registerScroll(props.onScroll);
             var mount: string | undefined;
             var rows = new Map<string, KeyedRow<T>>();
-            ops.push({ op: "create", id, parent, node: { kind: "list", style: props.style } });
+            ops.push({ op: "create", id, parent, node: { kind: "list", style: props.style, scroll } });
             ops.push({ op: "virtuallist", id, name: props.name });
             (currentScope.cleanup ??= []).push(() => {
                 virtualMounts.delete(id);
@@ -508,6 +887,7 @@ function Text(props: {
         mount(parent, ops) {
             var id = newId();
             var text = bind(props.children, function (v) {
+                flushCmd();
                 jsnir.setText(id, v);
             });
             var spans = props.spans === undefined ? undefined : bind(props.spans, function (v) {
@@ -563,7 +943,7 @@ function Label(props: { value: Source<number> }): Element {
         mount(parent, ops) {
             var id = newId();
             var value = bind(props.value, function (v) {
-                jsnir.set(id, v);
+                emitSet(id, v);
             });
             ops.push({ op: "create", id: id, parent: parent, node: { kind: "label", value: value } });
         },
@@ -585,8 +965,10 @@ interface Field {
     selection(): [number, number];
     /** Layout rectangle (x, y, width, height) in logical pixels, read from the columns without crossing. */
     rect(): [number, number, number, number];
+    /** Replaces text only if it still has the expected value. The caret moves to the end. */
+    replace(text: string, expected?: string): void;
 }
-/** A field submit. Rust already captured `text` and cleared the field in the same operation. */
+/** A field submit. The field may retain the text until the app accepts it. */
 interface TextSubmit {
     text: string;
     field: Field;
@@ -603,9 +985,15 @@ function TextInput(props: {
     multiline?: boolean;
     /** In a multi-line field, Enter submits and Shift+Enter breaks the line, instead of Enter breaking it. */
     submitOnEnter?: boolean;
+    retainOnSubmit?: boolean;
+    /** Semantic purpose of the field (e.g. `"password"` masks glyphs with bullets and disables IME). */
+    purpose?: InputPurpose;
     onSubmit?: (submit: TextSubmit) => void;
     /** Receives the text after each edit, as a DOM `input` event. */
     onChange?: (text: string) => void;
+    /** Takes the focus when it mounts, as Discord's search fields do. */
+    autoFocus?: boolean;
+    ref?: (field: Field) => void;
 }): Element {
     return {
         mount(parent, ops) {
@@ -622,7 +1010,11 @@ function TextInput(props: {
                     var c = jsnir.columns;
                     return [c.x[id], c.y[id], c.width[id], c.height[id]];
                 },
+                replace: function (text: string, expected?: string): void {
+                    send([{ op: "setfield", id, text, expected: expected ?? field.text() }]);
+                },
             };
+            props.ref?.(field);
             var onSubmit = props.onSubmit;
             var submit = onSubmit === undefined ? 0 : register(function (text) {
                 (onSubmit as (submit: TextSubmit) => void)({ text: text, field: field });
@@ -645,11 +1037,14 @@ function TextInput(props: {
                     placeholderColor: props.placeholderColor,
                     multiline: props.multiline,
                     submitOnEnter: props.submitOnEnter,
+                    retainOnSubmit: props.retainOnSubmit,
+                    purpose: props.purpose,
                     style: props.style,
                     font: props.font,
                     paint: paint,
                 },
             });
+            if (props.autoFocus) ops.push({ op: "focus", id: id });
         },
     };
 }
@@ -673,8 +1068,13 @@ function Dynamic<T>({
                     current = mountInto(id, render(value));
                 });
             };
+            var shown: { value: T } | null = null;
             effect(function () {
                 var next = read(source);
+                // The same value keeps its content: a rerun (another signal the source read changed) must not remount
+                // it, which would recycle its node and callback ids for nothing.
+                if (shown !== null && Object.is(shown.value, next)) return;
+                shown = { value: next };
                 // The first child waits until the batch that creates the container has been sent.
                 if (first) {
                     first = false;
@@ -740,11 +1140,13 @@ function For<T>({
                     if (fresh.size !== keys.length) throw new Error("For: duplicate key");
                     rows.forEach(function (row, rowKey) {
                         if (fresh.has(rowKey)) return;
-                        dispose(row.scope);
+                        // Out of the state first, so a sync re-entered from a cleanup cannot remove it twice;
+                        // then off the screen before dispose, so its ids are freed only once its remove is sent.
+                        rows.delete(rowKey);
+                        order.splice(order.indexOf(row.mounted.id), 1);
                         scope.children.splice(scope.children.indexOf(row.scope), 1);
                         row.mounted.remove();
-                        order.splice(order.indexOf(row.mounted.id), 1);
-                        rows.delete(rowKey);
+                        dispose(row.scope);
                     });
                     // From the last item back, each child goes before the one placed after it: a kept child
                     // moves only when it is not already there.
@@ -757,7 +1159,7 @@ function For<T>({
                         } else {
                             row.signal.value = items[i];
                             if (order[order.indexOf(row.mounted.id) + 1] !== before) {
-                                send([{ op: "move", id: row.mounted.id, before: before }]);
+                                emitMove(row.mounted.id, before);
                                 order.splice(order.indexOf(row.mounted.id), 1);
                                 order.splice(placeAt(order, before), 0, row.mounted.id);
                             }
@@ -795,6 +1197,8 @@ function Popover(props: {
     side?: Side;
     align?: AnchorAlign;
     layer?: number;
+    /** Distance between the anchor and the panel, in logical pixels (default 8). */
+    gap?: number;
     style?: Style;
     paint?: Source<Paint>;
     /** After the final frame pass, when the resolved side or offset changes (including first placement).
@@ -811,7 +1215,7 @@ function Popover(props: {
             var show = function () {
                 var node = props.anchor();
                 if (node === undefined || current !== null) return;
-                var anchor: Anchor = { node: node, side: props.side ?? "bottom", align: props.align ?? "start", gap: 8, flip: true };
+                var anchor: Anchor = { node: node, side: props.side ?? "bottom", align: props.align ?? "start", gap: props.gap ?? 8, flip: true };
                 current = mountInto(
                     parent as number,
                     {
@@ -928,14 +1332,23 @@ function onHost(handler: (message: any) => void): void {
 function hostEvent(text: string): void {
     if (hostHandler !== undefined) hostHandler(JSON.parse(text));
 }
-// Rust calls `jsnirMount` once and `jsnirEvent` per event, on the VM thread. The operations they emit
-// form that call's batch.
+// Rust calls `jsnirMount` once and `jsnirEvent` (or typed numeric dispatchers) per event, on the VM thread.
+// The operations they emit form that call's batch.
 function jsnirMount(): void {
     if (root === null) throw new Error("mount(App) was never called");
-    var ops: Operation[] = [];
-    root().mount(undefined, ops);
-    send(ops);
-    mountPending();
+    inMount = true;
+    try {
+        var ops: Operation[] = [];
+        root().mount(undefined, ops);
+        send(ops);
+        mountPending();
+        flushCmd();
+    } catch (e) {
+        cmdPos = 0;
+        throw e;
+    } finally {
+        inMount = false;
+    }
 }
 // Unlike other events, placement is unsolicited and may already be queued when a panel closes or reloads.
 function jsnirPlacement(text: string): void {
@@ -951,16 +1364,74 @@ function jsnirEvent(callback: number, text: string, guard?: string): void {
     if (handler === undefined) return;
     runEvent(() => row === undefined ? handler(text) : inScope(row.scope, () => handler(text)));
 }
+var DRAG_PHASES: readonly DragPhase[] = ["start", "move", "end"];
+function jsnirDrag(
+    callback: number,
+    phase: number,
+    x: number,
+    y: number,
+    startX: number,
+    startY: number,
+    guard?: string,
+): void {
+    const row = rowCallbacks.get(callback);
+    if (row?.token !== guard) return;
+    const handler = dragHandlers[callback - 1];
+    if (handler === undefined) return;
+    const ev: DragEvent = {
+        phase: DRAG_PHASES[phase] ?? "end",
+        x,
+        y,
+        startX,
+        startY,
+        dx: x - startX,
+        dy: y - startY,
+    };
+    runEvent(() => row === undefined ? handler(ev) : inScope(row.scope, () => handler(ev)));
+}
+function jsnirScroll(
+    callback: number,
+    top: number,
+    height: number,
+    client: number,
+    guard?: string,
+): void {
+    const row = rowCallbacks.get(callback);
+    if (row?.token !== guard) return;
+    const handler = scrollHandlers[callback - 1];
+    if (handler === undefined) return;
+    const ev = { top, height, client };
+    runEvent(() => row === undefined ? handler(ev) : inScope(row.scope, () => handler(ev)));
+}
+function jsnirContextMenu(
+    callback: number,
+    x: number,
+    y: number,
+    guard?: string,
+): void {
+    const row = rowCallbacks.get(callback);
+    if (row?.token !== guard) return;
+    const handler = contextMenuHandlers[callback - 1];
+    if (handler === undefined) return;
+    const ev = { x, y };
+    runEvent(() => row === undefined ? handler(ev) : inScope(row.scope, () => handler(ev)));
+}
 function runEvent<T>(body: () => T): T {
     var previous = batching;
     batching = true;
     var result: T;
     try {
-        result = body();
-    } finally {
-        batching = previous;
+        try {
+            result = body();
+        } finally {
+            batching = previous;
+        }
+        flush();
+        mountPending();
+        if (!previous) flushCmd();
+    } catch (e) {
+        if (!previous) cmdPos = 0;
+        throw e;
     }
-    flush();
-    mountPending();
     return result;
 }
