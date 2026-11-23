@@ -6,6 +6,7 @@ use serde::Deserialize;
 use std::{
     collections::{HashMap, VecDeque},
     ops::Index,
+    sync::Arc,
 };
 
 contract_strings! {
@@ -547,7 +548,7 @@ contract_enum! {
             text: String,
             (default) style: Style,
             (default) font: Font,
-            (default) paint: Box<Paint>,
+            (default) paint: Arc<Paint>,
             /// At most this many lines; the last one shown ends in "…" when the text does not fit. None: no limit.
             (default) lines: Option<u16>,
             /// Alignment of each line inside the node's width.
@@ -577,13 +578,13 @@ contract_enum! {
             (default) purpose: InputPurpose,
             (default) style: Style,
             (default) font: Font,
-            (default) paint: Box<Paint>,
+            (default) paint: Arc<Paint>,
         },
         /// General container: layout, paint and an optional press callback.
         Box {
             (skip) children: Vec<u16>,
             (default) style: Style,
-            (default) paint: Box<Paint>,
+            (default) paint: Arc<Paint>,
             /// Callback for a click or tap. 0: not pressable.
             (default) press: u16,
             (default) disabled: bool,
@@ -605,9 +606,9 @@ contract_enum! {
             (default) drag: u16,
         },
         /// A stroke icon of `size` × `size` logical pixels.
-        Icon { icon: Icon, size: f32, stroke: f32, (default) style: Style, (default) paint: Box<Paint> },
+        Icon { icon: Icon, size: f32, stroke: f32, (default) style: Style, (default) paint: Arc<Paint> },
         /// An image the embedding program supplied with `Host::set_image`, stretched to its box. `paint.radius` rounds its corners and `paint.color` multiplies it (white glyphs become that color). Nothing is drawn while the source is missing.
-        Image { source: String, (default) style: Style, (default) paint: Box<Paint> },
+        Image { source: String, (default) style: Style, (default) paint: Arc<Paint> },
     }
 }
 contract_enum! {
@@ -631,7 +632,7 @@ contract_enum! {
         /// Changes the source of a `Node::Image`.
         SetSource { id: u16, source: String },
         /// Replaces the paint of a node. Properties with a transition animate from what is on screen.
-        SetPaint { id: u16, paint: Box<Paint> },
+        SetPaint { id: u16, paint: Arc<Paint> },
         SetStyle { id: u16, style: Style },
         SetDisabled { id: u16, disabled: bool },
         /// Moves keyboard focus to a text field, as Discord's `autofocus`.
@@ -733,7 +734,7 @@ impl Node {
             _ => None,
         }
     }
-    fn paint_mut(&mut self) -> Option<&mut Paint> {
+    fn paint_arc_mut(&mut self) -> Option<&mut Arc<Paint>> {
         match self {
             Node::Text { paint, .. }
             | Node::Input { paint, .. }
@@ -884,10 +885,33 @@ impl Tree {
         self.app_seq += 1;
         Ok(())
     }
+    /// Applies a shared app batch without cloning its `Vec<Op>`.
+    pub fn apply_ref(&mut self, base: u64, ops: &[Op]) -> Result<(), &'static str> {
+        if base != self.app_seq {
+            return Err("stale_base");
+        }
+        self.validate(ops, false)?;
+        self.write_ref(ops);
+        self.app_seq += 1;
+        Ok(())
+    }
+    /// Applies a shared app batch: moves it if unshared, otherwise applies from `&[Op]` with zero `Vec<Op>` clone.
+    pub fn apply_shared(&mut self, batch: Arc<Batch>) -> Result<(), &'static str> {
+        match Arc::try_unwrap(batch) {
+            Ok(owned) => self.apply(owned),
+            Err(shared) => self.apply_ref(shared.base, &shared.ops),
+        }
+    }
     /// Applies a UI batch. It may only contain UI operations and carries no base: the UI is the authority.
     pub fn apply_ui(&mut self, batch: Batch) -> Result<(), &'static str> {
         self.validate(&batch.ops, true)?;
         self.write(batch.ops);
+        Ok(())
+    }
+    /// Applies a UI batch from a slice without cloning `Batch` (so the caller can move it straight to the log).
+    pub fn apply_ui_ref(&mut self, ops: &[Op]) -> Result<(), &'static str> {
+        self.validate(ops, true)?;
+        self.write_ref(ops);
         Ok(())
     }
     fn validate(&self, ops: &[Op], ui: bool) -> Result<(), &'static str> {
@@ -1206,8 +1230,8 @@ impl Tree {
                     }
                 }
                 Op::SetPaint { id, paint } => {
-                    if let Some(slot) = self.nodes.get_mut(&id).and_then(Node::paint_mut) {
-                        *slot = *paint;
+                    if let Some(slot) = self.nodes.get_mut(&id).and_then(Node::paint_arc_mut) {
+                        *slot = paint;
                     }
                 }
                 Op::SetStyle { id, style } => {
@@ -1250,6 +1274,160 @@ impl Tree {
                     }) = self.nodes.get_mut(&id)
                     {
                         (*text, *selection) = (new, sel);
+                    }
+                }
+            }
+        }
+        self.version += 1;
+    }
+    fn write_ref(&mut self, ops: &[Op]) {
+        for op in ops {
+            match op {
+                Op::Create {
+                    id,
+                    parent,
+                    before,
+                    node,
+                } => {
+                    let id = *id;
+                    let parent = *parent;
+                    let before = *before;
+                    if let Some(children) = parent
+                        .and_then(|p| self.nodes.get_mut(&p))
+                        .and_then(Node::children_mut)
+                    {
+                        let at = before
+                            .and_then(|b| children.iter().position(|c| *c == b))
+                            .unwrap_or(children.len());
+                        children.insert(at, id);
+                    }
+                    if parent.is_none() {
+                        self.root = Some(id);
+                    }
+                    let i = id as usize;
+                    if self.parents.len() <= i {
+                        self.parents.resize(i + 1, None);
+                    }
+                    self.parents[i] = parent;
+                    self.nodes.insert(id, node.clone());
+                }
+                Op::Remove { id } => {
+                    let id = *id;
+                    if let Some(parent) = self.parent(id)
+                        && let Some(children) =
+                            self.nodes.get_mut(&parent).and_then(Node::children_mut)
+                    {
+                        children.retain(|c| *c != id);
+                    }
+                    if self.root == Some(id) {
+                        self.root = None;
+                    }
+                    for i in self.subtree(id) {
+                        self.nodes.remove(i);
+                        if let Some(rect) = self.rects.get_mut(i as usize) {
+                            *rect = [0.0; 4];
+                        }
+                        if let Some(scroll) = self.scrolls.get_mut(i as usize) {
+                            *scroll = [0.0; 3];
+                        }
+                        if let Some(p) = self.parents.get_mut(i as usize) {
+                            *p = None;
+                        }
+                    }
+                }
+                Op::Move { id, before } => {
+                    let id = *id;
+                    let before = *before;
+                    if let Some(parent) = self.parent(id)
+                        && let Some(children) =
+                            self.nodes.get_mut(&parent).and_then(Node::children_mut)
+                    {
+                        children.retain(|c| *c != id);
+                        let at = before
+                            .and_then(|b| children.iter().position(|c| *c == b))
+                            .unwrap_or(children.len());
+                        children.insert(at, id);
+                    }
+                }
+                Op::Set { id, value: new } => {
+                    if let Some(Node::Label { value }) = self.nodes.get_mut(id) {
+                        *value = *new;
+                    }
+                }
+                Op::SetText { id, text: new } => {
+                    if let Some(Node::Text { text, .. }) = self.nodes.get_mut(id) {
+                        text.clone_from(new);
+                    }
+                }
+                Op::SetField {
+                    id,
+                    expected,
+                    text: new,
+                } => {
+                    if let Some(Node::Input {
+                        text, selection, ..
+                    }) = self.nodes.get_mut(id)
+                        && text == expected
+                    {
+                        *selection = [new.encode_utf16().count() as u32; 2];
+                        text.clone_from(new);
+                    }
+                }
+                Op::SetSpans { id, spans: new } => {
+                    if let Some(Node::Text { spans, .. }) = self.nodes.get_mut(id) {
+                        *spans = Some(new.clone());
+                    }
+                }
+                Op::SetSource { id, source: new } => {
+                    if let Some(Node::Image { source, .. }) = self.nodes.get_mut(id) {
+                        source.clone_from(new);
+                    }
+                }
+                Op::SetPaint { id, paint } => {
+                    if let Some(slot) = self.nodes.get_mut(id).and_then(Node::paint_arc_mut) {
+                        *slot = Arc::clone(paint);
+                    }
+                }
+                Op::SetStyle { id, style } => {
+                    if let Some(slot) = self.nodes.get_mut(id).and_then(Node::style_mut) {
+                        slot.clone_from(style);
+                    }
+                }
+                Op::SetDisabled { id, disabled: new } => {
+                    if let Some(Node::Box { disabled, .. }) = self.nodes.get_mut(id) {
+                        *disabled = *new;
+                    }
+                }
+                Op::After { .. }
+                | Op::VirtualList { .. }
+                | Op::Focus { .. }
+                | Op::CallbackGuard { .. } => {}
+                Op::SetRect { id, rect } => {
+                    let i = *id as usize;
+                    if self.rects.len() <= i {
+                        self.rects.resize(i + 1, [0.0; 4]);
+                    }
+                    self.rects[i] = *rect;
+                }
+                Op::SetScroll { id, scroll } => {
+                    let i = *id as usize;
+                    if self.scrolls.len() <= i {
+                        self.scrolls.resize(i + 1, [0.0; 3]);
+                    }
+                    self.scrolls[i] = *scroll;
+                }
+                Op::ScrollTo { .. } => {}
+                Op::SetInput {
+                    id,
+                    text: new,
+                    selection: sel,
+                } => {
+                    if let Some(Node::Input {
+                        text, selection, ..
+                    }) = self.nodes.get_mut(id)
+                    {
+                        text.clone_from(new);
+                        *selection = *sel;
                     }
                 }
             }
@@ -1302,15 +1480,19 @@ impl Tree {
 pub struct Replica {
     pub confirmed: Tree,
     pub view: Tree,
-    // Each pending batch remembers whether it was applied to the view.
-    pending: VecDeque<(Batch, bool)>,
+    // Each pending batch is shared via `Arc` with the UI channel so no `Vec<Op>` is ever cloned.
+    pending: VecDeque<(Arc<Batch>, bool)>,
 }
 impl Replica {
     /// Records a batch on its way to the UI and applies it to the view if it is valid here.
     /// If it is not, the local version does not advance and the next batch leaves with the right base.
     pub fn produced(&mut self, batch: &Batch) -> Result<(), &'static str> {
-        let result = self.view.apply(batch.clone());
-        self.pending.push_back((batch.clone(), result.is_ok()));
+        self.produced_shared(Arc::new(batch.clone()))
+    }
+    /// Zero-clone variant used by the bridge: `batch` is shared via `Arc` between `pending` and the UI thread.
+    pub fn produced_shared(&mut self, batch: Arc<Batch>) -> Result<(), &'static str> {
+        let result = self.view.apply_ref(batch.base, &batch.ops);
+        self.pending.push_back((batch, result.is_ok()));
         result
     }
     /// The UI's answer to the oldest pending batch. Returns whether the view was rebuilt entirely.
@@ -1320,14 +1502,16 @@ impl Replica {
             .pop_front()
             .expect("answer without a pending batch");
         if accepted {
-            self.confirmed
-                .apply(batch)
-                .expect("the replica cannot apply a batch the UI accepted");
+            let applied = match Arc::try_unwrap(batch) {
+                Ok(owned) => self.confirmed.apply(owned),
+                Err(shared) => self.confirmed.apply_ref(shared.base, &shared.ops),
+            };
+            applied.expect("the replica cannot apply a batch the UI accepted");
         } else if in_view {
             // The view counted on that batch: rebuild it from what is confirmed plus the pending batches that are still valid.
             self.view = self.confirmed.clone();
             for (b, applied) in &mut self.pending {
-                *applied = self.view.apply(b.clone()).is_ok();
+                *applied = self.view.apply_ref(b.base, &b.ops).is_ok();
             }
             return true;
         }
@@ -1336,7 +1520,7 @@ impl Replica {
     /// Applies a confirmed UI batch. Updates for retired node instances stay out of the optimistic view.
     pub fn foreign(&mut self, mut batch: Batch) {
         self.confirmed
-            .apply_ui(batch.clone())
+            .apply_ui_ref(&batch.ops)
             .expect("invalid UI batch in the replica");
         if !self.pending.is_empty() {
             // A pending create can reuse an id that the UI still uses for the previous node.
@@ -1683,7 +1867,7 @@ mod tests {
             text: "orphan".into(),
             style: Style::default(),
             font: Font::default(),
-            paint: Box::default(),
+            paint: Arc::default(),
         };
         let before = t.clone();
         assert_eq!(
@@ -1949,7 +2133,7 @@ mod tests {
             Node::Image {
                 source: "b".into(),
                 style: Style::default(),
-                paint: Box::default()
+                paint: Arc::default()
             }
         );
     }

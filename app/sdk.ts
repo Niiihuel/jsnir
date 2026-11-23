@@ -292,7 +292,7 @@ function register(handler: (text: string) => void): number {
         var token = (typeof __jsnirPlacementEpoch === "string" ? __jsnirPlacementEpoch : "0")
             + ":" + nextCallbackToken++;
         rowCallbacks.set(id, { token, scope: currentScope });
-        send([{ op: "callbackguard", callback: id, token }]);
+        emitCallbackGuard(id, token);
     }
     return id;
 }
@@ -328,23 +328,35 @@ function unregister(id: number): void {
         rowCallbacks.delete(id);
         var callbacks = guarded.scope.callbacks;
         callbacks[callbacks.indexOf(id)] = 0; // do not unregister a future owner of this id
-        send([{ op: "callbackguard", callback: id }]);
+        emitCallbackGuard(id, undefined);
     }
     if (placementTokens[id] !== undefined) delete placementTokens[id];
     freeCallbacks.push(id);
 }
 
 // ---------- Binary Command Buffer ----------
-// Frequent ops are packed directly into the shared `jsnir.cmd` / `jsnir.cmdF32` ArrayBuffer and
-// flushed in one `jsnir.commit(words)` call without `JSON.stringify` or `serde_json`.
+// Frequent ops and node creations are packed directly into the shared `jsnir.cmd` / `jsnir.cmdF32`
+// ArrayBuffer (with strings in `cmdStrs`) and flushed in one `jsnir.commit` / `jsnir.commitStrings`
+// call without `JSON.stringify` or `serde_json`.
 var OP_SET = 1;
 var OP_SET_DISABLED = 2;
 var OP_REMOVE = 3;
 var OP_MOVE = 4;
+var OP_FOCUS = 5;
 var OP_AFTER = 6;
 var OP_SCROLL_TO = 7;
 var OP_SET_STYLE = 8;
 var OP_SET_PAINT = 9;
+var OP_SET_TEXT = 10;
+var OP_CREATE_BOX = 11;
+var OP_CREATE_TEXT = 12;
+var OP_CREATE_COLUMN = 13;
+var OP_CREATE_LABEL = 14;
+var OP_CREATE_BUTTON = 15;
+var OP_CREATE_ICON = 16;
+var OP_CREATE_IMAGE = 17;
+var OP_SET_SOURCE = 18;
+var OP_CALLBACK_GUARD = 19;
 var CURSOR_CODES: { [k: string]: number | undefined } = {
     default: 0,
     pointer: 1,
@@ -360,13 +372,30 @@ var CURSOR_CODES: { [k: string]: number | undefined } = {
     neswResize: 11,
     nwseResize: 12,
 };
+var ICON_CODES: { [k: string]: number | undefined } = {
+    arrowLeft: 0,
+    arrowRight: 1,
+    tick: 2,
+    checkCircle: 3,
+};
 var cmdPos = 0;
+var cmdStrs: string[] = [];
 var inMount = false;
+function resetCmd(): void {
+    cmdPos = 0;
+    cmdStrs.length = 0;
+}
 function flushCmd(): void {
     if (cmdPos === 0) return;
     var words = cmdPos;
     cmdPos = 0;
-    jsnir.commit(words);
+    if (cmdStrs.length === 0) {
+        jsnir.commit(words);
+    } else {
+        var strs = cmdStrs;
+        cmdStrs = [];
+        jsnir.commitStrings(words, strs);
+    }
 }
 function reserveCmd(words: number): void {
     if (cmdPos + words > jsnir.cmd.length) flushCmd();
@@ -374,8 +403,188 @@ function reserveCmd(words: number): void {
 function maybeFlushCmd(): void {
     if (!batching && !inMount) flushCmd();
 }
+function pushStr(s: string): number {
+    var idx = cmdStrs.length;
+    cmdStrs.push(s);
+    return idx;
+}
+function isU16(v: number): boolean {
+    return Number.isInteger(v) && v >= 0 && v <= 65535;
+}
+function canEncodeStyle(s: Style | undefined): boolean {
+    if (s === undefined) return true;
+    if (
+        s.anchor !== undefined
+        || (Array.isArray(s.padding) && s.padding.length !== 4)
+        || (Array.isArray(s.margin) && s.margin.length !== 4)
+        || (s.follow !== undefined && !isU16(s.follow))
+    ) return false;
+    if (s.direction !== undefined && s.direction !== "column" && s.direction !== "row") return false;
+    if (s.align !== undefined && s.align !== "stretch" && s.align !== "start" && s.align !== "center" && s.align !== "end") return false;
+    if (s.justify !== undefined && s.justify !== "start" && s.justify !== "center" && s.justify !== "end" && s.justify !== "between") return false;
+    if (s.position !== undefined && s.position !== "relative" && s.position !== "absolute" && s.position !== "fixed") return false;
+    if (s.scrollAnchor !== undefined && s.scrollAnchor !== "start" && s.scrollAnchor !== "end") return false;
+    return true;
+}
+function writeStyle(u: Uint32Array, f: Float32Array, start: number, s: Style): number {
+    var flags = 0;
+    if (s.direction === "row") flags |= 1;
+    if (s.align === "stretch") flags |= 1 << 1;
+    else if (s.align === "start") flags |= 2 << 1;
+    else if (s.align === "center") flags |= 3 << 1;
+    else if (s.align === "end") flags |= 4 << 1;
+    if (s.justify === "center") flags |= 1 << 4;
+    else if (s.justify === "end") flags |= 2 << 4;
+    else if (s.justify === "between") flags |= 3 << 4;
+    if (s.position === "absolute") flags |= 1 << 6;
+    else if (s.position === "fixed") flags |= 2 << 6;
+    if (s.clip) flags |= 1 << 8;
+    if (s.scroll) flags |= 1 << 9;
+    if (s.scrollAnchor === "end") flags |= 1 << 10;
+    if (s.group) flags |= 1 << 11;
+
+    var p = start + 2;
+    var mask = 0;
+    if (s.width !== undefined) { mask |= 1 << 0; f[p++] = s.width; }
+    if (s.height !== undefined) { mask |= 1 << 1; f[p++] = s.height; }
+    if (s.grow !== undefined) { mask |= 1 << 2; f[p++] = s.grow; }
+    if (s.shrink !== undefined) { mask |= 1 << 3; f[p++] = s.shrink; }
+    if (s.basis !== undefined) { mask |= 1 << 4; f[p++] = s.basis; }
+    if (s.padding !== undefined) {
+        mask |= 1 << 5;
+        if (typeof s.padding === "number") {
+            f[p] = s.padding; f[p + 1] = s.padding; f[p + 2] = s.padding; f[p + 3] = s.padding;
+        } else {
+            f[p] = s.padding[0]; f[p + 1] = s.padding[1]; f[p + 2] = s.padding[2]; f[p + 3] = s.padding[3];
+        }
+        p += 4;
+    }
+    if (s.margin !== undefined) {
+        mask |= 1 << 6;
+        if (typeof s.margin === "number") {
+            f[p] = s.margin; f[p + 1] = s.margin; f[p + 2] = s.margin; f[p + 3] = s.margin;
+        } else {
+            f[p] = s.margin[0]; f[p + 1] = s.margin[1]; f[p + 2] = s.margin[2]; f[p + 3] = s.margin[3];
+        }
+        p += 4;
+    }
+    if (s.gap !== undefined) { mask |= 1 << 7; f[p++] = s.gap; }
+    if (s.left !== undefined) { mask |= 1 << 8; f[p++] = s.left; }
+    if (s.top !== undefined) { mask |= 1 << 9; f[p++] = s.top; }
+    if (s.follow !== undefined) { mask |= 1 << 10; u[p++] = s.follow; }
+    if (s.layer !== undefined) { mask |= 1 << 11; u[p++] = (s.layer | 0) >>> 0; }
+    if (s.minWidth !== undefined) { mask |= 1 << 12; f[p++] = s.minWidth; }
+    if (s.minHeight !== undefined) { mask |= 1 << 13; f[p++] = s.minHeight; }
+    if (s.maxWidth !== undefined) { mask |= 1 << 14; f[p++] = s.maxWidth; }
+    if (s.maxHeight !== undefined) { mask |= 1 << 15; f[p++] = s.maxHeight; }
+    u[start] = mask;
+    u[start + 1] = flags;
+    return p;
+}
+function canEncodeVariant(v: Variant): boolean {
+    if (v.gradient !== undefined && (!Array.isArray(v.gradient) || v.gradient.length !== 2)) return false;
+    if (v.cursor !== undefined && CURSOR_CODES[v.cursor] === undefined) return false;
+    return true;
+}
+function writeVariant(u: Uint32Array, f: Float32Array, start: number, v: Variant): number {
+    var p = start + 1;
+    var mask = 0;
+    if (v.background !== undefined) { mask |= 1 << 0; u[p++] = v.background >>> 0; }
+    if (v.gradient !== undefined) {
+        mask |= 1 << 1;
+        u[p++] = v.gradient[0] >>> 0;
+        u[p++] = v.gradient[1] >>> 0;
+    }
+    if (v.brightness !== undefined) { mask |= 1 << 2; f[p++] = v.brightness; }
+    if (v.scale !== undefined) { mask |= 1 << 3; f[p++] = v.scale; }
+    if (v.opacity !== undefined) { mask |= 1 << 4; f[p++] = v.opacity; }
+    if (v.x !== undefined) { mask |= 1 << 5; f[p++] = v.x; }
+    if (v.y !== undefined) { mask |= 1 << 6; f[p++] = v.y; }
+    if (v.color !== undefined) { mask |= 1 << 7; u[p++] = v.color >>> 0; }
+    if (v.edge !== undefined) { mask |= 1 << 8; u[p++] = v.edge >>> 0; }
+    if (v.height !== undefined) { mask |= 1 << 9; f[p++] = v.height; }
+    if (v.width !== undefined) { mask |= 1 << 10; f[p++] = v.width; }
+    if (v.underline !== undefined) { mask |= 1 << 11; u[p++] = v.underline ? 1 : 0; }
+    if (v.cursor !== undefined) { mask |= 1 << 12; u[p++] = CURSOR_CODES[v.cursor] as number; }
+    u[start] = mask;
+    return p;
+}
+function canEncodePaint(paint: Paint | undefined): boolean {
+    if (paint === undefined) return true;
+    if (
+        paint.mask !== undefined
+        || (paint.shadows !== undefined && paint.shadows.length > 0)
+        || (paint.transitions !== undefined && paint.transitions.length > 0)
+        || paint.animations !== undefined
+        || paint.starting !== undefined
+        || paint.scrollbar !== undefined
+        || (paint.gradient !== undefined && (!Array.isArray(paint.gradient) || paint.gradient.length !== 2))
+        || (Array.isArray(paint.radius) && paint.radius.length !== 4)
+        || (paint.edgeSides !== undefined && (!Array.isArray(paint.edgeSides) || paint.edgeSides.length !== 4))
+        || (paint.cursor !== undefined && CURSOR_CODES[paint.cursor] === undefined)
+        || (paint.hover !== undefined && !canEncodeVariant(paint.hover))
+        || (paint.active !== undefined && !canEncodeVariant(paint.active))
+        || (paint.focus !== undefined && !canEncodeVariant(paint.focus))
+    ) return false;
+    return true;
+}
+function writePaint(u: Uint32Array, f: Float32Array, start: number, paint: Paint): number {
+    var p = start + 1;
+    var mask = 0;
+    if (paint.background !== undefined) { mask |= 1 << 0; u[p++] = paint.background >>> 0; }
+    if (paint.gradient !== undefined) {
+        mask |= 1 << 1;
+        u[p++] = paint.gradient[0] >>> 0;
+        u[p++] = paint.gradient[1] >>> 0;
+    }
+    if (paint.radius !== undefined) {
+        mask |= 1 << 2;
+        if (typeof paint.radius === "number") {
+            f[p] = paint.radius; f[p + 1] = paint.radius; f[p + 2] = paint.radius; f[p + 3] = paint.radius;
+        } else {
+            f[p] = paint.radius[0]; f[p + 1] = paint.radius[1]; f[p + 2] = paint.radius[2]; f[p + 3] = paint.radius[3];
+        }
+        p += 4;
+    }
+    if (paint.edge !== undefined) { mask |= 1 << 3; u[p++] = paint.edge >>> 0; }
+    if (paint.edgeWidth !== undefined) { mask |= 1 << 4; f[p++] = paint.edgeWidth; }
+    if (paint.edgeSides !== undefined) {
+        mask |= 1 << 5;
+        f[p] = paint.edgeSides[0]; f[p + 1] = paint.edgeSides[1]; f[p + 2] = paint.edgeSides[2]; f[p + 3] = paint.edgeSides[3];
+        p += 4;
+    }
+    if (paint.highlight !== undefined) { mask |= 1 << 6; u[p++] = paint.highlight >>> 0; }
+    if (paint.opacity !== undefined) { mask |= 1 << 7; f[p++] = paint.opacity; }
+    if (paint.x !== undefined) { mask |= 1 << 8; f[p++] = paint.x; }
+    if (paint.y !== undefined) { mask |= 1 << 9; f[p++] = paint.y; }
+    if (paint.scale !== undefined) { mask |= 1 << 10; f[p++] = paint.scale; }
+    if (paint.brightness !== undefined) { mask |= 1 << 11; f[p++] = paint.brightness; }
+    if (paint.color !== undefined) { mask |= 1 << 12; u[p++] = paint.color >>> 0; }
+    if (paint.draw !== undefined) { mask |= 1 << 13; f[p++] = paint.draw; }
+    if (paint.cursor !== undefined) { mask |= 1 << 14; u[p++] = CURSOR_CODES[paint.cursor] as number; }
+    if (paint.hover !== undefined) { mask |= 1 << 15; p = writeVariant(u, f, p, paint.hover); }
+    if (paint.active !== undefined) { mask |= 1 << 16; p = writeVariant(u, f, p, paint.active); }
+    if (paint.focus !== undefined) { mask |= 1 << 17; p = writeVariant(u, f, p, paint.focus); }
+    u[start] = mask;
+    return p;
+}
+function canEncodeFont(font: Font | undefined): boolean {
+    if (font === undefined) return true;
+    return font.weight === undefined || isU16(font.weight);
+}
+function writeFont(u: Uint32Array, f: Float32Array, start: number, font: Font): number {
+    var p = start + 1;
+    var mask = 0;
+    if (font.size !== undefined) { mask |= 1 << 0; f[p++] = font.size; }
+    if (font.weight !== undefined) { mask |= 1 << 1; u[p++] = font.weight; }
+    if (font.lineHeight !== undefined) { mask |= 1 << 2; f[p++] = font.lineHeight; }
+    if (font.letterSpacing !== undefined) { mask |= 1 << 3; f[p++] = font.letterSpacing; }
+    if (font.family !== undefined) { mask |= 1 << 4; u[p++] = pushStr(font.family); }
+    u[start] = mask;
+    return p;
+}
 function emitSet(id: number, value: number): void {
-    if (!Number.isInteger(value) || value < 0 || value > 65535) {
+    if (!isU16(value)) {
         flushCmd();
         jsnir.set(id, value);
         return;
@@ -418,6 +627,15 @@ function emitMove(id: number, before: number | undefined): void {
     cmdPos = p + 3;
     maybeFlushCmd();
 }
+function emitFocus(id: number): void {
+    reserveCmd(2);
+    var u = jsnir.cmd;
+    var p = cmdPos;
+    u[p] = OP_FOCUS;
+    u[p + 1] = id;
+    cmdPos = p + 2;
+    maybeFlushCmd();
+}
 function emitAfter(callback: number, ms: number): void {
     reserveCmd(3);
     var u = jsnir.cmd;
@@ -443,167 +661,386 @@ function emitScrollTo(id: number, to: { offset?: number; to?: ScrollEdge; smooth
     cmdPos = p + 4;
     maybeFlushCmd();
 }
+function emitSetText(id: number, text: string): void {
+    reserveCmd(3);
+    var u = jsnir.cmd;
+    var p = cmdPos;
+    u[p] = OP_SET_TEXT;
+    u[p + 1] = id;
+    u[p + 2] = pushStr(text);
+    cmdPos = p + 3;
+    maybeFlushCmd();
+}
+function emitSetSource(id: number, source: string): void {
+    reserveCmd(3);
+    var u = jsnir.cmd;
+    var p = cmdPos;
+    u[p] = OP_SET_SOURCE;
+    u[p + 1] = id;
+    u[p + 2] = pushStr(source);
+    cmdPos = p + 3;
+    maybeFlushCmd();
+}
+function emitCallbackGuard(callback: number, token: string | undefined): void {
+    reserveCmd(3);
+    var u = jsnir.cmd;
+    var p = cmdPos;
+    u[p] = OP_CALLBACK_GUARD;
+    u[p + 1] = callback;
+    u[p + 2] = token === undefined ? 0xffffffff : pushStr(token);
+    cmdPos = p + 3;
+    maybeFlushCmd();
+}
 function emitSetStyle(id: number, s: Style): void {
-    if (
-        s.anchor !== undefined
-        || (Array.isArray(s.padding) && s.padding.length !== 4)
-        || (Array.isArray(s.margin) && s.margin.length !== 4)
-        || (s.follow !== undefined && (!Number.isInteger(s.follow) || s.follow < 0 || s.follow > 65535))
-    ) {
+    if (!canEncodeStyle(s)) {
         send([{ op: "setstyle", id: id, style: s }]);
         return;
     }
-    var flags = 0;
-    if (s.direction === "row") flags |= 1;
-    else if (s.direction !== undefined && s.direction !== "column") {
-        send([{ op: "setstyle", id: id, style: s }]);
-        return;
-    }
-    if (s.align !== undefined) {
-        if (s.align === "stretch") flags |= 1 << 1;
-        else if (s.align === "start") flags |= 2 << 1;
-        else if (s.align === "center") flags |= 3 << 1;
-        else if (s.align === "end") flags |= 4 << 1;
-        else { send([{ op: "setstyle", id: id, style: s }]); return; }
-    }
-    if (s.justify !== undefined && s.justify !== "start") {
-        if (s.justify === "center") flags |= 1 << 4;
-        else if (s.justify === "end") flags |= 2 << 4;
-        else if (s.justify === "between") flags |= 3 << 4;
-        else { send([{ op: "setstyle", id: id, style: s }]); return; }
-    }
-    if (s.position !== undefined && s.position !== "relative") {
-        if (s.position === "absolute") flags |= 1 << 6;
-        else if (s.position === "fixed") flags |= 2 << 6;
-        else { send([{ op: "setstyle", id: id, style: s }]); return; }
-    }
-    if (s.clip) flags |= 1 << 8;
-    if (s.scroll) flags |= 1 << 9;
-    if (s.scrollAnchor === "end") flags |= 1 << 10;
-    else if (s.scrollAnchor !== undefined && s.scrollAnchor !== "start") {
-        send([{ op: "setstyle", id: id, style: s }]);
-        return;
-    }
-    if (s.group) flags |= 1 << 11;
-
     reserveCmd(26);
     var u = jsnir.cmd;
-    var f = jsnir.cmdF32;
-    var start = cmdPos;
-    var p = start + 4;
-    var mask = 0;
-    if (s.width !== undefined) { mask |= 1 << 0; f[p++] = s.width; }
-    if (s.height !== undefined) { mask |= 1 << 1; f[p++] = s.height; }
-    if (s.grow !== undefined) { mask |= 1 << 2; f[p++] = s.grow; }
-    if (s.shrink !== undefined) { mask |= 1 << 3; f[p++] = s.shrink; }
-    if (s.basis !== undefined) { mask |= 1 << 4; f[p++] = s.basis; }
-    if (s.padding !== undefined) {
-        mask |= 1 << 5;
-        if (typeof s.padding === "number") {
-            f[p] = s.padding; f[p + 1] = s.padding; f[p + 2] = s.padding; f[p + 3] = s.padding;
-        } else {
-            f[p] = s.padding[0]; f[p + 1] = s.padding[1]; f[p + 2] = s.padding[2]; f[p + 3] = s.padding[3];
-        }
-        p += 4;
-    }
-    if (s.margin !== undefined) {
-        mask |= 1 << 6;
-        if (typeof s.margin === "number") {
-            f[p] = s.margin; f[p + 1] = s.margin; f[p + 2] = s.margin; f[p + 3] = s.margin;
-        } else {
-            f[p] = s.margin[0]; f[p + 1] = s.margin[1]; f[p + 2] = s.margin[2]; f[p + 3] = s.margin[3];
-        }
-        p += 4;
-    }
-    if (s.gap !== undefined) { mask |= 1 << 7; f[p++] = s.gap; }
-    if (s.left !== undefined) { mask |= 1 << 8; f[p++] = s.left; }
-    if (s.top !== undefined) { mask |= 1 << 9; f[p++] = s.top; }
-    if (s.follow !== undefined) { mask |= 1 << 10; u[p++] = s.follow; }
-    if (s.layer !== undefined) { mask |= 1 << 11; u[p++] = (s.layer | 0) >>> 0; }
-    if (s.minWidth !== undefined) { mask |= 1 << 12; f[p++] = s.minWidth; }
-    if (s.minHeight !== undefined) { mask |= 1 << 13; f[p++] = s.minHeight; }
-    if (s.maxWidth !== undefined) { mask |= 1 << 14; f[p++] = s.maxWidth; }
-    if (s.maxHeight !== undefined) { mask |= 1 << 15; f[p++] = s.maxHeight; }
-    u[start] = OP_SET_STYLE;
-    u[start + 1] = id;
-    u[start + 2] = mask;
-    u[start + 3] = flags;
-    cmdPos = p;
+    var p = cmdPos;
+    u[p] = OP_SET_STYLE;
+    u[p + 1] = id;
+    cmdPos = writeStyle(u, jsnir.cmdF32, p + 2, s);
     maybeFlushCmd();
 }
 function emitSetPaint(id: number, paint: Paint): void {
-    var cursorCode: number | undefined = undefined;
-    if (paint.cursor !== undefined) {
-        cursorCode = CURSOR_CODES[paint.cursor];
-        if (cursorCode === undefined) {
-            send([{ op: "setpaint", id: id, paint: paint }]);
-            return;
-        }
-    }
-    if (
-        paint.mask !== undefined
-        || paint.shadows !== undefined
-        || paint.transitions !== undefined
-        || paint.animations !== undefined
-        || paint.starting !== undefined
-        || paint.hover !== undefined
-        || paint.active !== undefined
-        || paint.focus !== undefined
-        || paint.scrollbar !== undefined
-        || (paint.gradient !== undefined && (!Array.isArray(paint.gradient) || paint.gradient.length !== 2))
-        || (Array.isArray(paint.radius) && paint.radius.length !== 4)
-        || (paint.edgeSides !== undefined && (!Array.isArray(paint.edgeSides) || paint.edgeSides.length !== 4))
-    ) {
+    if (!canEncodePaint(paint)) {
         send([{ op: "setpaint", id: id, paint: paint }]);
         return;
     }
-    reserveCmd(25);
+    reserveCmd(70);
     var u = jsnir.cmd;
-    var f = jsnir.cmdF32;
-    var start = cmdPos;
-    var p = start + 3;
-    var mask = 0;
-    if (paint.background !== undefined) { mask |= 1 << 0; u[p++] = paint.background >>> 0; }
-    if (paint.gradient !== undefined) {
-        mask |= 1 << 1;
-        u[p++] = paint.gradient[0] >>> 0;
-        u[p++] = paint.gradient[1] >>> 0;
-    }
-    if (paint.radius !== undefined) {
-        mask |= 1 << 2;
-        if (typeof paint.radius === "number") {
-            f[p] = paint.radius; f[p + 1] = paint.radius; f[p + 2] = paint.radius; f[p + 3] = paint.radius;
-        } else {
-            f[p] = paint.radius[0]; f[p + 1] = paint.radius[1]; f[p + 2] = paint.radius[2]; f[p + 3] = paint.radius[3];
-        }
-        p += 4;
-    }
-    if (paint.edge !== undefined) { mask |= 1 << 3; u[p++] = paint.edge >>> 0; }
-    if (paint.edgeWidth !== undefined) { mask |= 1 << 4; f[p++] = paint.edgeWidth; }
-    if (paint.edgeSides !== undefined) {
-        mask |= 1 << 5;
-        f[p] = paint.edgeSides[0]; f[p + 1] = paint.edgeSides[1]; f[p + 2] = paint.edgeSides[2]; f[p + 3] = paint.edgeSides[3];
-        p += 4;
-    }
-    if (paint.highlight !== undefined) { mask |= 1 << 6; u[p++] = paint.highlight >>> 0; }
-    if (paint.opacity !== undefined) { mask |= 1 << 7; f[p++] = paint.opacity; }
-    if (paint.x !== undefined) { mask |= 1 << 8; f[p++] = paint.x; }
-    if (paint.y !== undefined) { mask |= 1 << 9; f[p++] = paint.y; }
-    if (paint.scale !== undefined) { mask |= 1 << 10; f[p++] = paint.scale; }
-    if (paint.brightness !== undefined) { mask |= 1 << 11; f[p++] = paint.brightness; }
-    if (paint.color !== undefined) { mask |= 1 << 12; u[p++] = paint.color >>> 0; }
-    if (paint.draw !== undefined) { mask |= 1 << 13; f[p++] = paint.draw; }
-    if (cursorCode !== undefined) { mask |= 1 << 14; u[p++] = cursorCode; }
-    u[start] = OP_SET_PAINT;
-    u[start + 1] = id;
-    u[start + 2] = mask;
-    cmdPos = p;
+    var p = cmdPos;
+    u[p] = OP_SET_PAINT;
+    u[p + 1] = id;
+    cmdPos = writePaint(u, jsnir.cmdF32, p + 2, paint);
     maybeFlushCmd();
 }
+function canEncodeOp(op: Operation): boolean {
+    switch (op.op) {
+        case "create": {
+            var n = op.node;
+            switch (n.kind) {
+                case "box":
+                    return canEncodeStyle(n.style) && canEncodePaint(n.paint);
+                case "text":
+                    return n.spans === undefined
+                        && (n.lines === undefined || isU16(n.lines))
+                        && (n.align === undefined || n.align === "start" || n.align === "center" || n.align === "end")
+                        && canEncodeFont(n.font)
+                        && canEncodeStyle(n.style)
+                        && canEncodePaint(n.paint);
+                case "column":
+                    return canEncodeStyle(n.style);
+                case "label":
+                    return isU16(n.value);
+                case "button":
+                    return isU16(n.callback);
+                case "icon":
+                    return ICON_CODES[n.icon] !== undefined
+                        && canEncodeStyle(n.style)
+                        && canEncodePaint(n.paint);
+                case "image":
+                    return canEncodeStyle(n.style) && canEncodePaint(n.paint);
+                default:
+                    return false;
+            }
+        }
+        case "setstyle":
+            return canEncodeStyle(op.style);
+        case "setpaint":
+            return canEncodePaint(op.paint);
+        case "set":
+            return isU16(op.value);
+        case "setdisabled":
+        case "remove":
+        case "move":
+        case "focus":
+        case "after":
+        case "scrollto":
+        case "settext":
+        case "setsource":
+        case "callbackguard":
+            return true;
+        default:
+            return false;
+    }
+}
+function encodeOp(op: Operation): void {
+    switch (op.op) {
+        case "create": {
+            var n = op.node;
+            var parent = op.parent === undefined ? 0xffffffff : op.parent;
+            var before = op.before === undefined ? 0xffffffff : op.before;
+            switch (n.kind) {
+                case "box": {
+                    reserveCmd(103);
+                    var u = jsnir.cmd;
+                    var f = jsnir.cmdF32;
+                    var start = cmdPos;
+                    var p = start + 5;
+                    var flags = n.disabled ? 1 : 0;
+                    if (n.press) { flags |= 1 << 1; u[p++] = n.press; }
+                    if (n.hover) { flags |= 1 << 2; u[p++] = n.hover; }
+                    if (n.contextmenu) { flags |= 1 << 3; u[p++] = n.contextmenu; }
+                    if (n.dismiss) { flags |= 1 << 4; u[p++] = n.dismiss; }
+                    if (n.scroll) { flags |= 1 << 5; u[p++] = n.scroll; }
+                    if (n.drag) { flags |= 1 << 6; u[p++] = n.drag; }
+                    if (n.style !== undefined) { flags |= 1 << 7; p = writeStyle(u, f, p, n.style); }
+                    if (n.paint !== undefined) { flags |= 1 << 8; p = writePaint(u, f, p, n.paint); }
+                    u[start] = OP_CREATE_BOX;
+                    u[start + 1] = op.id;
+                    u[start + 2] = parent;
+                    u[start + 3] = before;
+                    u[start + 4] = flags;
+                    cmdPos = p;
+                    return;
+                }
+                case "text": {
+                    reserveCmd(105);
+                    var u = jsnir.cmd;
+                    var f = jsnir.cmdF32;
+                    var start = cmdPos;
+                    var textIdx = pushStr(n.text);
+                    var p = start + 6;
+                    var flags = n.align === "center" ? 1 : n.align === "end" ? 2 : 0;
+                    if (n.lines !== undefined) { flags |= 1 << 2; u[p++] = n.lines; }
+                    if (n.font !== undefined) { flags |= 1 << 3; p = writeFont(u, f, p, n.font); }
+                    if (n.style !== undefined) { flags |= 1 << 4; p = writeStyle(u, f, p, n.style); }
+                    if (n.paint !== undefined) { flags |= 1 << 5; p = writePaint(u, f, p, n.paint); }
+                    u[start] = OP_CREATE_TEXT;
+                    u[start + 1] = op.id;
+                    u[start + 2] = parent;
+                    u[start + 3] = before;
+                    u[start + 4] = textIdx;
+                    u[start + 5] = flags;
+                    cmdPos = p;
+                    return;
+                }
+                case "column": {
+                    reserveCmd(29);
+                    var u = jsnir.cmd;
+                    var start = cmdPos;
+                    var p = start + 5;
+                    var flags = 0;
+                    if (n.style !== undefined) { flags = 1; p = writeStyle(u, jsnir.cmdF32, p, n.style); }
+                    u[start] = OP_CREATE_COLUMN;
+                    u[start + 1] = op.id;
+                    u[start + 2] = parent;
+                    u[start + 3] = before;
+                    u[start + 4] = flags;
+                    cmdPos = p;
+                    return;
+                }
+                case "label": {
+                    reserveCmd(5);
+                    var u = jsnir.cmd;
+                    var p = cmdPos;
+                    u[p] = OP_CREATE_LABEL;
+                    u[p + 1] = op.id;
+                    u[p + 2] = parent;
+                    u[p + 3] = before;
+                    u[p + 4] = n.value;
+                    cmdPos = p + 5;
+                    return;
+                }
+                case "button": {
+                    reserveCmd(5);
+                    var u = jsnir.cmd;
+                    var p = cmdPos;
+                    u[p] = OP_CREATE_BUTTON;
+                    u[p + 1] = op.id;
+                    u[p + 2] = parent;
+                    u[p + 3] = before;
+                    u[p + 4] = n.callback;
+                    cmdPos = p + 5;
+                    return;
+                }
+                case "icon": {
+                    reserveCmd(100);
+                    var u = jsnir.cmd;
+                    var f = jsnir.cmdF32;
+                    var start = cmdPos;
+                    var p = start + 8;
+                    var flags = 0;
+                    if (n.style !== undefined) { flags |= 1; p = writeStyle(u, f, p, n.style); }
+                    if (n.paint !== undefined) { flags |= 2; p = writePaint(u, f, p, n.paint); }
+                    u[start] = OP_CREATE_ICON;
+                    u[start + 1] = op.id;
+                    u[start + 2] = parent;
+                    u[start + 3] = before;
+                    u[start + 4] = ICON_CODES[n.icon] as number;
+                    f[start + 5] = n.size;
+                    f[start + 6] = n.stroke;
+                    u[start + 7] = flags;
+                    cmdPos = p;
+                    return;
+                }
+                case "image": {
+                    reserveCmd(98);
+                    var u = jsnir.cmd;
+                    var f = jsnir.cmdF32;
+                    var start = cmdPos;
+                    var srcIdx = pushStr(n.source);
+                    var p = start + 6;
+                    var flags = 0;
+                    if (n.style !== undefined) { flags |= 1; p = writeStyle(u, f, p, n.style); }
+                    if (n.paint !== undefined) { flags |= 2; p = writePaint(u, f, p, n.paint); }
+                    u[start] = OP_CREATE_IMAGE;
+                    u[start + 1] = op.id;
+                    u[start + 2] = parent;
+                    u[start + 3] = before;
+                    u[start + 4] = srcIdx;
+                    u[start + 5] = flags;
+                    cmdPos = p;
+                    return;
+                }
+            }
+            return;
+        }
+        case "setstyle": {
+            reserveCmd(26);
+            var u = jsnir.cmd;
+            var p = cmdPos;
+            u[p] = OP_SET_STYLE;
+            u[p + 1] = op.id;
+            cmdPos = writeStyle(u, jsnir.cmdF32, p + 2, op.style);
+            return;
+        }
+        case "setpaint": {
+            reserveCmd(70);
+            var u = jsnir.cmd;
+            var p = cmdPos;
+            u[p] = OP_SET_PAINT;
+            u[p + 1] = op.id;
+            cmdPos = writePaint(u, jsnir.cmdF32, p + 2, op.paint);
+            return;
+        }
+        case "setdisabled": {
+            reserveCmd(3);
+            var u = jsnir.cmd;
+            var p = cmdPos;
+            u[p] = OP_SET_DISABLED;
+            u[p + 1] = op.id;
+            u[p + 2] = op.disabled ? 1 : 0;
+            cmdPos = p + 3;
+            return;
+        }
+        case "remove": {
+            reserveCmd(2);
+            var u = jsnir.cmd;
+            var p = cmdPos;
+            u[p] = OP_REMOVE;
+            u[p + 1] = op.id;
+            cmdPos = p + 2;
+            return;
+        }
+        case "move": {
+            reserveCmd(3);
+            var u = jsnir.cmd;
+            var p = cmdPos;
+            u[p] = OP_MOVE;
+            u[p + 1] = op.id;
+            u[p + 2] = op.before === undefined ? 0xffffffff : op.before;
+            cmdPos = p + 3;
+            return;
+        }
+        case "focus": {
+            emitFocus(op.id);
+            return;
+        }
+        case "after": {
+            reserveCmd(3);
+            var u = jsnir.cmd;
+            var p = cmdPos;
+            u[p] = OP_AFTER;
+            u[p + 1] = op.callback;
+            jsnir.cmdF32[p + 2] = op.ms;
+            cmdPos = p + 3;
+            return;
+        }
+        case "scrollto": {
+            reserveCmd(4);
+            var u = jsnir.cmd;
+            var p = cmdPos;
+            var flags = (op.offset !== undefined ? 1 : 0)
+                | (op.to !== undefined ? 2 : 0)
+                | (op.to === "end" ? 4 : 0)
+                | (op.smooth ? 8 : 0);
+            u[p] = OP_SCROLL_TO;
+            u[p + 1] = op.id;
+            u[p + 2] = flags;
+            jsnir.cmdF32[p + 3] = op.offset ?? 0;
+            cmdPos = p + 4;
+            return;
+        }
+        case "set": {
+            reserveCmd(3);
+            var u = jsnir.cmd;
+            var p = cmdPos;
+            u[p] = OP_SET;
+            u[p + 1] = op.id;
+            u[p + 2] = op.value;
+            cmdPos = p + 3;
+            return;
+        }
+        case "settext": {
+            reserveCmd(3);
+            var u = jsnir.cmd;
+            var p = cmdPos;
+            u[p] = OP_SET_TEXT;
+            u[p + 1] = op.id;
+            u[p + 2] = pushStr(op.text);
+            cmdPos = p + 3;
+            return;
+        }
+        case "setsource": {
+            reserveCmd(3);
+            var u = jsnir.cmd;
+            var p = cmdPos;
+            u[p] = OP_SET_SOURCE;
+            u[p + 1] = op.id;
+            u[p + 2] = pushStr(op.source);
+            cmdPos = p + 3;
+            return;
+        }
+        case "callbackguard": {
+            reserveCmd(3);
+            var u = jsnir.cmd;
+            var p = cmdPos;
+            u[p] = OP_CALLBACK_GUARD;
+            u[p + 1] = op.callback;
+            u[p + 2] = op.token === undefined ? 0xffffffff : pushStr(op.token);
+            cmdPos = p + 3;
+            return;
+        }
+    }
+}
 function send(ops: Operation[]): void {
-    flushCmd();
-    var batch: Batch = { ops: ops };
-    jsnir.batch(JSON.stringify(batch));
+    var jsonBatch: Operation[] | null = null;
+    for (var i = 0; i < ops.length; i++) {
+        var op = ops[i];
+        if (canEncodeOp(op)) {
+            if (jsonBatch !== null) {
+                jsnir.batch(JSON.stringify({ ops: jsonBatch }));
+                jsonBatch = null;
+            }
+            encodeOp(op);
+        } else {
+            if (jsonBatch === null) {
+                flushCmd();
+                jsonBatch = [op];
+            } else {
+                jsonBatch.push(op);
+            }
+        }
+    }
+    if (jsonBatch !== null) {
+        jsnir.batch(JSON.stringify({ ops: jsonBatch }));
+    } else {
+        maybeFlushCmd();
+    }
 }
 function mountChildren(children: Children | undefined, parent: number, ops: Operation[]): void {
     if (Array.isArray(children)) for (var i = 0; i < children.length; i++) mountChildren(children[i], parent, ops);
@@ -887,8 +1324,7 @@ function Text(props: {
         mount(parent, ops) {
             var id = newId();
             var text = bind(props.children, function (v) {
-                flushCmd();
-                jsnir.setText(id, v);
+                emitSetText(id, v);
             });
             var spans = props.spans === undefined ? undefined : bind(props.spans, function (v) {
                 setSpans(id, v);
@@ -928,7 +1364,7 @@ function Image(props: { source: Source<string>; style?: Style; paint?: Source<Pa
         mount(parent, ops) {
             var id = newId();
             var source = bind(props.source, function (s) {
-                send([{ op: "setsource", id: id, source: s }]);
+                emitSetSource(id, s);
             });
             var paint = bind(props.paint ?? {}, function (p) {
                 setPaint(id, p);
@@ -1344,7 +1780,7 @@ function jsnirMount(): void {
         mountPending();
         flushCmd();
     } catch (e) {
-        cmdPos = 0;
+        resetCmd();
         throw e;
     } finally {
         inMount = false;
@@ -1430,7 +1866,7 @@ function runEvent<T>(body: () => T): T {
         mountPending();
         if (!previous) flushCmd();
     } catch (e) {
-        if (!previous) cmdPos = 0;
+        if (!previous) resetCmd();
         throw e;
     }
     return result;

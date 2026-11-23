@@ -3,6 +3,7 @@ declare var jsnir: {
     set(id: number, value: number): void;
     batch(json: string): void;
     commit(words: number): void;
+    commitStrings(words: number, strings: string[]): void;
     report(message: string): void;
     setText(id: number, text: string): void;
     readText(id: number): string | undefined;

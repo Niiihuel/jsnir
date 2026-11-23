@@ -1281,9 +1281,10 @@ impl Host {
     fn accept_list_reply(
         &mut self,
         ticket: ListReplyId,
-        batch: Batch,
+        batch: impl Into<Arc<Batch>>,
         binds: &[(u64, u16)],
     ) -> Result<(), ListReplyError> {
+        let batch = batch.into();
         let id = ticket.list;
         let Some((generation, list)) = self.virtual_lists.get(&id.node) else {
             return Err(ListReplyError::Stale);
@@ -1608,7 +1609,7 @@ impl Host {
     }
 
     // Applies the batch of a reload. The old tree's native state is kept only if the new code loaded and `preserve_state` is true.
-    fn receive_reload(&mut self, batch: Batch, preserve_state: bool) {
+    fn receive_reload(&mut self, batch: Arc<Batch>, preserve_state: bool) {
         // The app sends the outcome before the batch that carries it.
         let outcome = self
             .bridge
@@ -1746,7 +1747,8 @@ impl Host {
     }
 
     // Applies one app batch and updates the layout, transitions, timers and focus that depend on it.
-    fn receive(&mut self, batch: Batch) -> bool {
+    fn receive(&mut self, batch: impl Into<Arc<Batch>>) -> bool {
+        let batch = batch.into();
         let mut removed = Vec::new();
         let mut affected_lists = HashSet::new();
         let mut created = Vec::new();
@@ -1816,7 +1818,7 @@ impl Host {
                 _ => {}
             }
         }
-        let result = self.tree.apply(batch);
+        let result = self.tree.apply_shared(batch);
         // The answer goes first: whatever the UI publishes next depends on this batch.
         let _ = self.bridge.log.send(Log::Answer(result.is_ok()));
         if let Err(e) = result {
@@ -2848,7 +2850,7 @@ impl Host {
                 selection: state.1,
             }],
         };
-        self.tree.apply_ui(batch.clone()).expect("UI batch");
+        self.tree.apply_ui_ref(&batch.ops).expect("UI batch");
         let _ = self.bridge.log.send(Log::Ui(batch));
         if changed
             && let Some(Node::Input { change, .. }) = self.tree.nodes.get(&id)
@@ -3014,7 +3016,7 @@ impl Host {
         }
     }
 
-    fn receive_list_reply(&mut self, ticket: ListReplyId, batch: Batch) {
+    fn receive_list_reply(&mut self, ticket: ListReplyId, batch: Arc<Batch>) {
         match self
             .bridge
             .list_replies
@@ -3452,7 +3454,7 @@ impl Host {
             return;
         }
         let batch = Batch { base: 0, ops };
-        self.tree.apply_ui(batch.clone()).expect("scroll batch");
+        self.tree.apply_ui_ref(&batch.ops).expect("scroll batch");
         let _ = self.bridge.log.send(Log::Ui(batch));
         for (callback, [top, height, client]) in events {
             self.send_payload(
@@ -3748,7 +3750,7 @@ impl Host {
                 .map(|(id, rect)| Op::SetRect { id, rect })
                 .collect(),
         };
-        self.tree.apply_ui(batch.clone()).expect("layout batch");
+        self.tree.apply_ui_ref(&batch.ops).expect("layout batch");
         let _ = self.bridge.log.send(Log::Ui(batch));
     }
 }
@@ -6999,7 +7001,7 @@ mod tests {
     }
 
     // Test the real batch/answer boundary without introducing a delivery protocol.
-    fn reply_batch(host: &mut Host, ops: &str) -> Batch {
+    fn reply_batch(host: &mut Host, ops: &str) -> Arc<Batch> {
         host.push(format!(r#"{{"ops":{ops}}}"#));
         let updates = &host.bridge.updates;
         let batch = updates.recv_timeout(Duration::from_secs(1)).unwrap();

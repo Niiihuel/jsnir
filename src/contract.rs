@@ -5,8 +5,8 @@
 //! with a single interpreter instruction, without calling Rust or converting values. Rust is the only
 //! writer and writes only between callbacks, on the VM thread: reads and writes never overlap.
 use crate::tree::{
-    Align, Axis, Cursor, Edges, Justify, Node, Op, Paint, Position, Radius, ScrollAnchor,
-    ScrollEdge, Style, Tree,
+    Align, Axis, Cursor, Edges, Font, Icon, Justify, Node, Op, Paint, Position, Radius,
+    ScrollAnchor, ScrollEdge, Style, TextAlign, Tree, Variant,
 };
 use rquickjs::{ArrayBuffer, ArrayBufferSource, Ctx, Object, Persistent, TypedArray};
 
@@ -29,6 +29,11 @@ impl<T: Ts> Ts for rquickjs::Result<T> {
     }
 }
 impl<T: Ts> Ts for Box<T> {
+    fn ts() -> String {
+        T::ts()
+    }
+}
+impl<T: Ts> Ts for std::sync::Arc<T> {
     fn ts() -> String {
         T::ts()
     }
@@ -376,7 +381,12 @@ pub(crate) struct CommandReader {
     alive: Rc<Cell<bool>>,
 }
 impl CommandReader {
-    pub(crate) fn decode(&self, words: usize, out: &mut Vec<Op>) -> Result<(), String> {
+    pub(crate) fn decode(
+        &self,
+        words: usize,
+        strings: &mut [String],
+        out: &mut Vec<Op>,
+    ) -> Result<(), String> {
         if !self.alive.get() {
             return Err("command buffer detached".to_string());
         }
@@ -389,7 +399,7 @@ impl CommandReader {
         // SAFETY: `alive` is true so `CmdStorage`'s `Box<[u32]>` of `self.cap` words is still allocated,
         // `u32`-aligned, and no JS runs during `commit`.
         let slice = unsafe { std::slice::from_raw_parts(self.ptr, words) };
-        decode_commands(slice, out)
+        decode_commands(slice, strings, out)
     }
 }
 
@@ -433,65 +443,338 @@ pub(crate) const OP_AFTER: u32 = 6;
 pub(crate) const OP_SCROLL_TO: u32 = 7;
 pub(crate) const OP_SET_STYLE: u32 = 8;
 pub(crate) const OP_SET_PAINT: u32 = 9;
+pub(crate) const OP_SET_TEXT: u32 = 10;
+pub(crate) const OP_CREATE_BOX: u32 = 11;
+pub(crate) const OP_CREATE_TEXT: u32 = 12;
+pub(crate) const OP_CREATE_COLUMN: u32 = 13;
+pub(crate) const OP_CREATE_LABEL: u32 = 14;
+pub(crate) const OP_CREATE_BUTTON: u32 = 15;
+pub(crate) const OP_CREATE_ICON: u32 = 16;
+pub(crate) const OP_CREATE_IMAGE: u32 = 17;
+pub(crate) const OP_SET_SOURCE: u32 = 18;
+pub(crate) const OP_CALLBACK_GUARD: u32 = 19;
 
-pub(crate) fn decode_commands(words: &[u32], out: &mut Vec<Op>) -> Result<(), String> {
+#[inline]
+fn next_word(words: &[u32], i: &mut usize) -> Result<u32, String> {
+    let v = *words
+        .get(*i)
+        .ok_or_else(|| "truncated binary command".to_string())?;
+    *i += 1;
+    Ok(v)
+}
+#[inline]
+fn next_u16(words: &[u32], i: &mut usize) -> Result<u16, String> {
+    let v = next_word(words, i)?;
+    u16::try_from(v).map_err(|_| format!("invalid u16 operand {v}"))
+}
+#[inline]
+fn next_opt_u16(words: &[u32], i: &mut usize) -> Result<Option<u16>, String> {
+    let raw = next_word(words, i)?;
+    if raw == u32::MAX {
+        Ok(None)
+    } else {
+        Ok(Some(
+            u16::try_from(raw).map_err(|_| format!("invalid optional u16 operand {raw}"))?,
+        ))
+    }
+}
+#[inline]
+fn next_f32(words: &[u32], i: &mut usize) -> Result<f32, String> {
+    Ok(f32::from_bits(next_word(words, i)?))
+}
+#[inline]
+fn next_f32x4(words: &[u32], i: &mut usize) -> Result<[f32; 4], String> {
+    Ok([
+        next_f32(words, i)?,
+        next_f32(words, i)?,
+        next_f32(words, i)?,
+        next_f32(words, i)?,
+    ])
+}
+#[inline]
+fn take_str(words: &[u32], i: &mut usize, strings: &mut [String]) -> Result<String, String> {
+    let idx = next_word(words, i)? as usize;
+    let len = strings.len();
+    let slot = strings
+        .get_mut(idx)
+        .ok_or_else(|| format!("string index {idx} out of bounds ({len})"))?;
+    Ok(std::mem::take(slot))
+}
+
+fn decode_cursor(code: u32) -> Result<Cursor, String> {
+    match code {
+        0 => Ok(Cursor::Default),
+        1 => Ok(Cursor::Pointer),
+        2 => Ok(Cursor::Text),
+        3 => Ok(Cursor::NotAllowed),
+        4 => Ok(Cursor::Grab),
+        5 => Ok(Cursor::Grabbing),
+        6 => Ok(Cursor::Move),
+        7 => Ok(Cursor::ColResize),
+        8 => Ok(Cursor::RowResize),
+        9 => Ok(Cursor::EwResize),
+        10 => Ok(Cursor::NsResize),
+        11 => Ok(Cursor::NeswResize),
+        12 => Ok(Cursor::NwseResize),
+        _ => Err(format!("invalid cursor code {code}")),
+    }
+}
+
+fn decode_variant(words: &[u32], i: &mut usize) -> Result<Variant, String> {
+    let mask = next_word(words, i)?;
+    let mut v = Variant::default();
+    if mask & (1 << 0) != 0 {
+        v.background = Some(next_word(words, i)?);
+    }
+    if mask & (1 << 1) != 0 {
+        v.gradient = Some([next_word(words, i)?, next_word(words, i)?]);
+    }
+    if mask & (1 << 2) != 0 {
+        v.brightness = Some(next_f32(words, i)?);
+    }
+    if mask & (1 << 3) != 0 {
+        v.scale = Some(next_f32(words, i)?);
+    }
+    if mask & (1 << 4) != 0 {
+        v.opacity = Some(next_f32(words, i)?);
+    }
+    if mask & (1 << 5) != 0 {
+        v.x = Some(next_f32(words, i)?);
+    }
+    if mask & (1 << 6) != 0 {
+        v.y = Some(next_f32(words, i)?);
+    }
+    if mask & (1 << 7) != 0 {
+        v.color = Some(next_word(words, i)?);
+    }
+    if mask & (1 << 8) != 0 {
+        v.edge = Some(next_word(words, i)?);
+    }
+    if mask & (1 << 9) != 0 {
+        v.height = Some(next_f32(words, i)?);
+    }
+    if mask & (1 << 10) != 0 {
+        v.width = Some(next_f32(words, i)?);
+    }
+    if mask & (1 << 11) != 0 {
+        v.underline = Some(next_word(words, i)? != 0);
+    }
+    if mask & (1 << 12) != 0 {
+        v.cursor = Some(decode_cursor(next_word(words, i)?)?);
+    }
+    Ok(v)
+}
+
+fn decode_style(words: &[u32], i: &mut usize) -> Result<Style, String> {
+    let mask = next_word(words, i)?;
+    let flags = next_word(words, i)?;
+    let mut style = Style {
+        direction: if flags & 1 != 0 {
+            Axis::Row
+        } else {
+            Axis::Column
+        },
+        align: match (flags >> 1) & 0x7 {
+            1 => Some(Align::Stretch),
+            2 => Some(Align::Start),
+            3 => Some(Align::Center),
+            4 => Some(Align::End),
+            _ => None,
+        },
+        justify: match (flags >> 4) & 0x3 {
+            1 => Justify::Center,
+            2 => Justify::End,
+            3 => Justify::Between,
+            _ => Justify::Start,
+        },
+        position: match (flags >> 6) & 0x3 {
+            1 => Position::Absolute,
+            2 => Position::Fixed,
+            _ => Position::Relative,
+        },
+        clip: flags & (1 << 8) != 0,
+        scroll: flags & (1 << 9) != 0,
+        scroll_anchor: if flags & (1 << 10) != 0 {
+            ScrollAnchor::End
+        } else {
+            ScrollAnchor::Start
+        },
+        group: flags & (1 << 11) != 0,
+        ..Style::default()
+    };
+    if mask & (1 << 0) != 0 {
+        style.width = Some(next_f32(words, i)?);
+    }
+    if mask & (1 << 1) != 0 {
+        style.height = Some(next_f32(words, i)?);
+    }
+    if mask & (1 << 2) != 0 {
+        style.grow = next_f32(words, i)?;
+    }
+    if mask & (1 << 3) != 0 {
+        style.shrink = Some(next_f32(words, i)?);
+    }
+    if mask & (1 << 4) != 0 {
+        style.basis = Some(next_f32(words, i)?);
+    }
+    if mask & (1 << 5) != 0 {
+        style.padding = Edges::Sides(next_f32x4(words, i)?);
+    }
+    if mask & (1 << 6) != 0 {
+        style.margin = Edges::Sides(next_f32x4(words, i)?);
+    }
+    if mask & (1 << 7) != 0 {
+        style.gap = next_f32(words, i)?;
+    }
+    if mask & (1 << 8) != 0 {
+        style.left = Some(next_f32(words, i)?);
+    }
+    if mask & (1 << 9) != 0 {
+        style.top = Some(next_f32(words, i)?);
+    }
+    if mask & (1 << 10) != 0 {
+        style.follow = Some(next_u16(words, i)?);
+    }
+    if mask & (1 << 11) != 0 {
+        style.layer = Some(next_word(words, i)? as i32);
+    }
+    if mask & (1 << 12) != 0 {
+        style.min_width = Some(next_f32(words, i)?);
+    }
+    if mask & (1 << 13) != 0 {
+        style.min_height = Some(next_f32(words, i)?);
+    }
+    if mask & (1 << 14) != 0 {
+        style.max_width = Some(next_f32(words, i)?);
+    }
+    if mask & (1 << 15) != 0 {
+        style.max_height = Some(next_f32(words, i)?);
+    }
+    Ok(style)
+}
+
+fn decode_paint(words: &[u32], i: &mut usize) -> Result<Paint, String> {
+    let mask = next_word(words, i)?;
+    let mut paint = Paint::default();
+    if mask & (1 << 0) != 0 {
+        paint.background = Some(next_word(words, i)?);
+    }
+    if mask & (1 << 1) != 0 {
+        paint.gradient = Some([next_word(words, i)?, next_word(words, i)?]);
+    }
+    if mask & (1 << 2) != 0 {
+        paint.radius = Radius::Corners(next_f32x4(words, i)?);
+    }
+    if mask & (1 << 3) != 0 {
+        paint.edge = Some(next_word(words, i)?);
+    }
+    if mask & (1 << 4) != 0 {
+        paint.edge_width = Some(next_f32(words, i)?);
+    }
+    if mask & (1 << 5) != 0 {
+        paint.edge_sides = Some(next_f32x4(words, i)?);
+    }
+    if mask & (1 << 6) != 0 {
+        paint.highlight = Some(next_word(words, i)?);
+    }
+    if mask & (1 << 7) != 0 {
+        paint.opacity = Some(next_f32(words, i)?);
+    }
+    if mask & (1 << 8) != 0 {
+        paint.x = next_f32(words, i)?;
+    }
+    if mask & (1 << 9) != 0 {
+        paint.y = next_f32(words, i)?;
+    }
+    if mask & (1 << 10) != 0 {
+        paint.scale = Some(next_f32(words, i)?);
+    }
+    if mask & (1 << 11) != 0 {
+        paint.brightness = Some(next_f32(words, i)?);
+    }
+    if mask & (1 << 12) != 0 {
+        paint.color = Some(next_word(words, i)?);
+    }
+    if mask & (1 << 13) != 0 {
+        paint.draw = Some(next_f32(words, i)?);
+    }
+    if mask & (1 << 14) != 0 {
+        paint.cursor = Some(decode_cursor(next_word(words, i)?)?);
+    }
+    if mask & (1 << 15) != 0 {
+        paint.hover = Some(decode_variant(words, i)?);
+    }
+    if mask & (1 << 16) != 0 {
+        paint.active = Some(decode_variant(words, i)?);
+    }
+    if mask & (1 << 17) != 0 {
+        paint.focus = Some(decode_variant(words, i)?);
+    }
+    Ok(paint)
+}
+
+fn decode_font(words: &[u32], i: &mut usize, strings: &mut [String]) -> Result<Font, String> {
+    let mask = next_word(words, i)?;
+    let mut font = Font::default();
+    if mask & (1 << 0) != 0 {
+        font.size = Some(next_f32(words, i)?);
+    }
+    if mask & (1 << 1) != 0 {
+        font.weight = Some(next_u16(words, i)?);
+    }
+    if mask & (1 << 2) != 0 {
+        font.line_height = Some(next_f32(words, i)?);
+    }
+    if mask & (1 << 3) != 0 {
+        font.letter_spacing = next_f32(words, i)?;
+    }
+    if mask & (1 << 4) != 0 {
+        font.family = Some(take_str(words, i, strings)?);
+    }
+    Ok(font)
+}
+
+pub(crate) fn decode_commands(
+    words: &[u32],
+    strings: &mut [String],
+    out: &mut Vec<Op>,
+) -> Result<(), String> {
     let mut i = 0usize;
-    let next = |i: &mut usize| -> Result<u32, String> {
-        let v = *words
-            .get(*i)
-            .ok_or_else(|| "truncated binary command".to_string())?;
-        *i += 1;
-        Ok(v)
-    };
-    let next_u16 = |i: &mut usize| -> Result<u16, String> {
-        let v = next(i)?;
-        u16::try_from(v).map_err(|_| format!("invalid u16 operand {v}"))
-    };
-    let next_f32 = |i: &mut usize| -> Result<f32, String> { Ok(f32::from_bits(next(i)?)) };
-    let next_f32x4 = |i: &mut usize| -> Result<[f32; 4], String> {
-        Ok([next_f32(i)?, next_f32(i)?, next_f32(i)?, next_f32(i)?])
-    };
-
     while i < words.len() {
-        let op = next(&mut i)?;
+        let op = next_word(words, &mut i)?;
         match op {
             OP_SET => {
-                let id = next_u16(&mut i)?;
-                let value = next_u16(&mut i)?;
+                let id = next_u16(words, &mut i)?;
+                let value = next_u16(words, &mut i)?;
                 out.push(Op::Set { id, value });
             }
             OP_SET_DISABLED => {
-                let id = next_u16(&mut i)?;
-                let disabled = next(&mut i)? != 0;
+                let id = next_u16(words, &mut i)?;
+                let disabled = next_word(words, &mut i)? != 0;
                 out.push(Op::SetDisabled { id, disabled });
             }
             OP_REMOVE => {
-                let id = next_u16(&mut i)?;
+                let id = next_u16(words, &mut i)?;
                 out.push(Op::Remove { id });
             }
             OP_MOVE => {
-                let id = next_u16(&mut i)?;
-                let raw = next(&mut i)?;
-                let before = if raw == u32::MAX {
-                    None
-                } else {
-                    Some(u16::try_from(raw).map_err(|_| format!("invalid before id {raw}"))?)
-                };
+                let id = next_u16(words, &mut i)?;
+                let before = next_opt_u16(words, &mut i)?;
                 out.push(Op::Move { id, before });
             }
             OP_FOCUS => {
-                let id = next_u16(&mut i)?;
+                let id = next_u16(words, &mut i)?;
                 out.push(Op::Focus { id });
             }
             OP_AFTER => {
-                let callback = next_u16(&mut i)?;
-                let ms = next_f32(&mut i)?;
+                let callback = next_u16(words, &mut i)?;
+                let ms = next_f32(words, &mut i)?;
                 out.push(Op::After { ms, callback });
             }
             OP_SCROLL_TO => {
-                let id = next_u16(&mut i)?;
-                let flags = next(&mut i)?;
-                let raw_offset = next_f32(&mut i)?;
+                let id = next_u16(words, &mut i)?;
+                let flags = next_word(words, &mut i)?;
+                let raw_offset = next_f32(words, &mut i)?;
                 let offset = (flags & 1 != 0).then_some(raw_offset);
                 let to = (flags & 2 != 0).then_some(if flags & 4 != 0 {
                     ScrollEdge::End
@@ -507,162 +790,236 @@ pub(crate) fn decode_commands(words: &[u32], out: &mut Vec<Op>) -> Result<(), St
                 });
             }
             OP_SET_STYLE => {
-                let id = next_u16(&mut i)?;
-                let mask = next(&mut i)?;
-                let flags = next(&mut i)?;
-                let mut style = Style {
-                    direction: if flags & 1 != 0 {
-                        Axis::Row
-                    } else {
-                        Axis::Column
-                    },
-                    align: match (flags >> 1) & 0x7 {
-                        1 => Some(Align::Stretch),
-                        2 => Some(Align::Start),
-                        3 => Some(Align::Center),
-                        4 => Some(Align::End),
-                        _ => None,
-                    },
-                    justify: match (flags >> 4) & 0x3 {
-                        1 => Justify::Center,
-                        2 => Justify::End,
-                        3 => Justify::Between,
-                        _ => Justify::Start,
-                    },
-                    position: match (flags >> 6) & 0x3 {
-                        1 => Position::Absolute,
-                        2 => Position::Fixed,
-                        _ => Position::Relative,
-                    },
-                    clip: flags & (1 << 8) != 0,
-                    scroll: flags & (1 << 9) != 0,
-                    scroll_anchor: if flags & (1 << 10) != 0 {
-                        ScrollAnchor::End
-                    } else {
-                        ScrollAnchor::Start
-                    },
-                    group: flags & (1 << 11) != 0,
-                    ..Style::default()
-                };
-                if mask & (1 << 0) != 0 {
-                    style.width = Some(next_f32(&mut i)?);
-                }
-                if mask & (1 << 1) != 0 {
-                    style.height = Some(next_f32(&mut i)?);
-                }
-                if mask & (1 << 2) != 0 {
-                    style.grow = next_f32(&mut i)?;
-                }
-                if mask & (1 << 3) != 0 {
-                    style.shrink = Some(next_f32(&mut i)?);
-                }
-                if mask & (1 << 4) != 0 {
-                    style.basis = Some(next_f32(&mut i)?);
-                }
-                if mask & (1 << 5) != 0 {
-                    style.padding = Edges::Sides(next_f32x4(&mut i)?);
-                }
-                if mask & (1 << 6) != 0 {
-                    style.margin = Edges::Sides(next_f32x4(&mut i)?);
-                }
-                if mask & (1 << 7) != 0 {
-                    style.gap = next_f32(&mut i)?;
-                }
-                if mask & (1 << 8) != 0 {
-                    style.left = Some(next_f32(&mut i)?);
-                }
-                if mask & (1 << 9) != 0 {
-                    style.top = Some(next_f32(&mut i)?);
-                }
-                if mask & (1 << 10) != 0 {
-                    style.follow = Some(next_u16(&mut i)?);
-                }
-                if mask & (1 << 11) != 0 {
-                    style.layer = Some(next(&mut i)? as i32);
-                }
-                if mask & (1 << 12) != 0 {
-                    style.min_width = Some(next_f32(&mut i)?);
-                }
-                if mask & (1 << 13) != 0 {
-                    style.min_height = Some(next_f32(&mut i)?);
-                }
-                if mask & (1 << 14) != 0 {
-                    style.max_width = Some(next_f32(&mut i)?);
-                }
-                if mask & (1 << 15) != 0 {
-                    style.max_height = Some(next_f32(&mut i)?);
-                }
+                let id = next_u16(words, &mut i)?;
+                let style = decode_style(words, &mut i)?;
                 out.push(Op::SetStyle { id, style });
             }
             OP_SET_PAINT => {
-                let id = next_u16(&mut i)?;
-                let mask = next(&mut i)?;
-                let mut paint = Paint::default();
-                if mask & (1 << 0) != 0 {
-                    paint.background = Some(next(&mut i)?);
-                }
-                if mask & (1 << 1) != 0 {
-                    paint.gradient = Some([next(&mut i)?, next(&mut i)?]);
-                }
-                if mask & (1 << 2) != 0 {
-                    paint.radius = Radius::Corners(next_f32x4(&mut i)?);
-                }
-                if mask & (1 << 3) != 0 {
-                    paint.edge = Some(next(&mut i)?);
-                }
-                if mask & (1 << 4) != 0 {
-                    paint.edge_width = Some(next_f32(&mut i)?);
-                }
-                if mask & (1 << 5) != 0 {
-                    paint.edge_sides = Some(next_f32x4(&mut i)?);
-                }
-                if mask & (1 << 6) != 0 {
-                    paint.highlight = Some(next(&mut i)?);
-                }
-                if mask & (1 << 7) != 0 {
-                    paint.opacity = Some(next_f32(&mut i)?);
-                }
-                if mask & (1 << 8) != 0 {
-                    paint.x = next_f32(&mut i)?;
-                }
-                if mask & (1 << 9) != 0 {
-                    paint.y = next_f32(&mut i)?;
-                }
-                if mask & (1 << 10) != 0 {
-                    paint.scale = Some(next_f32(&mut i)?);
-                }
-                if mask & (1 << 11) != 0 {
-                    paint.brightness = Some(next_f32(&mut i)?);
-                }
-                if mask & (1 << 12) != 0 {
-                    paint.color = Some(next(&mut i)?);
-                }
-                if mask & (1 << 13) != 0 {
-                    paint.draw = Some(next_f32(&mut i)?);
-                }
-                if mask & (1 << 14) != 0 {
-                    let c = next(&mut i)?;
-                    paint.cursor = Some(match c {
-                        0 => Cursor::Default,
-                        1 => Cursor::Pointer,
-                        2 => Cursor::Text,
-                        3 => Cursor::NotAllowed,
-                        4 => Cursor::Grab,
-                        5 => Cursor::Grabbing,
-                        6 => Cursor::Move,
-                        7 => Cursor::ColResize,
-                        8 => Cursor::RowResize,
-                        9 => Cursor::EwResize,
-                        10 => Cursor::NsResize,
-                        11 => Cursor::NeswResize,
-                        12 => Cursor::NwseResize,
-                        _ => return Err(format!("invalid cursor code {c}")),
-                    });
-                }
+                let id = next_u16(words, &mut i)?;
+                let paint = decode_paint(words, &mut i)?;
                 out.push(Op::SetPaint {
                     id,
-                    paint: Box::new(paint),
+                    paint: std::sync::Arc::new(paint),
                 });
+            }
+            OP_SET_TEXT => {
+                let id = next_u16(words, &mut i)?;
+                let text = take_str(words, &mut i, strings)?;
+                out.push(Op::SetText { id, text });
+            }
+            OP_CREATE_BOX => {
+                let id = next_u16(words, &mut i)?;
+                let parent = next_opt_u16(words, &mut i)?;
+                let before = next_opt_u16(words, &mut i)?;
+                let flags = next_word(words, &mut i)?;
+                let disabled = flags & (1 << 0) != 0;
+                let press = if flags & (1 << 1) != 0 { next_u16(words, &mut i)? } else { 0 };
+                let hover = if flags & (1 << 2) != 0 { next_u16(words, &mut i)? } else { 0 };
+                let contextmenu = if flags & (1 << 3) != 0 { next_u16(words, &mut i)? } else { 0 };
+                let dismiss = if flags & (1 << 4) != 0 { next_u16(words, &mut i)? } else { 0 };
+                let scroll = if flags & (1 << 5) != 0 { next_u16(words, &mut i)? } else { 0 };
+                let drag = if flags & (1 << 6) != 0 { next_u16(words, &mut i)? } else { 0 };
+                let style = if flags & (1 << 7) != 0 {
+                    decode_style(words, &mut i)?
+                } else {
+                    Style::default()
+                };
+                let paint = if flags & (1 << 8) != 0 {
+                    std::sync::Arc::new(decode_paint(words, &mut i)?)
+                } else {
+                    std::sync::Arc::default()
+                };
+                out.push(Op::Create {
+                    id,
+                    parent,
+                    before,
+                    node: Node::Box {
+                        children: Vec::new(),
+                        style,
+                        paint,
+                        press,
+                        disabled,
+                        hover,
+                        contextmenu,
+                        dismiss,
+                        scroll,
+                        drag,
+                    },
+                });
+            }
+            OP_CREATE_TEXT => {
+                let id = next_u16(words, &mut i)?;
+                let parent = next_opt_u16(words, &mut i)?;
+                let before = next_opt_u16(words, &mut i)?;
+                let text = take_str(words, &mut i, strings)?;
+                let flags = next_word(words, &mut i)?;
+                let align = match flags & 0x3 {
+                    1 => TextAlign::Center,
+                    2 => TextAlign::End,
+                    _ => TextAlign::Start,
+                };
+                let lines = if flags & (1 << 2) != 0 {
+                    Some(next_u16(words, &mut i)?)
+                } else {
+                    None
+                };
+                let font = if flags & (1 << 3) != 0 {
+                    decode_font(words, &mut i, strings)?
+                } else {
+                    Font::default()
+                };
+                let style = if flags & (1 << 4) != 0 {
+                    decode_style(words, &mut i)?
+                } else {
+                    Style::default()
+                };
+                let paint = if flags & (1 << 5) != 0 {
+                    std::sync::Arc::new(decode_paint(words, &mut i)?)
+                } else {
+                    std::sync::Arc::default()
+                };
+                out.push(Op::Create {
+                    id,
+                    parent,
+                    before,
+                    node: Node::Text {
+                        text,
+                        style,
+                        font,
+                        paint,
+                        lines,
+                        align,
+                        spans: None,
+                    },
+                });
+            }
+            OP_CREATE_COLUMN => {
+                let id = next_u16(words, &mut i)?;
+                let parent = next_opt_u16(words, &mut i)?;
+                let before = next_opt_u16(words, &mut i)?;
+                let flags = next_word(words, &mut i)?;
+                let style = if flags & 1 != 0 {
+                    decode_style(words, &mut i)?
+                } else {
+                    Style::default()
+                };
+                out.push(Op::Create {
+                    id,
+                    parent,
+                    before,
+                    node: Node::Column {
+                        children: Vec::new(),
+                        style,
+                    },
+                });
+            }
+            OP_CREATE_LABEL => {
+                let id = next_u16(words, &mut i)?;
+                let parent = next_opt_u16(words, &mut i)?;
+                let before = next_opt_u16(words, &mut i)?;
+                let value = next_u16(words, &mut i)?;
+                out.push(Op::Create {
+                    id,
+                    parent,
+                    before,
+                    node: Node::Label { value },
+                });
+            }
+            OP_CREATE_BUTTON => {
+                let id = next_u16(words, &mut i)?;
+                let parent = next_opt_u16(words, &mut i)?;
+                let before = next_opt_u16(words, &mut i)?;
+                let callback = next_u16(words, &mut i)?;
+                out.push(Op::Create {
+                    id,
+                    parent,
+                    before,
+                    node: Node::Button { callback },
+                });
+            }
+            OP_CREATE_ICON => {
+                let id = next_u16(words, &mut i)?;
+                let parent = next_opt_u16(words, &mut i)?;
+                let before = next_opt_u16(words, &mut i)?;
+                let icon = match next_word(words, &mut i)? {
+                    0 => Icon::ArrowLeft,
+                    1 => Icon::ArrowRight,
+                    2 => Icon::Tick,
+                    3 => Icon::CheckCircle,
+                    code => return Err(format!("invalid icon code {code}")),
+                };
+                let size = next_f32(words, &mut i)?;
+                let stroke = next_f32(words, &mut i)?;
+                let flags = next_word(words, &mut i)?;
+                let style = if flags & 1 != 0 {
+                    decode_style(words, &mut i)?
+                } else {
+                    Style::default()
+                };
+                let paint = if flags & 2 != 0 {
+                    std::sync::Arc::new(decode_paint(words, &mut i)?)
+                } else {
+                    std::sync::Arc::default()
+                };
+                out.push(Op::Create {
+                    id,
+                    parent,
+                    before,
+                    node: Node::Icon {
+                        icon,
+                        size,
+                        stroke,
+                        style,
+                        paint,
+                    },
+                });
+            }
+            OP_CREATE_IMAGE => {
+                let id = next_u16(words, &mut i)?;
+                let parent = next_opt_u16(words, &mut i)?;
+                let before = next_opt_u16(words, &mut i)?;
+                let source = take_str(words, &mut i, strings)?;
+                let flags = next_word(words, &mut i)?;
+                let style = if flags & 1 != 0 {
+                    decode_style(words, &mut i)?
+                } else {
+                    Style::default()
+                };
+                let paint = if flags & 2 != 0 {
+                    std::sync::Arc::new(decode_paint(words, &mut i)?)
+                } else {
+                    std::sync::Arc::default()
+                };
+                out.push(Op::Create {
+                    id,
+                    parent,
+                    before,
+                    node: Node::Image {
+                        source,
+                        style,
+                        paint,
+                    },
+                });
+            }
+            OP_SET_SOURCE => {
+                let id = next_u16(words, &mut i)?;
+                let source = take_str(words, &mut i, strings)?;
+                out.push(Op::SetSource { id, source });
+            }
+            OP_CALLBACK_GUARD => {
+                let callback = next_u16(words, &mut i)?;
+                let raw = next_word(words, &mut i)?;
+                let token = if raw == u32::MAX {
+                    None
+                } else {
+                    let idx = raw as usize;
+                    let len = strings.len();
+                    let slot = strings
+                        .get_mut(idx)
+                        .ok_or_else(|| format!("string index {idx} out of bounds ({len})"))?;
+                    Some(std::mem::take(slot))
+                };
+                out.push(Op::CallbackGuard { callback, token });
             }
             _ => return Err(format!("unknown binary opcode {op}")),
         }

@@ -107,7 +107,7 @@ impl App for ChatRust {
                     purpose: Default::default(),
                     style: style(0., 0., 0., Some(34.)),
                     font: Font::default(),
-                    paint: Box::default(),
+                    paint: Default::default(),
                 },
             ),
             create(
@@ -120,7 +120,7 @@ impl App for ChatRust {
                     text: String::new(),
                     style: Style::default(),
                     font: Font::default(),
-                    paint: Box::default(),
+                    paint: Default::default(),
                 },
             ),
         ])
@@ -148,7 +148,7 @@ impl App for ChatRust {
                     text: e.text,
                     style: Style::default(),
                     font: Font::default(),
-                    paint: Box::default(),
+                    paint: Default::default(),
                 },
             },
             Op::SetText {
@@ -225,7 +225,7 @@ impl Chat {
         .expect("chat failed to mount");
         let created = creates(&mount.ops);
         let mut tree = Tree::default();
-        tree.apply(mount).expect("invalid chat mount");
+        tree.apply_shared(mount).expect("invalid chat mount");
         let mut layout = Layout::default();
         for (id, parent) in created {
             layout.created(&tree, id, parent);
@@ -285,7 +285,7 @@ impl Chat {
             .map(|(id, rect)| Op::SetRect { id, rect })
             .collect();
         let batch = Batch { base: 0, ops };
-        self.tree.apply_ui(batch.clone()).expect("layout batch");
+        self.tree.apply_ui_ref(&batch.ops).expect("layout batch");
         let _ = self.bridge.log.send(Log::Ui(batch));
     }
     /// List rectangle (x, y, width, height).
@@ -418,7 +418,7 @@ impl Chat {
             base: 0,
             ops: vec![op],
         };
-        self.tree.apply_ui(batch.clone()).expect("UI batch");
+        self.tree.apply_ui_ref(&batch.ops).expect("UI batch");
         let _ = self.bridge.log.send(Log::Ui(batch));
         self.published = (draft, selection);
     }
@@ -475,7 +475,7 @@ impl Chat {
                         })
                         .collect::<Vec<_>>();
                     let remount = batch.ops.iter().any(|op| matches!(op, Op::Remove { .. }));
-                    let result = self.tree.apply(batch);
+                    let result = self.tree.apply_shared(batch);
                     // The answer goes first: whatever the UI publishes because of this batch (for example, the
                     // draft in a new field) depends on it, and the replica must apply it first.
                     let _ = self.bridge.log.send(Log::Answer(result.is_ok()));

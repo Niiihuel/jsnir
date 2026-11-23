@@ -414,6 +414,158 @@ fn bench_column_sync_churn() {
     println!();
 }
 
+/// Benchmarks swapping a view of `rows` interactive rows (each row = 1 Box with style + paint + hover + 2 Texts = 3 nodes),
+/// mimicking switching channels or replacing a `Dynamic` list:
+/// - Legacy JSON: `Remove` + `jsnir.batch(JSON.stringify({ ops }))`
+/// - Binary + String Pool: `OP_REMOVE` + `OP_CREATE_BOX` (with hover variant) + `OP_CREATE_TEXT` + `commitStrings`
+fn view_swap_script(rows: usize, binary: bool) -> String {
+    let mut s = format!(
+        r#"
+        var ROWS = {rows};
+        var gen = 0;
+        function jsnirMount() {{
+            jsnir.batch(JSON.stringify({{ ops: [
+                {{ op: 'create', id: 1, node: {{ kind: 'box', style: {{ width: 1280, height: 720 }} }} }},
+                {{ op: 'create', id: 2, parent: 1, node: {{ kind: 'box', style: {{ width: 100, height: 40 }}, press: 1 }} }},
+                {{ op: 'create', id: 3, parent: 1, node: {{ kind: 'box', style: {{ width: 1280, height: 680 }} }} }},
+                {{ op: 'create', id: 10, parent: 3, node: {{ kind: 'box' }} }},
+            ] }}));
+        }}
+        "#
+    );
+    if binary {
+        s.push_str(
+            r#"
+            function jsnirEvent(cb) {
+                if (cb !== 1) return;
+                gen++;
+                var u = jsnir.cmd;
+                var f = jsnir.cmdF32;
+                var strs = [];
+                var p = 0;
+                // OP_REMOVE(3, id=10) + recreate container id=10
+                u[p++] = 3; u[p++] = 10;
+                u[p++] = 11; u[p++] = 10; u[p++] = 3; u[p++] = 0xffffffff; u[p++] = 0;
+                var nextId = 11;
+                for (var i = 0; i < ROWS; i++) {
+                    if (p + 80 > u.length) {
+                        jsnir.commitStrings(p, strs);
+                        p = 0;
+                        strs = [];
+                    }
+                    var rowId = nextId++;
+                    var titleId = nextId++;
+                    var bodyId = nextId++;
+                    // OP_CREATE_BOX(11): style (row, height=44, padding=[6,12,6,12], gap=8) + paint (bg, radius=6, hover={bg})
+                    u[p++] = 11; u[p++] = rowId; u[p++] = 10; u[p++] = 0xffffffff; u[p++] = (1 << 7) | (1 << 8);
+                    // style: height(1<<1) | padding(1<<5) | gap(1<<7), flags=row(1)
+                    u[p++] = (1 << 1) | (1 << 5) | (1 << 7); u[p++] = 1;
+                    f[p++] = 44; f[p++] = 6; f[p++] = 12; f[p++] = 6; f[p++] = 12; f[p++] = 8;
+                    // paint: bg(1) | radius(1<<2) | hover(1<<15)
+                    u[p++] = 1 | (1 << 2) | (1 << 15);
+                    u[p++] = 0x1e2028ff >>> 0; f[p++] = 6; f[p++] = 6; f[p++] = 6; f[p++] = 6;
+                    u[p++] = 1; u[p++] = 0x2a2d38ff >>> 0;
+                    // OP_CREATE_TEXT(12) title
+                    var s0 = strs.length; strs.push('User ' + i);
+                    u[p++] = 12; u[p++] = titleId; u[p++] = rowId; u[p++] = 0xffffffff; u[p++] = s0; u[p++] = (1 << 3) | (1 << 5);
+                    u[p++] = 1 | (1 << 1); f[p++] = 14; u[p++] = 600;
+                    u[p++] = 1 << 12; u[p++] = 0xf8fafcff >>> 0;
+                    // OP_CREATE_TEXT(12) message
+                    var s1 = strs.length; strs.push('Message #' + gen + '-' + i + ' in channel');
+                    u[p++] = 12; u[p++] = bodyId; u[p++] = rowId; u[p++] = 0xffffffff; u[p++] = s1; u[p++] = (1 << 3) | (1 << 5);
+                    u[p++] = 1; f[p++] = 13;
+                    u[p++] = 1 << 12; u[p++] = 0x94a3b8ff >>> 0;
+                }
+                jsnir.commitStrings(p, strs);
+            }
+            "#,
+        );
+    } else {
+        s.push_str(
+            r#"
+            function jsnirEvent(cb) {
+                if (cb !== 1) return;
+                gen++;
+                var ops = [
+                    { op: 'remove', id: 10 },
+                    { op: 'create', id: 10, parent: 3, node: { kind: 'box' } },
+                ];
+                var nextId = 11;
+                for (var i = 0; i < ROWS; i++) {
+                    var rowId = nextId++;
+                    var titleId = nextId++;
+                    var bodyId = nextId++;
+                    ops.push({
+                        op: 'create', id: rowId, parent: 10,
+                        node: {
+                            kind: 'box',
+                            style: { direction: 'row', height: 44, padding: [6, 12, 6, 12], gap: 8 },
+                            paint: { background: 0x1e2028ff, radius: [6, 6, 6, 6], hover: { background: 0x2a2d38ff } },
+                        },
+                    });
+                    ops.push({
+                        op: 'create', id: titleId, parent: rowId,
+                        node: { kind: 'text', text: 'User ' + i, font: { size: 14, weight: 600 }, paint: { color: 0xf8fafcff } },
+                    });
+                    ops.push({
+                        op: 'create', id: bodyId, parent: rowId,
+                        node: { kind: 'text', text: 'Message #' + gen + '-' + i + ' in channel', font: { size: 13 }, paint: { color: 0x94a3b8ff } },
+                    });
+                }
+                jsnir.batch(JSON.stringify({ ops: ops }));
+            }
+            "#,
+        );
+    }
+    s
+}
+
+fn bench_view_swap() {
+    println!("=== 6. View / Channel Swap (Create N Interactive Rows): JSON vs Binary + String Pool ===");
+    println!(
+        "{:<16} {:>12} {:>12} {:>12} {:>12} {:>10}",
+        "Subtree", "JSON p50", "Bin p50", "JSON p99", "Bin p99", "Speedup"
+    );
+    let warmup = 30;
+    let iters = 250;
+    for rows in [20usize, 100, 200] {
+        let run = |binary: bool| -> Stats {
+            let mut host = Host::new(
+                view_swap_script(rows, binary),
+                "{}".into(),
+                TextEngine::default(),
+            );
+            host.set_wait_budget(Duration::from_millis(20));
+            settle_host(&mut host);
+            host.pointer_move(Some([20., 20.]));
+            let mut samples = Vec::with_capacity(iters);
+            for i in 0..(warmup + iters) {
+                let t = Instant::now();
+                host.pointer_down(PointSelection::Place);
+                host.pointer_up();
+                wait_reply(&mut host);
+                let dt = t.elapsed().as_nanos();
+                if i >= warmup {
+                    samples.push(dt);
+                }
+            }
+            summarize(samples)
+        };
+        let json = run(false);
+        let bin = run(true);
+        println!(
+            "{:<16} {:>9.2} µs {:>9.2} µs {:>9.2} µs {:>9.2} µs {:>8.2}x",
+            format!("{rows} rows ({}n)", rows * 3),
+            json.p50_us,
+            bin.p50_us,
+            json.p99_us,
+            bin.p99_us,
+            json.p50_us / bin.p50_us,
+        );
+    }
+    println!();
+}
+
 fn main() {
     println!("JSNIR Engine Microbenchmark Suite (release build)\n");
     bench_mutations();
@@ -421,4 +573,5 @@ fn main() {
     bench_bounded_wait();
     bench_bytecode_startup();
     bench_column_sync_churn();
+    bench_view_swap();
 }

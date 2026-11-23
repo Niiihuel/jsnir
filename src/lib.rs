@@ -342,6 +342,7 @@ impl Vm {
                 );
                 // Binary command buffer: flushes `words` packed u32/f32 commands from `jsnir.cmd` without JSON.
                 let (cmd, cmd_reader) = CommandBuffer::install(&c, &jsnir)?;
+                let cmd_reader_num = cmd_reader.clone();
                 let sink = ops.clone();
                 def!(
                     jsnir,
@@ -350,8 +351,22 @@ impl Vm {
                     "commit",
                     |ctx: Ctx, words: u32| -> rquickjs::Result<()> {
                         let mut ops = sink.borrow_mut();
+                        cmd_reader_num
+                            .decode(words as usize, &mut [], &mut ops)
+                            .map_err(|e| Exception::throw_type(&ctx, &format!("invalid cmd: {e}")))
+                    }
+                );
+                let sink = ops.clone();
+                def!(
+                    jsnir,
+                    c,
+                    sigs,
+                    "commitStrings",
+                    |ctx: Ctx, words: u32, strings: Vec<String>| -> rquickjs::Result<()> {
+                        let mut strings = strings;
+                        let mut ops = sink.borrow_mut();
                         cmd_reader
-                            .decode(words as usize, &mut ops)
+                            .decode(words as usize, &mut strings, &mut ops)
                             .map_err(|e| Exception::throw_type(&ctx, &format!("invalid cmd: {e}")))
                     }
                 );
@@ -734,7 +749,7 @@ type ListBindings = Vec<(u64, u16)>;
 
 struct Bridge {
     events: SyncSender<Inbox>,
-    updates: Receiver<Batch>,
+    updates: Receiver<Arc<Batch>>,
     // Outcome of each reload, sent before the batch that carries it.
     reports: Receiver<Result<(), String>>,
     list_replies: Receiver<Result<ListBindings, String>>,
@@ -810,8 +825,8 @@ fn touched(ops: &[Op]) -> Vec<u16> {
 fn spawn_app(
     delay: Duration,
     make: impl FnOnce(Rc<RefCell<Replica>>) -> Result<Box<dyn App>, String> + Send + 'static,
-) -> Result<(Batch, Bridge), String> {
-    let (init, boot) = sync_channel::<Result<Batch, String>>(1);
+) -> Result<(Arc<Batch>, Bridge), String> {
+    let (init, boot) = sync_channel::<Result<Arc<Batch>, String>>(1);
     let (events, rx) = sync_channel::<Inbox>(MAX_PENDING.into());
     let (tx, updates) = sync_channel(MAX_PENDING.into());
     let log = CoalescingLog::default();
@@ -822,11 +837,11 @@ fn spawn_app(
         let replica: Rc<RefCell<Replica>> = Rc::default();
         let start = || {
             let mut app = make(replica.clone())?;
-            let mount = Batch {
+            let mount = Arc::new(Batch {
                 base: 0,
                 ops: app.mount()?,
-            };
-            replica.borrow_mut().produced(&mount)?;
+            });
+            replica.borrow_mut().produced_shared(Arc::clone(&mount))?;
             app.sync(&replica.borrow().view, None);
             Ok((app, mount))
         };
@@ -920,10 +935,10 @@ fn spawn_app(
                     }
                 },
             };
-            let batch = Batch {
+            let batch = Arc::new(Batch {
                 base: replica.borrow().view.app_seq,
                 ops,
-            };
+            });
             // The list lane knows the exact evicted subtrees, so it need not republish
             // columns for untouched resident rows on every scroll.
             let removed = batch.ops.iter().any(|op| matches!(op, Op::Remove { .. }));
@@ -937,7 +952,7 @@ fn spawn_app(
                 }
                 ids
             });
-            let produced = replica.borrow_mut().produced(&batch);
+            let produced = replica.borrow_mut().produced_shared(Arc::clone(&batch));
             match produced {
                 Ok(()) if let Some(ids) = list_ids => app.sync(&replica.borrow().view, Some(&ids)),
                 Ok(()) if removed => app.sync(&replica.borrow().view, None),
@@ -1052,7 +1067,7 @@ impl Runtime {
     /// The delay holds each event on the VM thread. Rust mode has no VM and ignores it.
     pub fn with_delay(mode: Mode, delay: Duration) -> Self {
         let (mount, bridge) = match mode {
-            Mode::Rust => (rust_mount(), None),
+            Mode::Rust => (Arc::new(rust_mount()), None),
             Mode::Js => {
                 let (mount, bridge) = spawn_app(delay, |replica| {
                     Ok(Box::new(CounterJs(Vm::counter(replica))))
@@ -1062,7 +1077,7 @@ impl Runtime {
             }
         };
         let mut tree = Tree::default();
-        tree.apply(mount).expect("invalid mount");
+        tree.apply_shared(mount).expect("invalid mount");
         if let Some(b) = &bridge {
             let _ = b.log.send(Log::Answer(true));
         }
@@ -1145,19 +1160,19 @@ impl Runtime {
                 t.event()
             }
             let value = (self.view.value + 1) % 1000;
-            self.apply(Batch {
+            self.apply(Arc::new(Batch {
                 base: self.tree.app_seq,
                 ops: vec![Op::Set {
                     id: self.view.display,
                     value,
                 }],
-            });
+            }));
         }
         true
     }
-    fn apply(&mut self, batch: Batch) {
+    fn apply(&mut self, batch: Arc<Batch>) {
         let (base, ops) = (batch.base, batch.ops.len());
-        let result = self.tree.apply(batch);
+        let result = self.tree.apply_shared(batch);
         if let Some(b) = &self.bridge {
             let _ = b.log.send(Log::Answer(result.is_ok()));
         }
@@ -1612,7 +1627,7 @@ mod tests {
             ops[8],
             Op::SetPaint {
                 id: 10,
-                paint: Box::new(tree::Paint {
+                paint: Arc::new(tree::Paint {
                     background: Some(0x112233ff),
                     opacity: Some(0.75),
                     cursor: Some(tree::Cursor::ColResize),
@@ -1717,5 +1732,76 @@ mod tests {
         host.pointer_up();
         host.poll();
         assert_eq!(host.tree.text(2), Some("count:1"));
+    }
+
+    #[test]
+    fn binary_create_and_string_pool_decode_nodes_variants_and_text() {
+        let vm = Vm::load(
+            r#"
+            function jsnirMount() {
+                var u = jsnir.cmd;
+                var f = jsnir.cmdF32;
+                var strs = ["Hola 茶😀", "Inter", "avatar.png", "0:1", "updated!"];
+                var p = 0;
+                // OP_CREATE_COLUMN(13, id=1, parent=None, before=None, flags=has_style(1), mask=width(1), flags=0, width=640)
+                u[p++] = 13; u[p++] = 1; u[p++] = 0xffffffff; u[p++] = 0xffffffff; u[p++] = 1;
+                u[p++] = 1; u[p++] = 0; f[p++] = 640.0;
+                // OP_CREATE_BOX(11, id=2, parent=1, before=None, flags=press(1<<1)|paint(1<<8))
+                u[p++] = 11; u[p++] = 2; u[p++] = 1; u[p++] = 0xffffffff; u[p++] = (1 << 1) | (1 << 8);
+                u[p++] = 7; // press=7
+                // paint: bg(1) | hover(1<<15) -> hover variant: brightness(1<<2) | cursor(1<<12)
+                u[p++] = 1 | (1 << 15);
+                u[p++] = 0x223344ff >>> 0;
+                u[p++] = (1 << 2) | (1 << 12); f[p++] = 1.15; u[p++] = 1; // Cursor::Pointer
+                // OP_CREATE_TEXT(12, id=3, parent=2, before=None, text=0, flags=align=Center(1)|lines(1<<2)|font(1<<3))
+                u[p++] = 12; u[p++] = 3; u[p++] = 2; u[p++] = 0xffffffff; u[p++] = 0; u[p++] = 1 | (1 << 2) | (1 << 3);
+                u[p++] = 2; // lines=2
+                // font: size(1) | weight(1<<1) | family(1<<4)
+                u[p++] = 1 | (1 << 1) | (1 << 4); f[p++] = 15.0; u[p++] = 600; u[p++] = 1;
+                // OP_CREATE_IMAGE(17, id=4, parent=2, before=None, source=2, flags=0)
+                u[p++] = 17; u[p++] = 4; u[p++] = 2; u[p++] = 0xffffffff; u[p++] = 2; u[p++] = 0;
+                // OP_CREATE_ICON(16, id=5, parent=2, before=None, icon=Tick(2), size=16, stroke=2, flags=0)
+                u[p++] = 16; u[p++] = 5; u[p++] = 2; u[p++] = 0xffffffff; u[p++] = 2; f[p++] = 16.0; f[p++] = 2.0; u[p++] = 0;
+                // OP_CALLBACK_GUARD(19, cb=7, token=3)
+                u[p++] = 19; u[p++] = 7; u[p++] = 3;
+                // OP_SET_TEXT(10, id=3, text=4)
+                u[p++] = 10; u[p++] = 3; u[p++] = 4;
+                jsnir.commitStrings(p, strs);
+            }
+            "#,
+            Rc::default(),
+        );
+        let ops = vm.call_mount().unwrap();
+        assert_eq!(ops.len(), 7);
+        let mut tree = Tree::default();
+        tree.apply(Batch { base: 0, ops }).expect("valid binary batch");
+        assert_eq!(tree.root, Some(1));
+        assert_eq!(tree.text(3), Some("updated!"));
+        match &tree.nodes[&2] {
+            tree::Node::Box { press, paint, .. } => {
+                assert_eq!(*press, 7);
+                assert_eq!(paint.background, Some(0x223344ff));
+                let hover = paint.hover.as_ref().expect("hover variant");
+                assert_eq!(hover.brightness, Some(1.15));
+                assert_eq!(hover.cursor, Some(tree::Cursor::Pointer));
+            }
+            other => panic!("expected Box, got {other:?}"),
+        }
+        match &tree.nodes[&3] {
+            tree::Node::Text {
+                align, lines, font, ..
+            } => {
+                assert_eq!(*align, tree::TextAlign::Center);
+                assert_eq!(*lines, Some(2));
+                assert_eq!(font.size, Some(15.0));
+                assert_eq!(font.weight, Some(600));
+                assert_eq!(font.family.as_deref(), Some("Inter"));
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
+        match &tree.nodes[&4] {
+            tree::Node::Image { source, .. } => assert_eq!(source, "avatar.png"),
+            other => panic!("expected Image, got {other:?}"),
+        }
     }
 }
