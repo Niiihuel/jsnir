@@ -387,9 +387,11 @@ impl ApplicationHandler for AppWindow {
 
     fn user_event(&mut self, events: &ActiveEventLoop, _: ()) {
         let Some(inbox) = &self.inbox else { return };
-        for message in inbox.try_iter() {
+        let messages = coalesce_messages(inbox.try_iter().collect());
+        for message in messages {
             match message {
                 Message::Push(text) => self.host.push(text),
+                Message::PushKeyed { key, text } => self.host.push_keyed(key, text),
                 Message::Image { source, rgba, size } => self.host.set_image(source, rgba, size),
                 Message::RemoveImage(source) => self.host.remove_image(&source),
                 Message::Font(bytes) => self.host.add_font(bytes),
@@ -518,6 +520,10 @@ pub fn open_with(
 /// What a `Pusher` sends to the window thread.
 enum Message {
     Push(String),
+    PushKeyed {
+        key: String,
+        text: String,
+    },
     Image {
         source: String,
         rgba: Vec<u8>,
@@ -601,6 +607,13 @@ impl Pusher {
     pub fn push(&self, json: String) -> bool {
         self.send(Message::Push(json))
     }
+    /// Like `push`, but coalesces bursts and queued backlog entries sharing `key` so only the latest payload is delivered.
+    pub fn push_keyed(&self, key: impl Into<String>, json: String) -> bool {
+        self.send(Message::PushKeyed {
+            key: key.into(),
+            text: json,
+        })
+    }
     /// Sets the pixels of the image that `Node::Image` names as `source` (straight RGBA8).
     pub fn image(&self, source: String, rgba: Vec<u8>, size: [u32; 2]) -> bool {
         self.send(Message::Image { source, rgba, size })
@@ -656,6 +669,33 @@ impl Pusher {
     fn send(&self, message: Message) -> bool {
         self.tx.send(message).is_ok() && self.proxy.send_event(()).is_ok()
     }
+}
+
+/// Drops superseded `Message::PushKeyed` entries in a drained burst while preserving
+/// chronological order relative to all other messages (`Push`, `Image`, `Reload`, etc.).
+fn coalesce_messages(messages: Vec<Message>) -> Vec<Message> {
+    let keyed_count = messages
+        .iter()
+        .filter(|m| matches!(m, Message::PushKeyed { .. }))
+        .count();
+    if keyed_count <= 1 {
+        return messages;
+    }
+    let mut last_index: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::with_capacity(keyed_count);
+    for (idx, msg) in messages.iter().enumerate() {
+        if let Message::PushKeyed { key, .. } = msg {
+            last_index.insert(key.clone(), idx);
+        }
+    }
+    messages
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, msg)| match &msg {
+            Message::PushKeyed { key, .. } if last_index.get(key) != Some(&idx) => None,
+            _ => Some(msg),
+        })
+        .collect()
 }
 /// Waits until the app has answered and every transition has settled, then captures a frame of `size` logical
 /// pixels at `scale` device pixels per logical pixel, into a new PPM file at `path`. Keyframe animations do not
@@ -727,6 +767,54 @@ mod tests {
         shared.set_scale(1.5);
         assert_eq!(shared.scale(), 1.5);
         assert_eq!(*seen.lock().unwrap(), [1.5]);
+    }
+
+    #[test]
+    fn coalesce_messages_keeps_latest_per_key_and_preserves_order() {
+        let messages = vec![
+            Message::PushKeyed {
+                key: "screen".into(),
+                text: "s1".into(),
+            },
+            Message::Push("fifo1".into()),
+            Message::PushKeyed {
+                key: "screen".into(),
+                text: "s2".into(),
+            },
+            Message::PushKeyed {
+                key: "sessions".into(),
+                text: "a1".into(),
+            },
+            Message::Title("icy".into()),
+            Message::PushKeyed {
+                key: "screen".into(),
+                text: "s3".into(),
+            },
+            Message::Push("fifo2".into()),
+            Message::PushKeyed {
+                key: "sessions".into(),
+                text: "a2".into(),
+            },
+        ];
+        let summary: Vec<String> = coalesce_messages(messages)
+            .into_iter()
+            .map(|m| match m {
+                Message::Push(t) => format!("push:{t}"),
+                Message::PushKeyed { key, text } => format!("keyed:{key}={text}"),
+                Message::Title(t) => format!("title:{t}"),
+                _ => "other".into(),
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                "push:fifo1",
+                "title:icy",
+                "keyed:screen=s3",
+                "push:fifo2",
+                "keyed:sessions=a2",
+            ]
+        );
     }
 
     // A 20 by 20 logical box that pulses forever: the capture settles, and shows the pulse at its first keyframe.

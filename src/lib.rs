@@ -1424,7 +1424,8 @@ mod tests {
                             { y: 1, blur: 3, spread: 0, color: 0x00000040 }
                         ],
                         transitions: [
-                            { property: "opacity", duration: 180, delay: 20, hold: 10, easing: "bezier", bezier: [0.2, 0.8, 0.2, 1.0] }
+                            { property: "opacity", duration: 180, delay: 20, hold: 10, easing: "bezier", bezier: [0.2, 0.8, 0.2, 1.0] },
+                            { property: "radius", duration: 240, easing: "spring" }
                         ],
                         animations: [
                             {
@@ -1441,6 +1442,7 @@ mod tests {
                             }
                         ],
                         starting: { opacity: 0, x: -4, y: 8, scale: 0.95, draw: 0.5 },
+                        exiting: { opacity: 0, x: -120, y: 12, scale: 0.92 },
                         scrollbar: { width: 6, thumb: 0x64748bff, track: 0x1e293bff, radius: 3, minThumb: 24, inset: 2, autoHide: true }
                     }
                 },
@@ -1551,12 +1553,15 @@ mod tests {
                 assert_eq!(paint.shadows.len(), 2);
                 assert_eq!(paint.shadows[0].blur, 12.);
                 assert_eq!(paint.shadows[0].spread, -1.);
-                assert_eq!(paint.transitions.len(), 1);
+                assert_eq!(paint.transitions.len(), 2);
                 assert_eq!(paint.transitions[0].property, tree::Property::Opacity);
                 assert_eq!(paint.transitions[0].easing, tree::Easing::Bezier);
                 assert_eq!(paint.transitions[0].bezier, Some([0.2, 0.8, 0.2, 1.0]));
                 assert_eq!(paint.transitions[0].delay, 20.);
                 assert_eq!(paint.transitions[0].hold, 10.);
+                assert_eq!(paint.transitions[1].property, tree::Property::Radius);
+                assert_eq!(paint.transitions[1].duration, 240.);
+                assert_eq!(paint.transitions[1].easing, tree::Easing::Spring);
                 let anims = paint.animations.as_ref().expect("animations");
                 assert_eq!(anims.len(), 1);
                 assert_eq!(anims[0].property, tree::Property::Scale);
@@ -1571,6 +1576,11 @@ mod tests {
                 assert_eq!(st.y, Some(8.));
                 assert_eq!(st.scale, Some(0.95));
                 assert_eq!(st.draw, Some(0.5));
+                let ex = paint.exiting.as_ref().expect("exiting");
+                assert_eq!(ex.opacity, Some(0.));
+                assert_eq!(ex.x, Some(-120.));
+                assert_eq!(ex.y, Some(12.));
+                assert_eq!(ex.scale, Some(0.92));
                 let sb = paint.scrollbar.as_ref().expect("scrollbar");
                 assert_eq!(sb.width, 6.);
                 assert_eq!(sb.thumb, 0x64748bff);

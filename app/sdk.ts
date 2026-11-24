@@ -528,6 +528,7 @@ var PROP_CODES: { [k: string]: number | undefined } = {
     left: 9,
     width: 10,
     height: 11,
+    radius: 12,
 };
 var EASING_CODES: { [k: string]: number | undefined } = {
     linear: 0,
@@ -986,6 +987,19 @@ function tryWritePaint(start: number, paint: Paint): number {
         f[p++] = sb.minThumb ?? 0;
         f[p++] = sb.inset ?? 0;
         if (sb.track !== undefined) u[p++] = sb.track >>> 0;
+    }
+    v = paint.exiting;
+    if (v !== undefined) {
+        if (p + 6 > cmdCap) return -2;
+        var ex = v as Exiting;
+        mask |= 1 << 24;
+        var exStart = p++;
+        var emask = 0;
+        if (ex.opacity !== undefined) { emask |= 1 << 0; f[p++] = ex.opacity; }
+        if (ex.x !== undefined) { emask |= 1 << 1; f[p++] = ex.x; }
+        if (ex.y !== undefined) { emask |= 1 << 2; f[p++] = ex.y; }
+        if (ex.scale !== undefined) { emask |= 1 << 3; f[p++] = ex.scale; }
+        u[exStart] = emask;
     }
     u[start] = mask;
     return p;

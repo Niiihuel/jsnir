@@ -5,10 +5,10 @@
 //! with a single interpreter instruction, without calling Rust or converting values. Rust is the only
 //! writer and writes only between callbacks, on the VM thread: reads and writes never overlap.
 use crate::tree::{
-    Align, Anchor, AnchorAlign, Animation, Axis, Cursor, Easing, Edges, Font, Icon, InlineImage,
-    InputPurpose, Justify, Keyframe, Node, Op, Paint, PlacementSubscription, Position, Property,
-    Radius, ScrollAnchor, ScrollEdge, Scrollbar, Shadow, Side, Span, Starting, Style, TextAlign,
-    Transition, Tree, Variant,
+    Align, Anchor, AnchorAlign, Animation, Axis, Cursor, Easing, Edges, Exiting, Font, Icon,
+    InlineImage, InputPurpose, Justify, Keyframe, Node, Op, Paint, PlacementSubscription, Position,
+    Property, Radius, ScrollAnchor, ScrollEdge, Scrollbar, Shadow, Side, Span, Starting, Style,
+    TextAlign, Transition, Tree, Variant,
 };
 
 /// TypeScript type of a value that crosses the boundary.
@@ -536,6 +536,24 @@ fn decode_starting(words: &[u32], i: &mut usize) -> Result<Starting, String> {
     })
 }
 
+fn decode_exiting(words: &[u32], i: &mut usize) -> Result<Exiting, String> {
+    let emask = next_word(words, i)?;
+    Ok(Exiting {
+        opacity: (emask & (1 << 0) != 0)
+            .then(|| next_f32(words, i))
+            .transpose()?,
+        x: (emask & (1 << 1) != 0)
+            .then(|| next_f32(words, i))
+            .transpose()?,
+        y: (emask & (1 << 2) != 0)
+            .then(|| next_f32(words, i))
+            .transpose()?,
+        scale: (emask & (1 << 3) != 0)
+            .then(|| next_f32(words, i))
+            .transpose()?,
+    })
+}
+
 fn decode_scrollbar(words: &[u32], i: &mut usize) -> Result<Scrollbar, String> {
     let sb_flags = next_word(words, i)?;
     let width = next_f32(words, i)?;
@@ -574,6 +592,7 @@ fn decode_property(code: u32) -> Result<Property, String> {
         9 => Ok(Property::Left),
         10 => Ok(Property::Width),
         11 => Ok(Property::Height),
+        12 => Ok(Property::Radius),
         _ => Err(format!("invalid property code {code}")),
     }
 }
@@ -766,6 +785,9 @@ fn decode_paint(words: &[u32], i: &mut usize, strings: &mut [String]) -> Result<
     }
     if mask & (1 << 23) != 0 {
         paint.scrollbar = Some(decode_scrollbar(words, i)?);
+    }
+    if mask & (1 << 24) != 0 {
+        paint.exiting = Some(decode_exiting(words, i)?);
     }
     Ok(paint)
 }

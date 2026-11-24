@@ -174,8 +174,9 @@ impl Style {
 contract_strings! {
     /// Properties that a transition can animate. `left`, `width` and `height` animate layout changes:
     /// `left` and `width` move the node on screen only, `height` also moves what follows it.
+    /// `radius` animates all four corner radii independently.
     pub enum Property as "Property" {
-        Opacity, X, Y, Scale, Brightness, Background, Edge, Color, Draw, Left, Width, Height
+        Opacity, X, Y, Scale, Brightness, Background, Edge, Color, Draw, Left, Width, Height, Radius
     }
 }
 impl Property {
@@ -326,6 +327,16 @@ contract_struct! {
     }
 }
 contract_struct! {
+    /// Target values a removed node animates toward using a frozen snapshot of its last rendered frame.
+    /// Each specified property uses its matching entry in `paint.transitions`.
+    pub struct Exiting as "Exiting" {
+        opacity: Option<f32>,
+        x: Option<f32>,
+        y: Option<f32>,
+        scale: Option<f32>,
+    }
+}
+contract_struct! {
     /// A thin scrollbar of a `scroll` node whose content is taller than its box. Lengths are logical pixels;
     /// colors are `0xRRGGBBAA`.
     pub struct Scrollbar as "Scrollbar" {
@@ -405,6 +416,8 @@ contract_struct! {
         /// Keyframe animations that run while the node is on screen. A change of the list restarts them.
         animations: Option<Vec<Animation>>,
         starting: Option<Starting>,
+        /// Target values when the node is removed (`Op::Remove`), animating a frozen snapshot of its last frame.
+        exiting: Option<Exiting>,
         hover: Option<Variant>,
         active: Option<Variant>,
         focus: Option<Variant>,
@@ -456,6 +469,12 @@ impl Paint {
                 self.starting
                     .iter()
                     .flat_map(|s| [s.opacity, s.x, s.y, s.scale, s.draw])
+                    .flatten(),
+            )
+            .chain(
+                self.exiting
+                    .iter()
+                    .flat_map(|e| [e.opacity, e.x, e.y, e.scale])
                     .flatten(),
             )
             .chain(self.shadows.iter().flat_map(|s| [s.y, s.blur, s.spread]))
@@ -686,6 +705,7 @@ pub(crate) fn ts_decls() -> String {
         Cursor::ts_decl(),
         Variant::ts_decl(),
         Starting::ts_decl(),
+        Exiting::ts_decl(),
         Scrollbar::ts_decl(),
         Paint::ts_decl(),
         Font::ts_decl(),

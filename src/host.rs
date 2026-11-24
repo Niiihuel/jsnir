@@ -582,6 +582,7 @@ struct QueuedEvent {
     callback: u16,
     payload: EventPayload,
     guard: Option<String>,
+    coalesce_key: Option<String>,
 }
 
 impl QueuedEvent {
@@ -637,6 +638,433 @@ impl QueuedEvent {
     }
 }
 
+/// Frozen paint snapshot of a node with `paint.exiting`, captured in `Walker::draw`
+/// only when `paint.exiting.is_some()` (zero cost for all other nodes).
+struct ExitSnapshot {
+    items: Vec<Item>,
+    children_start: usize,
+    self_clips: bool,
+    self_has_round_clip: bool,
+    opacity: f32,
+    ancestor_opacity: f32,
+    x: f32,
+    y: f32,
+    scale: f32,
+    ctx_k: f32,
+    center: [f32; 2],
+    parent_clip: Rect,
+    parent_round_clip: Option<(Rect, Corners)>,
+    layer: i32,
+}
+
+struct LeavingChannel {
+    from: f32,
+    to: f32,
+    transition: Transition,
+}
+
+impl LeavingChannel {
+    fn at(&self, start: f64, now: f64) -> f32 {
+        let elapsed = (now - start) as f32 - self.transition.delay;
+        if elapsed <= 0. {
+            return self.from;
+        }
+        if self.transition.duration <= 0. || elapsed >= self.transition.duration {
+            return self.to;
+        }
+        let t = elapsed / self.transition.duration;
+        self.from + (self.to - self.from) * crate::motion::ease(&self.transition, t)
+    }
+
+    fn end_offset_ms(&self) -> f64 {
+        f64::from(self.transition.delay.max(0.) + self.transition.duration.max(0.))
+    }
+}
+
+struct Leaving {
+    snapshot: ExitSnapshot,
+    start: f64,
+    end: f64,
+    opacity: Option<LeavingChannel>,
+    x: Option<LeavingChannel>,
+    y: Option<LeavingChannel>,
+    scale: Option<LeavingChannel>,
+}
+
+struct LeavingPlan {
+    id: u16,
+    opacity: Option<(f32, Transition)>,
+    x: Option<(f32, Transition)>,
+    y: Option<(f32, Transition)>,
+    scale: Option<(f32, Transition)>,
+}
+
+fn plan_leaving(id: u16, paint: &Paint) -> Option<LeavingPlan> {
+    let exiting = paint.exiting.as_ref()?;
+    let pick = |prop: Property, target: Option<f32>| -> Option<(f32, Transition)> {
+        let to = target?;
+        let tr = transition(paint, prop)?.clone();
+        if tr.delay.max(0.) + tr.duration.max(0.) <= 0. {
+            return None;
+        }
+        Some((to, tr))
+    };
+    let opacity = pick(Property::Opacity, exiting.opacity);
+    let x = pick(Property::X, exiting.x);
+    let y = pick(Property::Y, exiting.y);
+    let scale = pick(Property::Scale, exiting.scale);
+    if opacity.is_none() && x.is_none() && y.is_none() && scale.is_none() {
+        return None;
+    }
+    Some(LeavingPlan {
+        id,
+        opacity,
+        x,
+        y,
+        scale,
+    })
+}
+
+fn xform_rect(r: Rect, center: [f32; 2], delta: [f32; 2], scale: f32) -> Rect {
+    [
+        center[0] + (r[0] - center[0]) * scale + delta[0],
+        center[1] + (r[1] - center[1]) * scale + delta[1],
+        r[2] * scale,
+        r[3] * scale,
+    ]
+}
+
+fn xform_clip(
+    clip: Rect,
+    parent_clip: Rect,
+    child_owned: bool,
+    center: [f32; 2],
+    delta: [f32; 2],
+    scale: f32,
+) -> Rect {
+    if !child_owned && clip == parent_clip {
+        parent_clip
+    } else {
+        intersect(xform_rect(clip, center, delta, scale), parent_clip)
+    }
+}
+
+fn xform_round_clip(
+    round_clip: Option<(Rect, Corners)>,
+    parent_round_clip: Option<(Rect, Corners)>,
+    child_owned: bool,
+    center: [f32; 2],
+    delta: [f32; 2],
+    scale: f32,
+) -> Option<(Rect, Corners)> {
+    let (r, corners) = round_clip?;
+    if !child_owned && round_clip == parent_round_clip {
+        parent_round_clip
+    } else {
+        Some((
+            xform_rect(r, center, delta, scale),
+            corners.map(|c| c * scale),
+        ))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn transform_leaving_item(
+    item: &Item,
+    center: [f32; 2],
+    delta: [f32; 2],
+    scale: f32,
+    parent_clip: Rect,
+    parent_round_clip: Option<(Rect, Corners)>,
+    child_owned_clip: bool,
+    child_owned_round: bool,
+) -> Item {
+    match item {
+        Item::PushLayer { opacity } => Item::PushLayer { opacity: *opacity },
+        Item::PopLayer => Item::PopLayer,
+        Item::Shadow {
+            rect,
+            radius,
+            shadow,
+            clip,
+            round_clip,
+        } => Item::Shadow {
+            rect: xform_rect(*rect, center, delta, scale),
+            radius: radius * scale,
+            shadow: ShadowSpec {
+                y: shadow.y * scale,
+                blur: shadow.blur * scale,
+                spread: shadow.spread * scale,
+                color: shadow.color,
+            },
+            clip: xform_clip(*clip, parent_clip, child_owned_clip, center, delta, scale),
+            round_clip: xform_round_clip(
+                *round_clip,
+                parent_round_clip,
+                child_owned_round,
+                center,
+                delta,
+                scale,
+            ),
+        },
+        Item::Fill {
+            rect,
+            radius,
+            top,
+            bottom,
+            clip,
+            round_clip,
+            mask,
+        } => Item::Fill {
+            rect: xform_rect(*rect, center, delta, scale),
+            radius: radius.map(|r| r * scale),
+            top: *top,
+            bottom: *bottom,
+            clip: xform_clip(*clip, parent_clip, child_owned_clip, center, delta, scale),
+            round_clip: xform_round_clip(
+                *round_clip,
+                parent_round_clip,
+                child_owned_round,
+                center,
+                delta,
+                scale,
+            ),
+            mask: mask
+                .as_ref()
+                .map(|(img, mrect)| (img.clone(), xform_rect(*mrect, center, delta, scale))),
+        },
+        Item::Inset {
+            rect,
+            radius,
+            spread,
+            offset,
+            color,
+            clip,
+            round_clip,
+            mask,
+        } => Item::Inset {
+            rect: xform_rect(*rect, center, delta, scale),
+            radius: radius.map(|r| r * scale),
+            spread: spread * scale,
+            offset: [offset[0] * scale, offset[1] * scale],
+            color: *color,
+            clip: xform_clip(*clip, parent_clip, child_owned_clip, center, delta, scale),
+            round_clip: xform_round_clip(
+                *round_clip,
+                parent_round_clip,
+                child_owned_round,
+                center,
+                delta,
+                scale,
+            ),
+            mask: mask
+                .as_ref()
+                .map(|(img, mrect)| (img.clone(), xform_rect(*mrect, center, delta, scale))),
+        },
+        Item::Text {
+            rect,
+            text,
+            spans,
+            style,
+            wrap,
+            zoom,
+            clip,
+            round_clip,
+        } => Item::Text {
+            rect: xform_rect(*rect, center, delta, scale),
+            text: text.clone(),
+            spans: spans.clone(),
+            style: style.clone(),
+            wrap: *wrap,
+            zoom: zoom * scale,
+            clip: xform_clip(*clip, parent_clip, child_owned_clip, center, delta, scale),
+            round_clip: xform_round_clip(
+                *round_clip,
+                parent_round_clip,
+                child_owned_round,
+                center,
+                delta,
+                scale,
+            ),
+        },
+        Item::Icon {
+            rect,
+            icon,
+            stroke,
+            draw,
+            color,
+            zoom,
+            clip,
+            round_clip,
+        } => Item::Icon {
+            rect: xform_rect(*rect, center, delta, scale),
+            icon: *icon,
+            stroke: stroke * scale,
+            draw: *draw,
+            color: *color,
+            zoom: zoom * scale,
+            clip: xform_clip(*clip, parent_clip, child_owned_clip, center, delta, scale),
+            round_clip: xform_round_clip(
+                *round_clip,
+                parent_round_clip,
+                child_owned_round,
+                center,
+                delta,
+                scale,
+            ),
+        },
+        Item::Image {
+            rect,
+            radius,
+            image,
+            tint,
+            clip,
+            round_clip,
+            mask,
+        } => Item::Image {
+            rect: xform_rect(*rect, center, delta, scale),
+            radius: radius.map(|r| r * scale),
+            image: image.clone(),
+            tint: *tint,
+            clip: xform_clip(*clip, parent_clip, child_owned_clip, center, delta, scale),
+            round_clip: xform_round_clip(
+                *round_clip,
+                parent_round_clip,
+                child_owned_round,
+                center,
+                delta,
+                scale,
+            ),
+            mask: mask
+                .as_ref()
+                .map(|(img, mrect)| (img.clone(), xform_rect(*mrect, center, delta, scale))),
+        },
+        Item::Editor {
+            rect,
+            frame,
+            caret,
+            selection,
+            caret_color,
+            clip,
+            round_clip,
+        } => Item::Editor {
+            rect: xform_rect(*rect, center, delta, scale),
+            frame: frame.clone(),
+            caret: *caret,
+            selection: *selection,
+            caret_color: *caret_color,
+            clip: xform_clip(*clip, parent_clip, child_owned_clip, center, delta, scale),
+            round_clip: xform_round_clip(
+                *round_clip,
+                parent_round_clip,
+                child_owned_round,
+                center,
+                delta,
+                scale,
+            ),
+        },
+    }
+}
+
+fn emit_leaving(leaving: &Leaving, now: f64, items: &mut Vec<Item>) {
+    let snap = &leaving.snapshot;
+    let cur_opacity = leaving
+        .opacity
+        .as_ref()
+        .map_or(snap.opacity, |ch| ch.at(leaving.start, now));
+    let eff_opacity = (cur_opacity * snap.ancestor_opacity).clamp(0., 1.);
+    if eff_opacity <= 0.001 {
+        return;
+    }
+    let cur_x = leaving
+        .x
+        .as_ref()
+        .map_or(snap.x, |ch| ch.at(leaving.start, now));
+    let cur_y = leaving
+        .y
+        .as_ref()
+        .map_or(snap.y, |ch| ch.at(leaving.start, now));
+    let cur_scale = leaving
+        .scale
+        .as_ref()
+        .map_or(snap.scale, |ch| ch.at(leaving.start, now));
+    let rel_scale = if snap.scale.abs() > 1e-4 {
+        (cur_scale / snap.scale).max(0.)
+    } else {
+        1.
+    };
+    if rel_scale <= 0.001 {
+        return;
+    }
+    let delta = [
+        (cur_x - snap.x) * snap.ctx_k,
+        (cur_y - snap.y) * snap.ctx_k,
+    ];
+    let needs_xform =
+        delta[0].abs() > 1e-4 || delta[1].abs() > 1e-4 || (rel_scale - 1.).abs() > 1e-4;
+    let layer = eff_opacity < 0.999;
+    if layer {
+        items.push(Item::PushLayer {
+            opacity: eff_opacity,
+        });
+    }
+    if !needs_xform {
+        items.extend(snap.items.iter().cloned());
+    } else {
+        for (idx, item) in snap.items.iter().enumerate() {
+            let child_owned_clip = idx >= snap.children_start && snap.self_clips;
+            let child_owned_round = idx >= snap.children_start && snap.self_has_round_clip;
+            items.push(transform_leaving_item(
+                item,
+                snap.center,
+                delta,
+                rel_scale,
+                snap.parent_clip,
+                snap.parent_round_clip,
+                child_owned_clip,
+                child_owned_round,
+            ));
+        }
+    }
+    if layer {
+        items.push(Item::PopLayer);
+    }
+}
+
+fn emit_leaving_range(
+    leaving: &[Leaving],
+    now: f64,
+    min_layer: i32,
+    max_layer: i32,
+    items: &mut Vec<Item>,
+) {
+    if min_layer > max_layer {
+        return;
+    }
+    if min_layer == max_layer {
+        for entry in leaving {
+            if entry.snapshot.layer == min_layer {
+                emit_leaving(entry, now, items);
+            }
+        }
+        return;
+    }
+    let mut matching: Vec<usize> = leaving
+        .iter()
+        .enumerate()
+        .filter_map(|(i, l)| {
+            (l.snapshot.layer >= min_layer && l.snapshot.layer <= max_layer).then_some(i)
+        })
+        .collect();
+    if matching.is_empty() {
+        return;
+    }
+    matching.sort_by_key(|&i| (leaving[i].snapshot.layer, i));
+    for i in matching {
+        emit_leaving(&leaving[i], now, items);
+    }
+}
+
 pub struct Host {
     pub tree: Tree,
     list_mounts: HashMap<u16, String>,
@@ -664,6 +1092,10 @@ pub struct Host {
     last_items_len: usize,
     text: TextEngine,
     motion: Motion,
+    // Last-frame frozen paint snapshots for nodes with `paint.exiting`, promoted to `leaving` on `Op::Remove`.
+    exit_snapshots: HashMap<u16, ExitSnapshot>,
+    // Removed nodes currently playing their `paint.exiting` transitions on frozen snapshots.
+    leaving: Vec<Leaving>,
     clock: Instant,
     // Timers from `after` operations: deadline in ms on `clock`, and the callback.
     timers: Vec<(f64, QueuedEvent)>,
@@ -916,6 +1348,8 @@ impl Host {
             last_items_len: 0,
             text,
             motion: Motion::default(),
+            exit_snapshots: HashMap::new(),
+            leaving: Vec::new(),
             clock: Instant::now(),
             timers: Vec::new(),
             backlog: Vec::new(),
@@ -1503,6 +1937,7 @@ impl Host {
             guard: self.callback_guards.get(&callback).cloned(),
             callback,
             payload,
+            coalesce_key: None,
         }
     }
 
@@ -1524,7 +1959,7 @@ impl Host {
         {
             return;
         }
-        if self.can_send_now() {
+        if self.backlog.is_empty() && self.can_send_now() {
             self.bridge
                 .events
                 .try_send(queued.into_inbox())
@@ -1533,6 +1968,16 @@ impl Host {
             self.inflight.push_back(Inflight::Event);
             self.sent_at = Some(Instant::now());
         } else {
+            if let Some(key) = &queued.coalesce_key
+                && let Some(existing) = self.backlog.iter_mut().find(|item| {
+                    item.callback == queued.callback
+                        && item.guard == queued.guard
+                        && item.coalesce_key.as_deref() == Some(key.as_str())
+                })
+            {
+                existing.payload = queued.payload;
+                return;
+            }
             self.backlog.push(queued);
         }
     }
@@ -1543,6 +1988,15 @@ impl Host {
             callback: HOST_CALLBACK,
             text,
         });
+    }
+
+    /// Like `push`, but coalesces by `key` while queued in the backlog: if another message with the same
+    /// key is waiting to be sent, its payload is replaced in-place with `text` instead of queueing another
+    /// intermediate state. Unkeyed `push` messages keep strict FIFO delivery.
+    pub fn push_keyed(&mut self, key: impl Into<String>, text: String) {
+        let mut queued = self.queued_payload(HOST_CALLBACK, EventPayload::Text(text));
+        queued.coalesce_key = Some(key.into());
+        self.send_queued(queued);
     }
 
     /// Replaces the app with `script` (SDK + app) without restarting: the window, the program's connection and
@@ -1746,6 +2200,7 @@ impl Host {
             self.callback_guards.clear();
             self.reported_viewport = None;
             self.timers.retain(|(_, event)| event.guard.is_none());
+            self.exit_snapshots.clear();
         } else if self.dev_overlay_enabled
             && let Err(error) = &outcome
         {
@@ -1794,6 +2249,7 @@ impl Host {
                 self.node_drag = None;
                 self.pending_drag_move = None;
                 self.focused = None;
+                self.leaving.clear();
                 self.ime_revision += 1;
                 self.ime_change_cause = ImeChangeCause::Other;
             }
@@ -1892,10 +2348,31 @@ impl Host {
         // when it came after the ID's last creation (one pass, no per-create scan).
         let mut last_create: HashMap<u16, usize> = HashMap::new();
         let mut last_listed: HashMap<u16, usize> = HashMap::new();
+        let has_exit_snapshots = !self.exit_snapshots.is_empty();
+        let mut exit_paint_override: HashMap<u16, &Paint> = HashMap::new();
+        let mut exit_removed_seen: HashSet<u16> = HashSet::new();
+        let mut exit_plans: Vec<LeavingPlan> = Vec::new();
         for (index, op) in batch.ops.iter().enumerate() {
             match op {
                 Op::Remove { id } => {
-                    removed.extend(self.tree.subtree(*id));
+                    let subtree = self.tree.subtree(*id);
+                    if has_exit_snapshots {
+                        for &node_id in &subtree {
+                            if exit_removed_seen.insert(node_id)
+                                && self.exit_snapshots.contains_key(&node_id)
+                                && let Some(paint) = exit_paint_override
+                                    .get(&node_id)
+                                    .copied()
+                                    .or_else(|| {
+                                        self.tree.nodes.get(&node_id).and_then(Node::paint)
+                                    })
+                                && let Some(plan) = plan_leaving(node_id, paint)
+                            {
+                                exit_plans.push(plan);
+                            }
+                        }
+                    }
+                    removed.extend(subtree);
                     if !self.bound_rows.is_empty() {
                         // Read ownership before the batch can recycle the ID, walking
                         // only the removed subtree root's old ancestor chain.
@@ -1911,6 +2388,9 @@ impl Host {
                 Op::Create {
                     id, parent, before, ..
                 } => {
+                    if has_exit_snapshots {
+                        exit_paint_override.remove(id);
+                    }
                     last_create.insert(*id, index);
                     created.push((*id, *parent));
                     if before.is_some() {
@@ -1923,6 +2403,12 @@ impl Host {
                 }
                 Op::SetStyle { id, .. } => restyled.push(*id),
                 Op::SetPaint { id, paint } => {
+                    if has_exit_snapshots
+                        && self.exit_snapshots.contains_key(id)
+                        && !exit_removed_seen.contains(id)
+                    {
+                        exit_paint_override.insert(*id, paint);
+                    }
                     // If a previously static already-drawn node gains transitions or starting values via SetPaint,
                     // seed Motion with its current values before applying the batch so transitions start cleanly.
                     if (!paint.transitions.is_empty() || paint.starting.is_some())
@@ -1963,12 +2449,59 @@ impl Host {
                 _ => {}
             }
         }
+        // Avoid duplicating exiting descendants whose ancestor is already animating out as a single snapshot.
+        if exit_plans.len() > 1 {
+            let planned_ids: HashSet<u16> = exit_plans.iter().map(|p| p.id).collect();
+            exit_plans.retain(|plan| {
+                let mut parent = self.tree.parent(plan.id);
+                while let Some(ancestor) = parent {
+                    if planned_ids.contains(&ancestor) {
+                        return false;
+                    }
+                    parent = self.tree.parent(ancestor);
+                }
+                true
+            });
+        }
+        drop(exit_paint_override);
         let result = self.tree.apply_shared(batch);
         // The answer goes first: whatever the UI publishes next depends on this batch.
         let _ = self.bridge.log.send(Log::Answer(result.is_ok()));
         if let Err(e) = result {
             eprintln!("batch rejected ({e})");
             return false;
+        }
+        if !exit_plans.is_empty() {
+            let now = self.now();
+            for plan in exit_plans {
+                if let Some(snap) = self.exit_snapshots.remove(&plan.id) {
+                    let make = |from: f32, spec: Option<(f32, Transition)>| {
+                        spec.map(|(to, transition)| LeavingChannel {
+                            from,
+                            to,
+                            transition,
+                        })
+                    };
+                    let opacity = make(snap.opacity, plan.opacity);
+                    let x = make(snap.x, plan.x);
+                    let y = make(snap.y, plan.y);
+                    let scale = make(snap.scale, plan.scale);
+                    let max_ms = [&opacity, &x, &y, &scale]
+                        .into_iter()
+                        .flatten()
+                        .map(LeavingChannel::end_offset_ms)
+                        .fold(0_f64, f64::max);
+                    self.leaving.push(Leaving {
+                        snapshot: snap,
+                        start: now,
+                        end: now + max_ms,
+                        opacity,
+                        x,
+                        y,
+                        scale,
+                    });
+                }
+            }
         }
         for id in affected_lists {
             if let Some((_, list)) = self.virtual_lists.get_mut(&id)
@@ -2016,6 +2549,7 @@ impl Host {
             self.anchors.remove(id);
             self.placements.remove(id);
             self.sized_nodes.remove(id);
+            self.exit_snapshots.remove(id);
         }
         self.motion.forget(&removed);
         if self.focused.is_some_and(|f| removed.contains(&f)) {
@@ -3303,7 +3837,14 @@ impl Host {
         let mut placements = Vec::new();
         self.screen.clear();
         self.screen.resize(self.tree.nodes.end(), None);
+        self.exit_snapshots.clear();
+        if !self.leaving.is_empty() {
+            self.leaving.retain(|l| now < l.end);
+        }
         if let Some(root) = self.tree.root {
+            if !self.leaving.is_empty() {
+                emit_leaving_range(&self.leaving, now, i32::MIN, -1, &mut items);
+            }
             let window = [0., 0., width, height];
             let base = Context {
                 k: 1.,
@@ -3337,6 +3878,8 @@ impl Host {
                 hide_caret: self.hide_caret,
                 screen: &mut self.screen,
                 motion: &mut self.motion,
+                exit_snapshots: &mut self.exit_snapshots,
+                leaving: &self.leaving,
                 text: &mut self.text,
                 editor: &mut self.editor,
                 editor_key: &mut self.editor_key,
@@ -3355,14 +3898,20 @@ impl Host {
                 window,
                 layer: 0,
                 layer_root: None,
+                group_opacity: 1.,
                 deferred: Vec::new(),
                 placements: &mut placements,
                 queued: 0,
                 looping: false,
             };
             walker.node(root, base, scale, max_side);
+            if !walker.leaving.is_empty() {
+                emit_leaving_range(walker.leaving, now, 0, 0, walker.items);
+            }
             walker.draw_deferred(scale, max_side);
             looping = walker.looping;
+        } else if !self.leaving.is_empty() {
+            emit_leaving_range(&self.leaving, now, i32::MIN, i32::MAX, &mut items);
         }
         self.hits = hits;
         self.cursor_rects = cursors;
@@ -3378,7 +3927,7 @@ impl Host {
         (
             Frame {
                 items,
-                animating: self.motion.animating(now) || looping,
+                animating: self.motion.animating(now) || looping || !self.leaving.is_empty(),
                 ime_area,
             },
             placements,
@@ -4024,6 +4573,7 @@ fn seed_motion_from_paint(motion: &mut Motion, id: u16, paint: &Paint, v: &Varia
     motion.seed(id, Property::Background, background);
     motion.seed(id, Property::Edge, edge);
     motion.seed(id, Property::Color, color);
+    motion.seed(id, Property::Radius, Value::Quad(paint.radius.corners()));
 }
 
 fn variant_affects_geometry(paint: &Paint) -> bool {
@@ -4297,6 +4847,8 @@ struct Walker<'a> {
     hide_caret: bool,
     screen: &'a mut Vec<Option<Rect>>,
     motion: &'a mut Motion,
+    exit_snapshots: &'a mut HashMap<u16, ExitSnapshot>,
+    leaving: &'a [Leaving],
     text: &'a mut TextEngine,
     editor: &'a mut LineEditor,
     editor_key: &'a mut Option<EditorBitmapKey>,
@@ -4317,6 +4869,8 @@ struct Walker<'a> {
     // Layer of the node being drawn, and the node that starts that layer (its rectangle covers what is below it).
     layer: i32,
     layer_root: Option<u16>,
+    // Cumulative ancestor layer opacity for accurate `ExitSnapshot` composition.
+    group_opacity: f32,
     // Layered nodes waiting for their turn, and how many were ever queued: their order within a layer.
     deferred: Vec<Deferred>,
     placements: &'a mut Vec<(u16, Placement)>,
@@ -4348,6 +4902,7 @@ struct Shown {
     draw: f32,
     left: f32,
     width: f32,
+    radius: [f32; 4],
     underline: bool,
     looping: bool,
 }
@@ -4560,6 +5115,7 @@ impl<'a> Walker<'a> {
                 draw: draw_base,
                 left: rect[0],
                 width: width_base,
+                radius: paint.radius.corners().map(|r| r.max(0.)),
                 underline: v.underline.unwrap_or(false),
                 looping: false,
             };
@@ -4633,6 +5189,20 @@ impl<'a> Walker<'a> {
         let draw = number(Property::Draw, draw_base);
         let left = number(Property::Left, rect[0]);
         let width = number(Property::Width, width_base);
+        let radius_base = paint.radius.corners();
+        let radius = {
+            let tr = transition(paint, Property::Radius);
+            let shown = if tr.is_some() || has_active {
+                motion
+                    .show(id, Property::Radius, Value::Quad(radius_base), tr, now)
+                    .quad()
+            } else {
+                radius_base
+            };
+            overridden(Property::Radius)
+                .map_or(shown, Value::quad)
+                .map(|r| r.max(0.))
+        };
         // A color animates from transparent when it appears.
         let mut color = |property, value: Option<u32>| {
             let tr = transition(paint, property);
@@ -4669,6 +5239,7 @@ impl<'a> Walker<'a> {
             draw,
             left,
             width,
+            radius,
             underline: v.underline.unwrap_or(false),
         }
     }
@@ -4708,10 +5279,19 @@ impl<'a> Walker<'a> {
     // Draws the queued layers, lowest first and in document order within a layer. A layer's own layered children are
     // queued in turn, so they are drawn after the lower layers and before the higher ones.
     fn draw_deferred(&mut self, scale: f32, max_side: usize) {
+        self.group_opacity = 1.;
+        let mut last_layer = 0_i32;
         while let Some(next) = (0..self.deferred.len())
             .min_by_key(|&i| (self.deferred[i].layer, self.deferred[i].order))
         {
             let Deferred { id, layer, ctx, .. } = self.deferred.swap_remove(next);
+            if !self.leaving.is_empty() && layer > last_layer {
+                let from = if last_layer > 0 { last_layer } else { 1 };
+                if from <= layer - 1 {
+                    emit_leaving_range(self.leaving, self.now, from, layer - 1, self.items);
+                }
+                last_layer = layer;
+            }
             let ctx = match ctx {
                 Some(ctx) => ctx,
                 None => match self.fixed_context(id) {
@@ -4722,6 +5302,10 @@ impl<'a> Walker<'a> {
             self.layer = layer;
             self.layer_root = Some(id);
             self.draw(id, ctx, scale, max_side);
+        }
+        if !self.leaving.is_empty() {
+            let from = if last_layer > 0 { last_layer } else { 1 };
+            emit_leaving_range(self.leaving, self.now, from, i32::MAX, self.items);
         }
         self.layer = 0;
         self.layer_root = None;
@@ -4814,6 +5398,8 @@ impl<'a> Walker<'a> {
         if shown.opacity <= 0.001 || empty {
             return;
         }
+        let prev_opacity = self.group_opacity;
+        self.group_opacity = prev_opacity * shown.opacity;
         let layer = shown.opacity < 0.999
             && (visible || has_children || !paint.shadows.is_empty());
         if layer {
@@ -4821,6 +5407,7 @@ impl<'a> Walker<'a> {
                 opacity: shown.opacity,
             });
         }
+        let exit_start = paint.exiting.is_some().then(|| self.items.len());
         let clip = ctx.clip;
         let round_clip = ctx.round_clip;
         // The root of a layer covers what is below it, even where it reacts to nothing.
@@ -4831,7 +5418,7 @@ impl<'a> Walker<'a> {
                 layer: self.layer,
             });
         }
-        let radius = paint.radius.corners().map(|r| r * inner.k);
+        let radius = shown.radius.map(|r| r.max(0.) * inner.k);
         let shadow_radius = radius.into_iter().fold(0., f32::max);
         // A mask names an image: while that image is missing, the node draws none of its own paint.
         let mask = paint
@@ -5373,10 +5960,12 @@ impl<'a> Walker<'a> {
             child.group_hover = gh;
             child.group_active = ga;
         }
-        if node.style().is_some_and(|s| s.clip || s.scroll) {
+        let clips_style = node.style().is_some_and(|s| s.clip || s.scroll);
+        let self_has_round_clip = clips_style && radius.iter().any(|&r| r > 0.);
+        if clips_style {
             child.clip = on_screen;
             // shortcut: a rounded clip inside another rounded clip replaces it, so the outer corners are lost.
-            if radius.iter().any(|&r| r > 0.) {
+            if self_has_round_clip {
                 child.round_clip = Some((screen, radius));
             }
         }
@@ -5397,6 +5986,8 @@ impl<'a> Walker<'a> {
             }
             list.frame_viewport(layout_rect[3]).1
         });
+        let self_clips = clips_style || virtual_list.is_some();
+        let exit_children_start = exit_start.map(|s| self.items.len() - s);
         // A scrollbar and its opacity this frame, drawn over the content.
         let mut bar: Option<(&Scrollbar, Rect, Rect, f32)> = None;
         if virtual_list.is_none() && node.style().is_some_and(|s| s.scroll) {
@@ -5509,9 +6100,40 @@ impl<'a> Walker<'a> {
                 mask: None,
             });
         }
+        if let Some(start) = exit_start
+            && self.items.len() > start
+        {
+            let mut snap_items = self.items[start..].to_vec();
+            for item in &mut snap_items {
+                if let Item::Editor { caret, frame, .. } = item {
+                    *caret = None;
+                    frame.selection.clear();
+                }
+            }
+            self.exit_snapshots.insert(
+                id,
+                ExitSnapshot {
+                    items: snap_items,
+                    children_start: exit_children_start.unwrap_or(0),
+                    self_clips,
+                    self_has_round_clip,
+                    opacity: shown.opacity,
+                    ancestor_opacity: prev_opacity,
+                    x: shown.x,
+                    y: shown.y,
+                    scale: shown.scale,
+                    ctx_k: ctx.k,
+                    center: [screen[0] + screen[2] / 2., screen[1] + screen[3] / 2.],
+                    parent_clip: ctx.clip,
+                    parent_round_clip: ctx.round_clip,
+                    layer: self.layer,
+                },
+            );
+        }
         if layer {
             self.items.push(Item::PopLayer);
         }
+        self.group_opacity = prev_opacity;
     }
 
     fn placeholder(
@@ -9233,5 +9855,491 @@ mount(ResizeApp);
         assert_eq!(st3.purpose, InputPurpose::Email);
         assert!(!st3.multiline);
         assert_eq!(st3.surrounding.unwrap().text, "dev@jsnir.dev");
+    }
+
+    #[test]
+    fn radius_transition_animates_corners_and_round_clip_and_clamps_spring_overshoot() {
+        let script = r#"
+            function jsnirMount() {
+                jsnir.batch(JSON.stringify({ ops: [
+                    { op: 'create', id: 1, node: { kind: 'column', style: { width: 200, height: 100 } } },
+                    { op: 'create', id: 2, parent: 1, node: {
+                        kind: 'box',
+                        style: { width: 200, height: 100, clip: true },
+                        paint: {
+                            background: 0x223344ff,
+                            radius: [12, 8, 4, 0],
+                            transitions: [{ property: 'radius', duration: 200, easing: 'linear' }]
+                        }
+                    } },
+                    { op: 'create', id: 3, parent: 2, node: {
+                        kind: 'box',
+                        style: { width: 180, height: 80 },
+                        paint: { background: 0xff0000ff }
+                    } }
+                ] }));
+            }
+            function jsnirEvent(_cb, text) {
+                if (text === 'zero-linear') {
+                    jsnir.batch(JSON.stringify({ ops: [
+                        { op: 'setpaint', id: 2, paint: {
+                            background: 0x223344ff,
+                            radius: 0,
+                            transitions: [{ property: 'radius', duration: 200, easing: 'linear' }]
+                        } }
+                    ] }));
+                } else if (text === 'twelve-spring') {
+                    jsnir.batch(JSON.stringify({ ops: [
+                        { op: 'setpaint', id: 2, paint: {
+                            background: 0x223344ff,
+                            radius: 12,
+                            transitions: [{ property: 'radius', duration: 200, easing: 'spring' }]
+                        } }
+                    ] }));
+                } else if (text === 'zero-spring') {
+                    jsnir.batch(JSON.stringify({ ops: [
+                        { op: 'setpaint', id: 2, paint: {
+                            background: 0x223344ff,
+                            radius: 0,
+                            transitions: [{ property: 'radius', duration: 200, easing: 'spring' }]
+                        } }
+                    ] }));
+                }
+            }
+        "#;
+        let mut host = Host::new(script.into(), "{}".into(), TextEngine::default());
+        settle(&mut host);
+
+        let card_color = [0x22, 0x33, 0x44, 0xff];
+        let child_color = [0xff, 0x00, 0x00, 0xff];
+        let find_fill = |frame: &Frame, color: Rgba| {
+            frame
+                .items
+                .iter()
+                .find_map(|item| match item {
+                    Item::Fill {
+                        radius,
+                        top,
+                        round_clip,
+                        ..
+                    } if *top == color => Some((*radius, *round_clip)),
+                    _ => None,
+                })
+                .expect("expected fill item")
+        };
+
+        let t0 = host.now();
+        let (f0, _) = host.render(200., 100., 1., 4096, t0);
+        let (r0, _) = find_fill(&f0, card_color);
+        let (_, child_rc0) = find_fill(&f0, child_color);
+        assert_eq!(r0, [12., 8., 4., 0.]);
+        assert_eq!(child_rc0.unwrap().1, [12., 8., 4., 0.]);
+
+        // Linear 200 ms transition from [12, 8, 4, 0] -> [0, 0, 0, 0].
+        host.push("zero-linear".into());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while host.busy() {
+            assert!(Instant::now() < deadline);
+            host.poll();
+        }
+        let t1 = t0 + 10.;
+        let (f_start, _) = host.render(200., 100., 1., 4096, t1);
+        assert!(f_start.animating);
+        let (f_mid, _) = host.render(200., 100., 1., 4096, t1 + 100.);
+        assert!(f_mid.animating);
+        let (r_mid, _) = find_fill(&f_mid, card_color);
+        let (_, child_rc_mid) = find_fill(&f_mid, child_color);
+        for (got, expected) in r_mid.iter().zip([6., 4., 2., 0.]) {
+            assert!((got - expected).abs() < 0.05, "r_mid={r_mid:?}");
+        }
+        let rc_corners = child_rc_mid.expect("animated round_clip").1;
+        for (got, expected) in rc_corners.iter().zip([6., 4., 2., 0.]) {
+            assert!((got - expected).abs() < 0.05, "round_clip={rc_corners:?}");
+        }
+
+        let (f_end, _) = host.render(200., 100., 1., 4096, t1 + 220.);
+        assert!(!f_end.animating);
+        let (r_end, _) = find_fill(&f_end, card_color);
+        let (_, child_rc_end) = find_fill(&f_end, child_color);
+        assert_eq!(r_end, [0.; 4]);
+        assert!(child_rc_end.is_none());
+
+        // Spring overshoot test: 12 -> 0 overshoots below 0 around 11/28 of duration and must clamp to >= 0.
+        host.push("twelve-spring".into());
+        while host.busy() {
+            host.poll();
+        }
+        let t2 = t1 + 500.;
+        let _ = host.render(200., 100., 1., 4096, t2);
+        let _ = host.render(200., 100., 1., 4096, t2 + 300.);
+        host.push("zero-spring".into());
+        while host.busy() {
+            host.poll();
+        }
+        let t3 = t2 + 400.;
+        let _ = host.render(200., 100., 1., 4096, t3);
+        let (f_over, _) = host.render(200., 100., 1., 4096, t3 + 78.6);
+        let (r_over, _) = find_fill(&f_over, card_color);
+        assert!(
+            r_over.iter().all(|&r| r >= 0.),
+            "spring overshoot must clamp radius >= 0, got {r_over:?}"
+        );
+    }
+
+    #[test]
+    fn exiting_animates_frozen_snapshot_and_handles_id_recycling_and_nested_children() {
+        let script = r#"
+            function jsnirMount() {
+                jsnir.batch(JSON.stringify({ ops: [
+                    { op: 'create', id: 1, node: { kind: 'box', style: { direction: 'row', width: 400, height: 200 } } },
+                    { op: 'create', id: 2, parent: 1, node: {
+                        kind: 'box',
+                        style: { width: 100, height: 200 },
+                        paint: { background: 0x111111ff }
+                    } },
+                    { op: 'create', id: 3, parent: 1, node: {
+                        kind: 'box',
+                        style: { width: 300, height: 200, clip: true }
+                    } },
+                    { op: 'create', id: 4, parent: 3, node: {
+                        kind: 'box',
+                        style: { direction: 'column', width: 300, height: 200, clip: true },
+                        paint: {
+                            background: 0x334455ff,
+                            radius: 12,
+                            exiting: { opacity: 0, x: -200, scale: 0.8 },
+                            transitions: [
+                                { property: 'opacity', duration: 200, easing: 'linear' },
+                                { property: 'x', duration: 200, easing: 'linear' },
+                                { property: 'scale', duration: 200, easing: 'linear' }
+                            ]
+                        }
+                    } },
+                    { op: 'create', id: 5, parent: 4, node: {
+                        kind: 'box',
+                        style: { width: 120, height: 40 },
+                        paint: {
+                            background: 0x667788ff,
+                            exiting: { opacity: 0 },
+                            transitions: [{ property: 'opacity', duration: 200, easing: 'linear' }]
+                        }
+                    } },
+                    { op: 'create', id: 6, parent: 5, node: {
+                        kind: 'text',
+                        text: 'Terminal output',
+                        paint: { color: 0xffffffff }
+                    } },
+                    { op: 'create', id: 7, parent: 1, node: {
+                        kind: 'box',
+                        style: { position: 'fixed', left: 10, top: 10, width: 60, height: 30, layer: 1 },
+                        paint: { background: 0xeeee00ff }
+                    } }
+                ] }));
+            }
+            function jsnirEvent(_cb, text) {
+                if (text === 'bad-remove') {
+                    // Invalid batch (removes non-existent node 999 after removing 4): must be rejected atomically.
+                    jsnir.batch(JSON.stringify({ ops: [
+                        { op: 'remove', id: 4 },
+                        { op: 'remove', id: 999 }
+                    ] }));
+                } else if (text === 'swap') {
+                    // Remove Panel A (id 4, subtree 4,5,6) and immediately recycle id 4 for Panel C.
+                    jsnir.batch(JSON.stringify({ ops: [
+                        { op: 'remove', id: 4 },
+                        { op: 'create', id: 4, parent: 3, node: {
+                            kind: 'box',
+                            style: { direction: 'column', width: 300, height: 200 },
+                            paint: { background: 0x11aa22ff }
+                        } },
+                        { op: 'create', id: 8, parent: 4, node: {
+                            kind: 'text',
+                            text: 'Workspace 2',
+                            paint: { color: 0xffffffff }
+                        } }
+                    ] }));
+                }
+            }
+        "#;
+        let mut host = Host::new(script.into(), "{}".into(), TextEngine::default());
+        settle(&mut host);
+
+        let panel_a_color = [0x33, 0x44, 0x55, 0xff];
+        let panel_c_color = [0x11, 0xaa, 0x22, 0xff];
+        let popover_color = [0xee, 0xee, 0x00, 0xff];
+
+        // First render captures ExitSnapshot for Panel A (id 4) and nested child (id 5).
+        let t0 = host.now();
+        let (f0, _) = host.render(400., 200., 1., 4096, t0);
+        assert!(!f0.animating);
+        assert!(host.exit_snapshots.contains_key(&4));
+        assert!(host.exit_snapshots.contains_key(&5));
+
+        // Rejected batch must NOT promote anything to `leaving` or discard snapshots.
+        host.push("bad-remove".into());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while host.busy() {
+            assert!(Instant::now() < deadline);
+            host.poll();
+        }
+        assert!(host.leaving.is_empty());
+        assert!(host.exit_snapshots.contains_key(&4));
+
+        // Atomic swap: remove Panel A and immediately recycle id 4 for Panel C.
+        host.push("swap".into());
+        while host.busy() {
+            assert!(Instant::now() < deadline);
+            host.poll();
+        }
+        assert_eq!(
+            host.leaving.len(),
+            1,
+            "nested exiting child 5 must NOT create a duplicate Leaving alongside ancestor 4"
+        );
+        let t_start = host.leaving[0].start;
+
+        // Mid-exit at exactly 100 ms (50% of 200 ms linear): opacity=0.5, x=-100, scale=0.9.
+        let (f_mid, _) = host.render(400., 200., 1., 4096, t_start + 100.);
+        assert!(f_mid.animating);
+
+        let layer_opacities: Vec<f32> = f_mid
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::PushLayer { opacity } => Some(*opacity),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(layer_opacities.len(), 1, "{layer_opacities:?}");
+        assert!(
+            (layer_opacities[0] - 0.5).abs() < 0.02,
+            "expected opacity ~0.5, got {}",
+            layer_opacities[0]
+        );
+
+        let panel_a_idx = f_mid
+            .items
+            .iter()
+            .position(|item| matches!(item, Item::Fill { top, .. } if *top == panel_a_color))
+            .expect("frozen Panel A fill");
+        let panel_c_idx = f_mid
+            .items
+            .iter()
+            .position(|item| matches!(item, Item::Fill { top, .. } if *top == panel_c_color))
+            .expect("live Panel C fill");
+        let popover_idx = f_mid
+            .items
+            .iter()
+            .position(|item| matches!(item, Item::Fill { top, .. } if *top == popover_color))
+            .expect("live layer-1 popover fill");
+        assert!(
+            panel_c_idx < panel_a_idx && panel_a_idx < popover_idx,
+            "layer-0 exiting Panel A ({panel_a_idx}) must render after live layer-0 ({panel_c_idx}) and before layer-1 popover ({popover_idx})"
+        );
+
+        match &f_mid.items[panel_a_idx] {
+            Item::Fill {
+                rect,
+                radius,
+                clip,
+                ..
+            } => {
+                // Original rect=[100, 0, 300, 200], center=[250, 100], scale=0.9, dx=-100:
+                // new x = 250 + (100 - 250)*0.9 - 100 = 15, width = 270, height = 180.
+                assert!((rect[0] - 15.).abs() < 0.5, "rect={rect:?}");
+                assert!((rect[2] - 270.).abs() < 0.5, "rect={rect:?}");
+                assert!((rect[3] - 180.).abs() < 0.5, "rect={rect:?}");
+                assert!((radius[0] - 10.8).abs() < 0.2, "radius={radius:?}");
+                // Static parent clip must stay at x >= 100 so sliding left never bleeds over the sidebar.
+                assert_eq!(*clip, [100., 0., 300., 200.]);
+            }
+            _ => unreachable!(),
+        }
+
+        // Frozen text inside nested exiting child must appear exactly once, scaled and clipped at x >= 100.
+        let frozen_texts: Vec<_> = f_mid
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Text {
+                    text, zoom, clip, ..
+                } if text == "Terminal output" => Some((*zoom, *clip)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(frozen_texts.len(), 1, "must not duplicate nested exiting child");
+        assert!((frozen_texts[0].0 - 0.9).abs() < 0.02, "{frozen_texts:?}");
+        assert!(frozen_texts[0].1[0] >= 100., "child clip must stay inside viewport: {:?}", frozen_texts[0].1);
+
+        assert!(f_mid.items.iter().any(|item| matches!(item, Item::Text { text, .. } if text == "Workspace 2")));
+
+        // Past 200 ms: exiting Panel A is dropped and animation stops.
+        let (f_done, _) = host.render(400., 200., 1., 4096, t_start + 220.);
+        assert!(!f_done.animating);
+        assert!(host.leaving.is_empty());
+        assert!(!f_done.items.iter().any(|item| matches!(item, Item::Fill { top, .. } if *top == panel_a_color)));
+        assert!(!f_done.items.iter().any(|item| matches!(item, Item::Text { text, .. } if text == "Terminal output")));
+        assert!(f_done.items.iter().any(|item| matches!(item, Item::Fill { top, .. } if *top == panel_c_color)));
+    }
+
+    #[test]
+    fn exiting_respects_same_batch_setpaint_and_strips_editor_caret() {
+        let script = r#"
+            function jsnirMount() {
+                jsnir.batch(JSON.stringify({ ops: [
+                    { op: 'create', id: 1, node: { kind: 'box', style: { width: 300, height: 100 } } },
+                    { op: 'create', id: 2, parent: 1, node: {
+                        kind: 'box',
+                        style: { width: 200, height: 60 },
+                        paint: {
+                            background: 0x222233ff,
+                            exiting: { x: -100 },
+                            transitions: [{ property: 'x', duration: 200, easing: 'linear' }]
+                        }
+                    } },
+                    { op: 'create', id: 3, parent: 2, node: {
+                        kind: 'input',
+                        text: 'hello',
+                        style: { width: 180, height: 32 }
+                    } }
+                ] }));
+            }
+            function jsnirEvent(_cb, text) {
+                if (text === 'flip-and-remove') {
+                    // Dynamically flip exit direction in the same batch right before removing node 2.
+                    jsnir.batch(JSON.stringify({ ops: [
+                        { op: 'setpaint', id: 2, paint: {
+                            background: 0x222233ff,
+                            exiting: { x: 100 },
+                            transitions: [{ property: 'x', duration: 200, easing: 'linear' }]
+                        } },
+                        { op: 'remove', id: 2 }
+                    ] }));
+                }
+            }
+        "#;
+        let mut host = Host::new(script.into(), "{}".into(), TextEngine::default());
+        settle(&mut host);
+        host.focus(Some(3));
+        host.edit(&[EditorEvent::SelectAll]);
+
+        let t0 = host.now();
+        let (f0, _) = host.render(300., 100., 1., 4096, t0);
+        // Live focused input has caret and non-empty selection before removal.
+        assert!(f0.items.iter().any(|item| matches!(
+            item,
+            Item::Editor { caret: Some(_), frame, .. } if !frame.selection.is_empty()
+        )));
+
+        host.push("flip-and-remove".into());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while host.busy() {
+            assert!(Instant::now() < deadline);
+            host.poll();
+        }
+        assert_eq!(host.leaving.len(), 1);
+        let t_start = host.leaving[0].start;
+
+        // At 100 ms (50%): x moved +50 (NOT -50!) because same-batch SetPaint updated exiting.x = +100.
+        let (f_mid, _) = host.render(300., 100., 1., 4096, t_start + 100.);
+        assert!(f_mid.animating);
+        let fill_x = f_mid
+            .items
+            .iter()
+            .find_map(|item| match item {
+                Item::Fill { rect, top, .. } if *top == [0x22, 0x22, 0x33, 0xff] => Some(rect[0]),
+                _ => None,
+            })
+            .expect("frozen box fill");
+        assert!((fill_x - 50.).abs() < 0.5, "expected +50 shift from same-batch SetPaint, got {fill_x}");
+        let editor = f_mid.items.iter().find_map(|item| match item {
+            Item::Editor {
+                rect, caret, frame, ..
+            } => Some((*rect, *caret, frame.selection.len())),
+            _ => None,
+        });
+        let (ed_rect, ed_caret, ed_sel) = editor.expect("frozen editor item");
+        assert!(ed_caret.is_none(), "frozen exiting input must strip caret");
+        assert_eq!(ed_sel, 0, "frozen exiting input must strip selection");
+        assert!(ed_rect[0] >= 50., "frozen editor must shift with parent: {ed_rect:?}");
+    }
+
+    #[test]
+    fn push_keyed_coalesces_pending_backlog_without_affecting_fifo_push() {
+        let script = r#"
+            var seen = [];
+            function jsnirMount() {
+                jsnir.batch(JSON.stringify({ ops: [
+                    { op: 'create', id: 1, node: { kind: 'column' } },
+                    { op: 'create', id: 2, parent: 1, node: { kind: 'text', text: '' } }
+                ] }));
+            }
+            function jsnirEvent(_cb, text) {
+                if (text === 'block') {
+                    jsnirRequest('hold');
+                }
+                seen.push(text);
+                jsnir.batch(JSON.stringify({ ops: [
+                    { op: 'settext', id: 2, text: seen.join(',') }
+                ] }));
+            }
+        "#;
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        let mut host = Host::with_request_handler(
+            script.into(),
+            "{}".into(),
+            TextEngine::default(),
+            move |_req| {
+                let _ = entered_tx.send(());
+                let _ = release_rx.lock().unwrap().recv();
+                Ok("ok".into())
+            },
+        )
+        .expect("start host with request handler");
+        settle(&mut host);
+
+        // Hold the app thread on the first in-flight event and saturate the remaining MAX_PENDING slots.
+        host.push("block".into());
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("app thread entered blocking request");
+        for i in 1..MAX_PENDING {
+            host.push(format!("fill{i}"));
+        }
+        assert_eq!(host.pending, MAX_PENDING);
+        assert!(host.backlog.is_empty());
+
+        // Queue mixed keyed and unkeyed events while saturated: same keys must coalesce in-place.
+        host.push_keyed("screen", "s1".into());
+        host.push("fifo1".into());
+        host.push_keyed("screen", "s2".into());
+        host.push_keyed("sessions", "sess1".into());
+        host.push_keyed("screen", "s3".into());
+        host.push("fifo2".into());
+        host.push_keyed("sessions", "sess2".into());
+
+        assert_eq!(host.backlog.len(), 4, "expected 2 coalesced keys + 2 FIFO pushes");
+
+        // Release the app thread and drain every queued event.
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while host.busy() {
+            assert!(Instant::now() < deadline, "host did not drain backlog");
+            host.poll();
+            std::thread::yield_now();
+        }
+
+        let delivered = match host.tree.nodes.get(&2) {
+            Some(Node::Text { text, .. }) => text.clone(),
+            other => panic!("expected text node, got {other:?}"),
+        };
+        let mut expected = vec!["block".to_string()];
+        for i in 1..MAX_PENDING {
+            expected.push(format!("fill{i}"));
+        }
+        expected.extend(["s3", "fifo1", "sess2", "fifo2"].into_iter().map(String::from));
+        assert_eq!(delivered, expected.join(","));
     }
 }

@@ -11,11 +11,12 @@ const SPRING: [f32; 29] = [
     0.9953, 0.9966, 0.9978, 0.9988, 1.,
 ];
 
-/// An animatable value: a number, or a straight RGBA color with channels in 0–255.
+/// An animatable value: a number, a straight RGBA color in 0–255, or four unclamped floats (e.g. corner radii).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Value {
     Number(f32),
     Color([f32; 4]),
+    Quad([f32; 4]),
 }
 impl Value {
     pub fn color(rgba: u32) -> Self {
@@ -24,13 +25,20 @@ impl Value {
     pub fn number(self) -> f32 {
         match self {
             Value::Number(v) => v,
-            Value::Color(_) => 0.,
+            Value::Color(_) | Value::Quad(_) => 0.,
         }
     }
     pub fn rgba(self) -> [f32; 4] {
         match self {
             Value::Color(c) => c,
-            Value::Number(_) => [0.; 4],
+            Value::Number(_) | Value::Quad(_) => [0.; 4],
+        }
+    }
+    pub fn quad(self) -> [f32; 4] {
+        match self {
+            Value::Quad(q) => q,
+            Value::Number(v) => [v; 4],
+            Value::Color(_) => [0.; 4],
         }
     }
     fn mix(self, to: Value, t: f32) -> Value {
@@ -40,6 +48,9 @@ impl Value {
             (Value::Color(a), Value::Color(b)) => Value::Color(std::array::from_fn(|i| {
                 (a[i] + (b[i] - a[i]) * t).clamp(0., 255.)
             })),
+            (Value::Quad(a), Value::Quad(b)) => {
+                Value::Quad(std::array::from_fn(|i| a[i] + (b[i] - a[i]) * t))
+            }
             _ => to,
         }
     }
