@@ -5,7 +5,9 @@ edition = "2024"
 license = "MIT"
 
 [features]
-examples = []
+default = ["engine-quickjs"]
+engine-quickjs = ["dep:rquickjs"]
+examples = ["engine-quickjs"]
 stepper = []
 
 [[example]]
@@ -14,19 +16,19 @@ required-features = ["examples"]
 
 [[example]]
 name = "bridge_bench"
-required-features = ["stepper"]
+required-features = ["stepper", "engine-quickjs"]
 
 [[example]]
 name = "frame_bench"
-required-features = ["stepper"]
+required-features = ["stepper", "engine-quickjs"]
 
 [[example]]
 name = "sdk_bench"
-required-features = ["stepper"]
+required-features = ["stepper", "engine-quickjs"]
 
 [dependencies]
 cosmic-text = "=0.14.2"
-rquickjs = "=0.14.0"
+rquickjs = { version = "=0.14.0", optional = true }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 taffy = { version = "=0.15.1", default-features = false, features = ["std", "taffy_tree", "flexbox"] }

@@ -2,12 +2,12 @@
 //! handles pointer, focus and text input, runs transitions and timers, and turns the tree into a list
 //! of drawing items that any backend can paint. JS never runs on this thread.
 use crate::{
-    App, Bridge, Event, HOST_CALLBACK, Inbox, JsEngine, ListBindings, Log, MAX_PENDING,
-    ScriptBundle, Vm,
+    App, Bridge, Event, HOST_CALLBACK, Inbox, ListBindings, Log, MAX_PENDING, ScriptBundle,
     editor::{
         EditorBitmapKey, EditorEvent, EditorFrame, EditorOutput, LineEditor, PointSelection,
         SurroundingText, mask_text,
     },
+    engine::{JsEngine, JsEngineFactory, RequestHandler, VmConfig, VmLimits},
     layout::Layout,
     list::List,
     motion::{Channel, Motion, Value},
@@ -15,11 +15,9 @@ use crate::{
     text::{Mark, TextBitmap, TextEngine, TextStyle, WRAP_SLACK, node_spans, plain_text},
     tree::{
         Anchor, AnchorAlign, Batch, Easing, Icon, InputPurpose, Node, Op, Paint,
-        PlacementSubscription, Position, Property, Replica, ScrollAnchor, ScrollEdge, Scrollbar,
-        Shadow, Side, Span, Transition, Tree, Variant,
+        PlacementSubscription, Position, Property, Replica, ScrollAnchor, ScrollEdge, Scrollbar, Shadow, Side, Span, Transition, Tree, Variant,
     },
 };
-use rquickjs::{Ctx, Exception, Function, function::MutFn};
 use std::{
     cell::RefCell,
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
@@ -182,20 +180,20 @@ pub struct Frame {
     pub ime_area: Option<Rect>,
 }
 
-// Adds the host's globals to a VM before its script runs (`jsnirRequest`).
-type Configure = Box<dyn for<'js> Fn(&Ctx<'js>) -> rquickjs::Result<()> + Send>;
-
 // The bridge carries placement on the host-message channel with a prefix that cannot start a JSON message.
 // It must not enter the ordinary callback dispatcher before its mount token has been checked.
 const PLACEMENT_PREFIX: &str = "\0placement:";
 
-// The app in QuickJS (or another `JsEngine`): `jsnirMount` once, `jsnirEvent` / typed numeric handlers per event.
-// A reload makes a new VM with the same replica, startup arguments and globals.
+// The app in QuickJS (or any `JsEngine` implementation): `jsnirMount` once, `jsnirEvent` / typed numeric
+// handlers per event. A reload uses `reload_in_place` when the engine supports recycling its isolate, or
+// creates a fresh VM via `factory` with the same replica, startup arguments, request handler, and limits.
 struct HostApp {
+    factory: Arc<dyn JsEngineFactory>,
     vm: Box<dyn JsEngine>,
     replica: Rc<RefCell<Replica>>,
     args: String,
-    configure: Configure,
+    request_handler: Option<RequestHandler>,
+    limits: VmLimits,
     placement_epoch: u64,
 }
 impl App for HostApp {
@@ -275,14 +273,25 @@ impl App for HostApp {
         // The old VM's signals carry over to the new one unless this is a hard reload. If the new script fails to load, the old one keeps running.
         let state = preserve_state.then(|| self.vm.reload_state()).flatten();
         let placement_epoch = self.placement_epoch + 1;
-        let vm = Vm::try_load_with(js, self.replica.clone(), state.as_deref(), |c| {
-            c.globals().set("__jsnirArgs", self.args.as_str())?;
-            c.globals()
-                .set("__jsnirPlacementEpoch", placement_epoch.to_string())?;
-            (self.configure)(c)
-        })?;
+        let config = VmConfig {
+            args: self.args.clone(),
+            placement_epoch,
+            previous_state: state,
+            request_handler: self.request_handler.clone(),
+            limits: self.limits,
+        };
+        let bundle = ScriptBundle::Source(js.to_string());
+        if let Some(res) = self
+            .vm
+            .reload_in_place(&bundle, self.replica.clone(), &config)
+        {
+            let mount = res?;
+            self.placement_epoch = placement_epoch;
+            return Ok(mount);
+        }
+        let mut vm = self.factory.create(&bundle, self.replica.clone(), &config)?;
         let mount = vm.call_mount()?;
-        self.vm = Box::new(vm);
+        self.vm = vm;
         self.placement_epoch = placement_epoch;
         Ok(mount)
     }
@@ -706,30 +715,73 @@ const HEIGHT_TRANSITION: Property = Property::Height;
 const SCROLL_HOVER_IDLE_MS: f64 = 100.;
 
 impl Host {
-    /// Starts `script` (SDK + app) on its own thread. `args` is a JSON value the app reads with `args()`.
+    /// Starts `script` (SDK + app) on its own thread using the default QuickJS-ng engine.
+    /// `args` is a JSON value the app reads with `args()`.
+    #[cfg(feature = "engine-quickjs")]
     pub fn new(script: String, args: String, text: TextEngine) -> Self {
         Self::try_new(script, args, text)
             .unwrap_or_else(|error| panic!("app failed to mount: {error}"))
     }
 
-    /// Starts an app and returns an error if the script fails to load or mount.
+    /// Starts an app with the default QuickJS-ng engine and returns an error if the script fails to load or mount.
+    #[cfg(feature = "engine-quickjs")]
     pub fn try_new(script: String, args: String, text: TextEngine) -> Result<Self, String> {
-        Self::start(ScriptBundle::Source(script), args, text, |_| Ok(()))
+        Self::try_new_with_engine(
+            crate::engine::default_factory(),
+            ScriptBundle::Source(script),
+            args,
+            text,
+        )
     }
 
     /// Starts an app from precompiled QuickJS bytecode (`JSNRBC01`, built with [`crate::compile_bytecode`]).
+    #[cfg(feature = "engine-quickjs")]
     pub fn try_new_bytecode(
         bytecode: Vec<u8>,
         args: String,
         text: TextEngine,
     ) -> Result<Self, String> {
-        Self::start(ScriptBundle::Bytecode(bytecode), args, text, |_| Ok(()))
+        Self::try_new_with_engine(
+            crate::engine::default_factory(),
+            ScriptBundle::Bytecode(bytecode),
+            args,
+            text,
+        )
     }
 
-    /// Starts an app from raw bytes, automatically detecting precompiled QuickJS bytecode (`JSNRBC01`)
-    /// or UTF-8 JavaScript source.
+    /// Starts an app from raw bytes using the default QuickJS-ng engine, automatically detecting
+    /// precompiled bytecode (`JSNRBC01`) or UTF-8 JavaScript source.
+    #[cfg(feature = "engine-quickjs")]
     pub fn try_new_auto(bytes: Vec<u8>, args: String, text: TextEngine) -> Result<Self, String> {
-        Self::start(ScriptBundle::from_bytes(bytes)?, args, text, |_| Ok(()))
+        Self::try_new_with_engine(
+            crate::engine::default_factory(),
+            ScriptBundle::from_bytes(bytes)?,
+            args,
+            text,
+        )
+    }
+
+    /// Starts an app with an explicit pluggable [`JsEngineFactory`] (e.g. `QuickJsFactory` or `V8Factory`).
+    pub fn try_new_with_engine(
+        factory: Arc<dyn JsEngineFactory>,
+        bundle: ScriptBundle,
+        args: String,
+        text: TextEngine,
+    ) -> Result<Self, String> {
+        Self::try_new_with_options(factory, bundle, args, text, None, VmLimits::default())
+    }
+
+    /// Starts an app with an explicit [`JsEngineFactory`], optional `jsnirRequest(json)` handler,
+    /// and [`VmLimits`] (memory ceiling + per-call interrupt timeout).
+    pub fn try_new_with_options(
+        factory: Arc<dyn JsEngineFactory>,
+        bundle: ScriptBundle,
+        args: String,
+        text: TextEngine,
+        request_handler: Option<RequestHandler>,
+        limits: VmLimits,
+    ) -> Result<Self, String> {
+        Self::start(factory, bundle, args, text, request_handler, limits)
     }
 
     /// Configures how long `poll()` may wait for a just-sent event's reply before returning to draw the frame.
@@ -738,33 +790,50 @@ impl Host {
         self.wait_budget = budget;
     }
 
-    /// Exposes `jsnirRequest(json)` to an embedded app. The handler runs on the app thread.
+    /// Exposes `jsnirRequest(json)` to an embedded app on the default QuickJS-ng engine.
+    /// The handler runs on the app thread.
+    #[cfg(feature = "engine-quickjs")]
     pub fn with_request_handler(
         script: String,
         args: String,
         text: TextEngine,
         handler: impl FnMut(String) -> Result<String, String> + Send + 'static,
     ) -> Result<Self, String> {
-        // Shared by every VM the app runs in, so a reloaded app keeps the same handler.
-        let handler = Arc::new(Mutex::new(handler));
-        Self::start(ScriptBundle::Source(script), args, text, move |ctx| {
-            let handler = handler.clone();
-            let request = Function::new(
-                ctx.clone(),
-                MutFn::new(move |ctx: Ctx<'_>, json: String| {
-                    let mut handler = handler.lock().expect("request handler");
-                    (*handler)(json).map_err(|error| Exception::throw_message(&ctx, &error))
-                }),
-            )?;
-            ctx.globals().set("jsnirRequest", request)
-        })
+        Self::with_engine_and_request_handler(
+            crate::engine::default_factory(),
+            ScriptBundle::Source(script),
+            args,
+            text,
+            handler,
+        )
     }
 
-    fn start(
+    /// Like [`Self::with_request_handler`], using a custom [`JsEngineFactory`].
+    pub fn with_engine_and_request_handler(
+        factory: Arc<dyn JsEngineFactory>,
         bundle: ScriptBundle,
         args: String,
         text: TextEngine,
-        configure: impl for<'js> Fn(&Ctx<'js>) -> rquickjs::Result<()> + Send + 'static,
+        handler: impl FnMut(String) -> Result<String, String> + Send + 'static,
+    ) -> Result<Self, String> {
+        let handler: RequestHandler = Arc::new(Mutex::new(handler));
+        Self::try_new_with_options(
+            factory,
+            bundle,
+            args,
+            text,
+            Some(handler),
+            VmLimits::default(),
+        )
+    }
+
+    fn start(
+        factory: Arc<dyn JsEngineFactory>,
+        bundle: ScriptBundle,
+        args: String,
+        text: TextEngine,
+        request_handler: Option<RequestHandler>,
+        limits: VmLimits,
     ) -> Result<Self, String> {
         // Never recycle issuers: a handle may outlive its Host. Only uniqueness needs synchronization.
         static NEXT_LIST_ISSUER: AtomicU64 = AtomicU64::new(0);
@@ -779,16 +848,23 @@ impl Host {
         let (mount, bridge) = spawn_app(
             Duration::ZERO,
             move |replica: Rc<RefCell<Replica>>| -> Result<Box<dyn App>, String> {
-                let vm = Vm::try_load_bundle(&bundle, replica.clone(), None, |c| {
-                    c.globals().set("__jsnirArgs", args.as_str())?;
-                    configure(c)
-                })
-                .map_err(|error| format!("script failed to load: {error}"))?;
+                let config = VmConfig {
+                    args: args.clone(),
+                    placement_epoch: 0,
+                    previous_state: None,
+                    request_handler: request_handler.clone(),
+                    limits,
+                };
+                let vm = factory
+                    .create(&bundle, replica.clone(), &config)
+                    .map_err(|error| format!("script failed to load: {error}"))?;
                 Ok(Box::new(HostApp {
-                    vm: Box::new(vm),
+                    factory,
+                    vm,
                     replica,
                     args,
-                    configure: Box::new(configure),
+                    request_handler,
+                    limits,
                     placement_epoch: 0,
                 }))
             },

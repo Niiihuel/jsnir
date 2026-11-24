@@ -1,4 +1,5 @@
-//! JSNIR: a TypeScript app runs in an embedded QuickJS VM on its own thread, and Rust owns the native UI.
+//! JSNIR: a TypeScript app runs in a pluggable embedded JavaScript VM (QuickJS-ng by default,
+//! optional JIT backends via [`engine::JsEngine`]) on its own thread, and Rust owns the native UI.
 //!
 //! The app and the UI share a tree of nodes with stable ids. The app sends versioned batches; the UI
 //! applies each batch whole or rejects it, and never waits for JS to draw a frame.
@@ -8,6 +9,7 @@ mod contract;
 pub mod chat;
 pub mod design;
 pub mod editor;
+pub mod engine;
 #[cfg(any(feature = "examples", test))]
 pub mod history;
 pub mod host;
@@ -72,8 +74,10 @@ pub mod apps {
     pub const RELOAD: &str = include_str!(concat!(env!("OUT_DIR"), "/reload.js"));
 }
 
-use contract::{Columns, CommandBuffer};
-use rquickjs::{CatchResultExt, Ctx, Exception, Function, function::IntoArgs};
+#[cfg(feature = "engine-quickjs")]
+pub use engine::quickjs::compile_bytecode;
+#[cfg(feature = "engine-quickjs")]
+use engine::quickjs::QuickJsEngine as Vm;
 use std::{
     cell::RefCell,
     collections::{HashMap, VecDeque},
@@ -97,29 +101,10 @@ use std::{
 use tree::Node;
 use tree::{Batch, Op, Replica, Tree};
 
-/// Registers a native function on a JS object and records its TypeScript signature from the same declaration.
-/// A leading `Ctx` parameter is the VM context and does not appear in the JS signature.
-macro_rules! def {
-    ($obj:ident, $c:ident, $sigs:ident, $name:literal, || -> $ret:ty $body:block) => {{
-        $sigs.push(format!("{}(): {}", $name, <$ret as $crate::contract::Ts>::ts()));
-        $obj.set($name, Function::new($c.clone(), move || -> $ret { $body })?)?;
-    }};
-    ($obj:ident, $c:ident, $sigs:ident, $name:literal, |$ctx:ident: Ctx, $($arg:ident: $ty:ty),*| -> $ret:ty $body:block) => {{
-        let args: Vec<String> = vec![$(format!("{}: {}", stringify!($arg), <$ty as $crate::contract::Ts>::ts())),*];
-        $sigs.push(format!("{}({}): {}", $name, args.join(", "), <$ret as $crate::contract::Ts>::ts()));
-        $obj.set($name, Function::new($c.clone(), move |$ctx: Ctx, $($arg: $ty),*| -> $ret { $body })?)?;
-    }};
-    ($obj:ident, $c:ident, $sigs:ident, $name:literal, |$($arg:ident: $ty:ty),*| -> $ret:ty $body:block) => {{
-        let args: Vec<String> = vec![$(format!("{}: {}", stringify!($arg), <$ty as $crate::contract::Ts>::ts())),*];
-        $sigs.push(format!("{}({}): {}", $name, args.join(", "), <$ret as $crate::contract::Ts>::ts()));
-        $obj.set($name, Function::new($c.clone(), move |$($arg: $ty),*| -> $ret { $body })?)?;
-    }};
-}
-
 /// Magic header for precompiled JSNIR QuickJS bytecode bundles (`.jsbc`).
 pub const BYTECODE_MAGIC: &[u8; 8] = b"JSNRBC01";
 
-/// Input script for a VM: UTF-8 JavaScript source or precompiled QuickJS bytecode (`JSNRBC01`).
+/// Input script for a VM: UTF-8 JavaScript source or precompiled bytecode (`JSNRBC01` for QuickJS).
 #[derive(Debug, Clone)]
 pub enum ScriptBundle {
     Source(String),
@@ -136,418 +121,6 @@ impl ScriptBundle {
                 .map(Self::Source)
                 .map_err(|e| format!("script is neither JSNIR bytecode nor valid UTF-8: {e}"))
         }
-    }
-}
-
-/// Compiles a JS bundle (SDK + app) ahead of time into QuickJS bytecode (`JSNRBC01` header + raw bytecode).
-/// Loading the resulting bytes skips JS parsing completely on startup.
-pub fn compile_bytecode(js: &str) -> Result<Vec<u8>, String> {
-    let rt = rquickjs::Runtime::new().map_err(|e| format!("VM out of memory: {e}"))?;
-    let ctx = rquickjs::Context::full(&rt).map_err(|e| format!("VM out of memory: {e}"))?;
-    ctx.with(|c| {
-        let res: rquickjs::Result<Vec<u8>> = (|| {
-            let filename = std::ffi::CString::new("<jsnir-bundle>").unwrap();
-            let flags = (rquickjs::qjs::JS_EVAL_TYPE_GLOBAL
-                | rquickjs::qjs::JS_EVAL_FLAG_COMPILE_ONLY) as i32;
-            let raw = c.as_raw().as_ptr();
-            let mut src = Vec::with_capacity(js.len() + 1);
-            src.extend_from_slice(js.as_bytes());
-            src.push(0);
-            // SAFETY: `src` is null-terminated with length `js.len()` and lives across `JS_Eval`.
-            let func = unsafe {
-                rquickjs::qjs::JS_Eval(
-                    raw,
-                    src.as_ptr().cast(),
-                    js.len() as _,
-                    filename.as_ptr(),
-                    flags,
-                )
-            };
-            if unsafe { rquickjs::qjs::JS_IsException(func) } {
-                return Err(rquickjs::Error::Exception);
-            }
-            let mut len = std::mem::MaybeUninit::uninit();
-            // SAFETY: `func` is a valid compiled JS bytecode function owned by `raw`.
-            let buf = unsafe {
-                let b = rquickjs::qjs::JS_WriteObject(
-                    raw,
-                    len.as_mut_ptr(),
-                    func,
-                    rquickjs::qjs::JS_WRITE_OBJ_BYTECODE as i32,
-                );
-                rquickjs::qjs::JS_FreeValue(raw, func);
-                b
-            };
-            if buf.is_null() {
-                return Err(rquickjs::Error::Exception);
-            }
-            let len = unsafe { len.assume_init() };
-            let mut out = Vec::with_capacity(BYTECODE_MAGIC.len() + len as usize);
-            out.extend_from_slice(BYTECODE_MAGIC);
-            // SAFETY: QuickJS returned `len` valid bytes at `buf`.
-            out.extend_from_slice(unsafe { std::slice::from_raw_parts(buf, len as usize) });
-            unsafe { rquickjs::qjs::js_free(raw, buf.cast()) };
-            Ok(out)
-        })();
-        res.catch(&c).map_err(|e| e.to_string())
-    })
-}
-
-fn eval_bytecode(c: &Ctx<'_>, bytes: &[u8]) -> rquickjs::Result<()> {
-    let payload = bytes
-        .strip_prefix(BYTECODE_MAGIC)
-        .ok_or_else(|| Exception::throw_type(c, "invalid JSNIR bytecode header"))?;
-    let raw = c.as_raw().as_ptr();
-    // SAFETY: Without `JS_READ_OBJ_ROM_DATA`, QuickJS copies bytecode into VM-owned memory.
-    let obj = unsafe {
-        rquickjs::qjs::JS_ReadObject(
-            raw,
-            payload.as_ptr(),
-            payload.len() as _,
-            rquickjs::qjs::JS_READ_OBJ_BYTECODE as i32,
-        )
-    };
-    if unsafe { rquickjs::qjs::JS_IsException(obj) } {
-        return Err(rquickjs::Error::Exception);
-    }
-    let val = unsafe { rquickjs::qjs::JS_EvalFunction(raw, obj) };
-    if unsafe { rquickjs::qjs::JS_IsException(val) } {
-        return Err(rquickjs::Error::Exception);
-    }
-    unsafe { rquickjs::qjs::JS_FreeValue(raw, val) };
-    Ok(())
-}
-
-/// Engine-agnostic boundary between the JSNIR host protocol and the underlying JavaScript VM.
-/// Default implementation is [`Vm`] (QuickJS-ng); optional JIT or V8 backends can implement this trait
-/// without changing `Host`, `Tree`, or the TSX SDK.
-pub(crate) trait JsEngine {
-    fn sync(&mut self, view: &Tree, ids: Option<&[u16]>);
-    fn call_mount(&self) -> Result<Vec<Op>, String>;
-    fn call_event(&self, callback: u16, text: &str, guard: Option<&str>) -> Result<Vec<Op>, String>;
-    fn call_drag(
-        &self,
-        callback: u16,
-        phase: u8,
-        x: f32,
-        y: f32,
-        sx: f32,
-        sy: f32,
-        dx: f32,
-        dy: f32,
-        guard: Option<&str>,
-    ) -> Result<Vec<Op>, String>;
-    fn call_scroll(
-        &self,
-        callback: u16,
-        top: f32,
-        height: f32,
-        client: f32,
-        guard: Option<&str>,
-    ) -> Result<Vec<Op>, String>;
-    fn call_context_menu(
-        &self,
-        callback: u16,
-        x: f32,
-        y: f32,
-        guard: Option<&str>,
-    ) -> Result<Vec<Op>, String>;
-    fn call_placement(&self, text: &str) -> Result<Vec<Op>, String>;
-    fn call_virtual_list(&self, delta: &str) -> Result<(String, Vec<Op>), String>;
-    fn reload_state(&self) -> Option<String>;
-}
-
-/// A QuickJS VM. It is created and used on the app thread only; the UI thread never touches it.
-struct Vm {
-    // Persistent JS roots (`columns`, `_cmd`) MUST be declared before `ctx` and `_rt` so they drop
-    // while `ctx` is still alive and `JS_FreeRuntime` sees an empty GC object list.
-    columns: Columns,
-    _cmd: CommandBuffer,
-    ctx: rquickjs::Context,
-    // Native `jsnir` functions push operations here; the call that triggered them collects the batch.
-    ops: Rc<RefCell<Vec<Op>>>,
-    has_jsnir_drag: bool,
-    has_jsnir_scroll: bool,
-    has_jsnir_context_menu: bool,
-    signatures: Vec<String>,
-    _rt: rquickjs::Runtime,
-}
-impl Vm {
-    /// The counter app (app/counter.tsx).
-    #[cfg(feature = "examples")]
-    fn counter(replica: Rc<RefCell<Replica>>) -> Self {
-        Self::load(
-            include_str!(concat!(env!("OUT_DIR"), "/counter.js")),
-            replica,
-        )
-    }
-    /// Text reads go to `replica`'s view, which lives on the app thread. Numbers reach JS through the columns (see `sync`).
-    fn load(js: &str, replica: Rc<RefCell<Replica>>) -> Self {
-        Self::try_load(js, replica, None).unwrap_or_else(|e| panic!("script failed to load: {e}"))
-    }
-    /// Like `load`, but returns the script error. On a live reload, `previous` is the signal state of the
-    /// old VM; the app finds it in `__jsnirPreviousState` before it runs.
-    fn try_load(
-        js: &str,
-        replica: Rc<RefCell<Replica>>,
-        previous: Option<&str>,
-    ) -> Result<Self, String> {
-        Self::try_load_with(js, replica, previous, |_| Ok(()))
-    }
-    fn try_load_with(
-        js: &str,
-        replica: Rc<RefCell<Replica>>,
-        previous: Option<&str>,
-        configure: impl for<'js> FnOnce(&Ctx<'js>) -> rquickjs::Result<()>,
-    ) -> Result<Self, String> {
-        Self::try_load_bundle(
-            &ScriptBundle::Source(js.to_string()),
-            replica,
-            previous,
-            configure,
-        )
-    }
-    fn try_load_bundle(
-        bundle: &ScriptBundle,
-        replica: Rc<RefCell<Replica>>,
-        previous: Option<&str>,
-        configure: impl for<'js> FnOnce(&Ctx<'js>) -> rquickjs::Result<()>,
-    ) -> Result<Self, String> {
-        let rt = rquickjs::Runtime::new().expect("VM out of memory");
-        let ctx = rquickjs::Context::full(&rt).expect("VM out of memory");
-        let ops: Rc<RefCell<Vec<Op>>> = Rc::default();
-        let mut sigs = Vec::new();
-        let (columns, cmd, has_jsnir_drag, has_jsnir_scroll, has_jsnir_context_menu) = ctx.with(|c| {
-            let r = (|| {
-                let jsnir = rquickjs::Object::new(c.clone())?;
-                // Frequent writes are plain calls with numbers, no JSON. rquickjs rejects numbers outside
-                // u16; the tree validates the rest when it applies the batch.
-                let sink = ops.clone();
-                def!(jsnir, c, sigs, "set", |id: u16, value: u16| -> () {
-                    sink.borrow_mut().push(Op::Set { id, value })
-                });
-                // Structure: a whole subtree crosses in one call. Creating nodes is rare and the JSON
-                // cost is amortized over the subtree.
-                let sink = ops.clone();
-                def!(
-                    jsnir,
-                    c,
-                    sigs,
-                    "batch",
-                    |ctx: Ctx, json: String| -> rquickjs::Result<()> {
-                        let batch: Batch = serde_json::from_str(&json).map_err(|e| {
-                            Exception::throw_type(&ctx, &format!("invalid batch: {e}"))
-                        })?;
-                        sink.borrow_mut().extend(batch.ops);
-                        Ok(())
-                    }
-                );
-                // Binary command buffer: flushes `words` packed u32/f32 commands from `jsnir.cmd` without JSON.
-                let (cmd, cmd_reader) = CommandBuffer::install(&c, &jsnir)?;
-                let cmd_reader_num = cmd_reader.clone();
-                let sink = ops.clone();
-                def!(
-                    jsnir,
-                    c,
-                    sigs,
-                    "commit",
-                    |ctx: Ctx, words: u32| -> rquickjs::Result<()> {
-                        let mut ops = sink.borrow_mut();
-                        cmd_reader_num
-                            .decode(words as usize, &mut [], &mut ops)
-                            .map_err(|e| Exception::throw_type(&ctx, &format!("invalid cmd: {e}")))
-                    }
-                );
-                let sink = ops.clone();
-                def!(
-                    jsnir,
-                    c,
-                    sigs,
-                    "commitStrings",
-                    |ctx: Ctx, words: u32, strings: Vec<String>| -> rquickjs::Result<()> {
-                        let mut strings = strings;
-                        let mut ops = sink.borrow_mut();
-                        cmd_reader
-                            .decode(words as usize, &mut strings, &mut ops)
-                            .map_err(|e| Exception::throw_type(&ctx, &format!("invalid cmd: {e}")))
-                    }
-                );
-                // An error the app survives, such as a cleanup that threw while its subtree was removed.
-                def!(jsnir, c, sigs, "report", |message: String| -> () {
-                    eprintln!("app error, the event keeps its changes: {message}")
-                });
-                let sink = ops.clone();
-                def!(jsnir, c, sigs, "setText", |id: u16, text: String| -> () {
-                    sink.borrow_mut().push(Op::SetText { id, text })
-                });
-                // Text is transcoded on the way (UTF-8 in Rust, 8 or 16 bits in JS), so it goes per call and per id.
-                let read = replica.clone();
-                def!(jsnir, c, sigs, "readText", |id: u16| -> Option<String> {
-                    read.borrow().view.text(id).map(str::to_owned)
-                });
-                c.globals().set("jsnir", jsnir.clone())?;
-                if let Some(state) = previous {
-                    c.globals().set("__jsnirPreviousState", state)?;
-                }
-                let columns = Columns::install(&c, &jsnir)?;
-                configure(&c)?;
-                match bundle {
-                    ScriptBundle::Source(js) => c.eval::<(), _>(js.as_str())?,
-                    ScriptBundle::Bytecode(bytes) => eval_bytecode(&c, bytes)?,
-                }
-                let globals = c.globals();
-                let has_drag = globals.get::<_, Function>("jsnirDrag").is_ok();
-                let has_scroll = globals.get::<_, Function>("jsnirScroll").is_ok();
-                let has_context_menu = globals.get::<_, Function>("jsnirContextMenu").is_ok();
-                Ok((columns, cmd, has_drag, has_scroll, has_context_menu))
-            })();
-            r.catch(&c).map_err(|e| e.to_string())
-        })?;
-        Ok(Self {
-            ctx,
-            ops,
-            columns,
-            _cmd: cmd,
-            has_jsnir_drag,
-            has_jsnir_scroll,
-            has_jsnir_context_menu,
-            signatures: sigs,
-            _rt: rt,
-        })
-    }
-    /// Copies the touched nodes of the view (or all of them with `None`) into the shared columns.
-    fn sync(&mut self, view: &Tree, ids: Option<&[u16]>) {
-        let Self { ctx, columns, .. } = self;
-        ctx.with(|c| columns.sync(&c, view, ids));
-    }
-    fn try_invoke<R: for<'js> rquickjs::FromJs<'js>>(
-        &self,
-        name: &str,
-        args: impl for<'js> IntoArgs<'js>,
-    ) -> Result<R, String> {
-        self.ctx.with(|c| {
-            let r: rquickjs::Result<R> = c
-                .globals()
-                .get::<_, Function>(name)
-                .and_then(|f| f.call(args));
-            r.catch(&c).map_err(|e| format!("{name}: {e}"))
-        })
-    }
-    /// Calls a global app function and collects the operations it emitted through `jsnir`.
-    /// If the function throws, the operations it already emitted are dropped: a batch is all or nothing.
-    fn try_call(&self, name: &str, args: impl for<'js> IntoArgs<'js>) -> Result<Vec<Op>, String> {
-        self.try_call_with::<()>(name, args).map(|((), ops)| ops)
-    }
-    fn try_call_with<R: for<'js> rquickjs::FromJs<'js>>(
-        &self,
-        name: &str,
-        args: impl for<'js> IntoArgs<'js>,
-    ) -> Result<(R, Vec<Op>), String> {
-        self.ops.borrow_mut().clear();
-        let result = self.try_invoke::<R>(name, args);
-        let ops = std::mem::take(&mut *self.ops.borrow_mut());
-        result.map(|value| (value, ops))
-    }
-    #[cfg(all(test, feature = "examples"))]
-    fn call(&self, name: &str, args: impl for<'js> IntoArgs<'js>) -> Vec<Op> {
-        self.try_call(name, args).unwrap_or_else(|e| panic!("{e}"))
-    }
-}
-
-impl JsEngine for Vm {
-    fn sync(&mut self, view: &Tree, ids: Option<&[u16]>) {
-        Vm::sync(self, view, ids)
-    }
-    fn call_mount(&self) -> Result<Vec<Op>, String> {
-        self.try_call("jsnirMount", ())
-    }
-    fn call_event(&self, callback: u16, text: &str, guard: Option<&str>) -> Result<Vec<Op>, String> {
-        match guard {
-            Some(guard) => self.try_call("jsnirEvent", (callback, text, guard)),
-            None => self.try_call("jsnirEvent", (callback, text)),
-        }
-    }
-    fn call_drag(
-        &self,
-        callback: u16,
-        phase: u8,
-        x: f32,
-        y: f32,
-        sx: f32,
-        sy: f32,
-        dx: f32,
-        dy: f32,
-        guard: Option<&str>,
-    ) -> Result<Vec<Op>, String> {
-        if self.has_jsnir_drag {
-            match guard {
-                Some(guard) => {
-                    self.try_call("jsnirDrag", (callback, phase, x, y, sx, sy, guard))
-                }
-                None => self.try_call("jsnirDrag", (callback, phase, x, y, sx, sy)),
-            }
-        } else {
-            let phase_str = match phase {
-                0 => "start",
-                1 => "move",
-                _ => "end",
-            };
-            let json = serde_json::json!({
-                "phase": phase_str,
-                "x": x,
-                "y": y,
-                "startX": sx,
-                "startY": sy,
-                "dx": dx,
-                "dy": dy,
-            })
-            .to_string();
-            self.call_event(callback, &json, guard)
-        }
-    }
-    fn call_scroll(
-        &self,
-        callback: u16,
-        top: f32,
-        height: f32,
-        client: f32,
-        guard: Option<&str>,
-    ) -> Result<Vec<Op>, String> {
-        if self.has_jsnir_scroll {
-            match guard {
-                Some(guard) => self.try_call("jsnirScroll", (callback, top, height, client, guard)),
-                None => self.try_call("jsnirScroll", (callback, top, height, client)),
-            }
-        } else {
-            let json = format!(r#"{{"top":{top},"height":{height},"client":{client}}}"#);
-            self.call_event(callback, &json, guard)
-        }
-    }
-    fn call_context_menu(
-        &self,
-        callback: u16,
-        x: f32,
-        y: f32,
-        guard: Option<&str>,
-    ) -> Result<Vec<Op>, String> {
-        if self.has_jsnir_context_menu {
-            match guard {
-                Some(guard) => self.try_call("jsnirContextMenu", (callback, x, y, guard)),
-                None => self.try_call("jsnirContextMenu", (callback, x, y)),
-            }
-        } else {
-            let json = serde_json::json!({ "x": x, "y": y }).to_string();
-            self.call_event(callback, &json, guard)
-        }
-    }
-    fn call_placement(&self, text: &str) -> Result<Vec<Op>, String> {
-        self.try_call("jsnirPlacement", (text,))
-    }
-    fn call_virtual_list(&self, delta: &str) -> Result<(String, Vec<Op>), String> {
-        self.try_call_with::<String>("jsnirVirtualList", (delta,))
-    }
-    fn reload_state(&self) -> Option<String> {
-        self.try_invoke::<String>("jsnirReloadState", ()).ok()
     }
 }
 
@@ -995,6 +568,7 @@ impl App for CounterJs {
 }
 
 /// TypeScript declarations for `jsnir`, generated from the contract and the registered functions.
+#[cfg(feature = "engine-quickjs")]
 pub fn dts() -> String {
     contract::dts(&Vm::load("", Rc::default()).signatures)
 }
@@ -1230,6 +804,10 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "engine-quickjs")]
+    use crate::engine::JsEngine;
+    #[cfg(feature = "engine-quickjs")]
+    use rquickjs::CatchResultExt;
     #[cfg(feature = "examples")]
     #[test]
     fn ordered_burst_and_wrap() {
@@ -1252,6 +830,7 @@ mod tests {
             assert_eq!((r.version(), r.view.value), (1025, 24));
         }
     }
+    #[cfg(feature = "engine-quickjs")]
     #[test]
     fn contract_dts_is_generated_from_rust() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/app/jsnir.d.ts");
@@ -1543,9 +1122,10 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
+    #[cfg(feature = "engine-quickjs")]
     #[test]
     fn binary_command_buffer_decodes_all_ops_without_json() {
-        let vm = Vm::load(
+        let mut vm = Vm::load(
             r#"
             function jsnirMount() {
                 var u = jsnir.cmd;
@@ -1706,6 +1286,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "engine-quickjs")]
     #[test]
     fn bytecode_aot_roundtrip_mounts_and_handles_events() {
         let js = r#"
@@ -1736,9 +1317,10 @@ mod tests {
         assert_eq!(host.tree.text(2), Some("count:1"));
     }
 
+    #[cfg(feature = "engine-quickjs")]
     #[test]
     fn binary_create_and_string_pool_decode_nodes_variants_and_text() {
-        let vm = Vm::load(
+        let mut vm = Vm::load(
             r#"
             function jsnirMount() {
                 var u = jsnir.cmd;
@@ -1807,7 +1389,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "stepper")]
+    #[cfg(all(feature = "stepper", feature = "engine-quickjs"))]
     #[test]
     fn binary_sdk_roundtrip_covers_all_opcodes_rich_paint_spans_and_overflow_flush() {
         let app = r#"
@@ -1921,7 +1503,7 @@ mod tests {
             }
             mount(App);
         "#;
-        let vm = Vm::load(&format!("{}\n{app}", crate::apps::SDK), Rc::default());
+        let mut vm = Vm::load(&format!("{}\n{app}", crate::apps::SDK), Rc::default());
         let mount_ops = vm.call_mount().expect("mount binary sdk");
         let (json_after_mount, bin_after_mount): (u32, u32) = vm.ctx.with(|c| {
             let j: u32 = c.eval("jsonCalls").unwrap();
@@ -2083,5 +1665,69 @@ mod tests {
             ops: ev_ops,
         })
         .expect("event batch must apply cleanly");
+    }
+
+    #[cfg(feature = "engine-quickjs")]
+    #[test]
+    fn vm_limits_interrupt_infinite_loop_and_enforce_memory_ceiling() {
+        use crate::engine::{JsEngineFactory, VmConfig, VmLimits, quickjs::QuickJsFactory};
+
+        let script = r#"
+            var n = 0;
+            function jsnirMount() {
+                jsnir.batch(JSON.stringify({ ops: [
+                    { op: 'create', id: 1, node: { kind: 'text', text: 'ok:0' } }
+                ] }));
+            }
+            function jsnirEvent(cb) {
+                if (cb === 1) {
+                    jsnir.setText(1, 'partial');
+                    while (true) {}
+                }
+                if (cb === 2) {
+                    var junk = [];
+                    for (var i = 0; i < 100000; i++) junk.push('x'.repeat(1024));
+                }
+                if (cb === 3) {
+                    n += 1;
+                    jsnir.setText(1, 'ok:' + n);
+                }
+            }
+        "#;
+        let factory = QuickJsFactory;
+        let config = VmConfig {
+            args: "{}".into(),
+            limits: VmLimits {
+                max_memory_bytes: Some(8 * 1024 * 1024),
+                max_call_duration: Some(Duration::from_millis(25)),
+            },
+            ..Default::default()
+        };
+        let mut engine = factory
+            .create(&ScriptBundle::Source(script.into()), Rc::default(), &config)
+            .expect("load vm with limits");
+        assert_eq!(engine.name(), "quickjs-ng");
+        let mount = engine.call_mount().expect("mount");
+        assert_eq!(mount.len(), 1);
+        let mem = engine.memory_usage().expect("memory usage");
+        assert!(mem.used_bytes > 0 && mem.total_bytes == 8 * 1024 * 1024);
+
+        // Infinite loop is interrupted without hanging and discards partial ops.
+        let hang = engine.call_event(1, "", None);
+        assert!(hang.is_err(), "expected interrupt error, got {hang:?}");
+
+        // Runaway allocation hits memory ceiling cleanly.
+        let oom = engine.call_event(2, "", None);
+        assert!(oom.is_err(), "expected OOM error, got {oom:?}");
+
+        // VM remains healthy for subsequent events.
+        let ok = engine.call_event(3, "", None).expect("recovery event");
+        assert_eq!(
+            ok,
+            vec![Op::SetText {
+                id: 1,
+                text: "ok:1".into()
+            }]
+        );
     }
 }

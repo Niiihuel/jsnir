@@ -15,7 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-jsnir = { path = "../..", default-features = false }
+jsnir = { path = "../..", default-features = false, features = ["engine-quickjs"] }
 jsnir-gpu = { path = "../../backends/gpu" }
 notify-debouncer-mini = "0.7"
 oxc = { version = "0.159", features = ["ast_visit", "semantic", "transformer", "codegen"] }

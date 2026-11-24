@@ -10,9 +10,9 @@ use crate::tree::{
     Radius, ScrollAnchor, ScrollEdge, Scrollbar, Shadow, Side, Span, Starting, Style, TextAlign,
     Transition, Tree, Variant,
 };
-use rquickjs::{ArrayBuffer, ArrayBufferSource, Ctx, Object, Persistent, TypedArray};
 
 /// TypeScript type of a value that crosses the boundary.
+#[cfg_attr(not(feature = "engine-quickjs"), allow(dead_code))]
 pub trait Ts {
     fn ts() -> String;
 }
@@ -25,7 +25,7 @@ impl<T: Ts> Ts for Option<T> {
         format!("{} | undefined", T::ts())
     }
 }
-impl<T: Ts> Ts for rquickjs::Result<T> {
+impl<T: Ts, E> Ts for std::result::Result<T, E> {
     fn ts() -> String {
         T::ts()
     }
@@ -50,13 +50,9 @@ impl<T: Ts, const N: usize> Ts for [T; N] {
         format!("[{}]", vec![T::ts(); N].join(", "))
     }
 }
-impl Ts for TypedArray<'_, i32> {
-    fn ts() -> String {
-        "Int32Array".into()
-    }
-}
 
 /// `snake_case` Rust name → `camelCase` JS name, the convention on each side of the boundary.
+#[cfg_attr(not(feature = "engine-quickjs"), allow(dead_code))]
 pub(crate) fn camel(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     let mut upper = false;
@@ -94,6 +90,7 @@ macro_rules! contract_strings {
         }
         impl $name {
             /// TypeScript declaration: the union of the accepted strings.
+            #[cfg_attr(not(feature = "engine-quickjs"), allow(dead_code))]
             pub(crate) fn ts_decl() -> String {
                 let names = [stringify!($first) $(, stringify!($variant))*];
                 let literals: Vec<String> = names
@@ -144,6 +141,7 @@ macro_rules! contract_enum {
         }
         impl $name {
             /// TypeScript declaration: the union of the variants the app may send.
+            #[cfg_attr(not(feature = "engine-quickjs"), allow(dead_code))]
             pub(crate) fn ts_decl() -> String {
                 let mut variants: Vec<String> = Vec::new();
                 $(
@@ -188,6 +186,7 @@ macro_rules! contract_struct {
         }
         impl $name {
             /// TypeScript declaration: every field is optional, as in serde.
+            #[cfg_attr(not(feature = "engine-quickjs"), allow(dead_code))]
             pub(crate) fn ts_decl() -> String {
                 let fields: Vec<String> = vec![$(format!("{}?: {}", $crate::contract::camel(stringify!($field)), <$fty as $crate::contract::Ts>::ts())),*];
                 format!("interface {} {{ {} }}\n", $ts, fields.join("; "))
@@ -207,6 +206,7 @@ macro_rules! contract_columns {
                 $value
             }),*]
         }
+        #[cfg_attr(not(feature = "engine-quickjs"), allow(dead_code))]
         fn columns_dts() -> String {
             let mut out = String::new();
             $(
@@ -244,197 +244,8 @@ contract_columns! {
     clientHeight: |t, id| t.scroll(id)[2] as i32,
 }
 
-/// Block of i32 on the Rust heap that backs an immutable `ArrayBuffer` for JS.
-pub(crate) struct Column(*mut [i32]);
-impl Column {
-    pub(crate) fn new(values: Vec<i32>) -> Self {
-        Self(Box::into_raw(values.into_boxed_slice()))
-    }
-}
-// SAFETY: the block neither moves nor is freed until JS releases the buffer and Drop runs.
-unsafe impl ArrayBufferSource for Column {
-    fn as_ptr(&self) -> *mut u8 {
-        self.0 as *mut u8
-    }
-    fn len(&self) -> usize {
-        self.0.len() * 4
-    }
-}
-impl Drop for Column {
-    fn drop(&mut self) {
-        drop(unsafe { Box::from_raw(self.0) })
-    }
-}
-/// Shares values with JS: returns the view JS sees, the `Persistent` root keeping the buffer alive,
-/// and the stable raw pointer on the Rust heap for zero-overhead writes between callbacks.
-/// QuickJS-ng 0.16.2 silently ignores JS writes to an immutable buffer.
-pub(crate) fn share<'js>(
-    c: &Ctx<'js>,
-    values: Vec<i32>,
-) -> (TypedArray<'js, i32>, Persistent<ArrayBuffer<'static>>, *mut i32) {
-    let col = Column::new(values);
-    let ptr = col.0 as *mut i32;
-    let ab = ArrayBuffer::from_source_immutable(c.clone(), col).expect("column out of memory");
-    let view = TypedArray::<i32>::from_arraybuffer(ab.clone()).expect("column view");
-    // Persistent keeps the GC from freeing the block while Rust writes it.
-    (view, Persistent::save(c, ab), ptr)
-}
-
-/// A VM's columns, installed as `jsnir.columns`. They grow when a larger id appears.
-pub(crate) struct Columns {
-    buffers: Vec<(Persistent<ArrayBuffer<'static>>, *mut i32)>,
-    len: usize,
-}
-impl Columns {
-    pub(crate) fn install<'js>(c: &Ctx<'js>, jsnir: &Object<'js>) -> rquickjs::Result<Self> {
-        let col = Object::new(c.clone())?;
-        jsnir.set("columns", col)?;
-        let mut columns = Self {
-            buffers: Vec::new(),
-            len: 0,
-        };
-        columns.rebuild(c, &Tree::default(), 64)?;
-        Ok(columns)
-    }
-    // Creates new columns with the full state of the view and hangs them from `jsnir.columns`.
-    fn rebuild(&mut self, c: &Ctx, view: &Tree, len: usize) -> rquickjs::Result<()> {
-        let target: Object = c.globals().get::<_, Object>("jsnir")?.get("columns")?;
-        let rows: Vec<_> = (0..len).map(|id| project(view, id as u16)).collect();
-        self.buffers.clear();
-        for (k, name) in COLUMNS.iter().enumerate() {
-            let (js, rust, ptr) = share(c, rows.iter().map(|r| r[k]).collect());
-            target.set(*name, js)?;
-            self.buffers.push((rust, ptr));
-        }
-        self.len = len;
-        Ok(())
-    }
-    /// Copies the given nodes of the view to the columns, or all of them with `None`. Only while no JS runs.
-    pub(crate) fn sync(&mut self, c: &Ctx, view: &Tree, ids: Option<&[u16]>) {
-        let needed = view.nodes.end();
-        if needed > self.len {
-            // shortcut: growing copies everything; trees of hundreds of thousands of nodes would want growth by blocks.
-            let len = needed.max(self.len * 2);
-            self.rebuild(c, view, len).expect("columns");
-            return;
-        }
-        if let Some(ids) = ids {
-            for &id in ids {
-                let idx = id as usize;
-                assert!(idx < self.len, "id outside the column");
-                let row = project(view, id);
-                for (k, &(_, ptr)) in self.buffers.iter().enumerate() {
-                    // SAFETY: `Persistent` keeps the `Column` heap slice alive; JS is not running; `idx < self.len`.
-                    unsafe { ptr.add(idx).write(row[k]) };
-                }
-            }
-        } else {
-            // In-place full refresh without reallocating 11 ArrayBuffers or touching JS GC.
-            for idx in 0..self.len {
-                let row = project(view, idx as u16);
-                for (k, &(_, ptr)) in self.buffers.iter().enumerate() {
-                    // SAFETY: same as above.
-                    unsafe { ptr.add(idx).write(row[k]) };
-                }
-            }
-        }
-    }
-}
-
-use std::{cell::Cell, rc::Rc};
-
 /// Number of `u32` words (64 KiB) in the shared JS→Rust binary command buffer (`jsnir.cmd` / `jsnir.cmdF32`).
-pub(crate) const CMD_WORDS: usize = 16_384;
-
-/// Backing storage for the mutable shared JS→Rust binary command buffer.
-struct CmdStorage {
-    data: *mut [u32],
-    alive: Rc<Cell<bool>>,
-}
-impl CmdStorage {
-    fn new(words: usize, alive: Rc<Cell<bool>>) -> Self {
-        Self {
-            data: Box::into_raw(vec![0u32; words].into_boxed_slice()),
-            alive,
-        }
-    }
-}
-// SAFETY: `CmdStorage` owns its heap allocation until JS drops the `ArrayBuffer`.
-unsafe impl ArrayBufferSource for CmdStorage {
-    fn as_ptr(&self) -> *mut u8 {
-        self.data as *mut u8
-    }
-    fn len(&self) -> usize {
-        self.data.len() * 4
-    }
-}
-impl Drop for CmdStorage {
-    fn drop(&mut self) {
-        self.alive.set(false);
-        drop(unsafe { Box::from_raw(self.data) });
-    }
-}
-
-/// Read handle passed to the `jsnir.commit` closure without retaining any QuickJS GC root.
-#[derive(Clone)]
-pub(crate) struct CommandReader {
-    ptr: *const u32,
-    cap: usize,
-    alive: Rc<Cell<bool>>,
-}
-impl CommandReader {
-    pub(crate) fn decode(
-        &self,
-        words: usize,
-        strings: &mut [String],
-        out: &mut Vec<Op>,
-    ) -> Result<(), String> {
-        if !self.alive.get() {
-            return Err("command buffer detached".to_string());
-        }
-        if words > self.cap {
-            return Err(format!(
-                "command buffer length {words} exceeds capacity {}",
-                self.cap
-            ));
-        }
-        // SAFETY: `alive` is true so `CmdStorage`'s `Box<[u32]>` of `self.cap` words is still allocated,
-        // `u32`-aligned, and no JS runs during `commit`.
-        let slice = unsafe { std::slice::from_raw_parts(self.ptr, words) };
-        decode_commands(slice, strings, out)
-    }
-}
-
-/// Shared mutable binary command buffer exposed as `jsnir.cmd` (`Uint32Array`) and `jsnir.cmdF32` (`Float32Array`).
-/// JS encodes frequent mutations as packed 32-bit words without `JSON.stringify`, then calls `jsnir.commit(words)`.
-pub(crate) struct CommandBuffer {
-    _buffer: Persistent<ArrayBuffer<'static>>,
-}
-impl CommandBuffer {
-    pub(crate) fn install<'js>(
-        c: &Ctx<'js>,
-        jsnir: &Object<'js>,
-    ) -> rquickjs::Result<(Self, CommandReader)> {
-        let alive = Rc::new(Cell::new(true));
-        let storage = CmdStorage::new(CMD_WORDS, alive.clone());
-        let ptr = storage.data as *const u32;
-        let ab = ArrayBuffer::from_source(c.clone(), storage)?;
-        let u32_view = TypedArray::<u32>::from_arraybuffer(ab.clone())?;
-        let f32_view = TypedArray::<f32>::from_arraybuffer(ab.clone())?;
-        jsnir.set("cmd", u32_view)?;
-        jsnir.set("cmdF32", f32_view)?;
-        Ok((
-            Self {
-                _buffer: Persistent::save(c, ab),
-            },
-            CommandReader {
-                ptr,
-                cap: CMD_WORDS,
-                alive,
-            },
-        ))
-    }
-}
+pub const CMD_WORDS: usize = 16_384;
 
 pub(crate) const OP_SET: u32 = 1;
 pub(crate) const OP_SET_DISABLED: u32 = 2;
@@ -1027,7 +838,7 @@ fn decode_font(words: &[u32], i: &mut usize, strings: &mut [String]) -> Result<F
     Ok(font)
 }
 
-pub(crate) fn decode_commands(
+pub fn decode_commands(
     words: &[u32],
     strings: &mut [String],
     out: &mut Vec<Op>,
@@ -1442,6 +1253,7 @@ pub(crate) fn decode_commands(
     Ok(())
 }
 
+#[cfg_attr(not(feature = "engine-quickjs"), allow(dead_code))]
 pub(crate) fn dts(signatures: &[String]) -> String {
     let mut out = String::from(
         "// Generated from src/contract.rs and Vm::load. Do not edit by hand: `JSNIR_UPDATE=1 cargo test contract`.\n\

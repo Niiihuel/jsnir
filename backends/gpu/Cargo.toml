@@ -9,7 +9,7 @@ examples = ["jsnir/examples"]
 stepper = ["jsnir/stepper", "dep:serde_json"]
 
 [dependencies]
-jsnir = { path = "../..", default-features = false }
+jsnir = { path = "../..", default-features = false, features = ["engine-quickjs"] }
 arboard = { version = "=3.7.0", default-features = false, features = ["wayland-data-control"] }
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "=0.4.0"

@@ -662,6 +662,7 @@ contract_enum! {
     }
 }
 /// TypeScript declarations of every contract type, in dependency order.
+#[cfg_attr(not(feature = "engine-quickjs"), allow(dead_code))]
 pub(crate) fn ts_decls() -> String {
     [
         Axis::ts_decl(),
