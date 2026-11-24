@@ -145,7 +145,7 @@ pub trait JsEngine {
     }
 
     /// Reports current VM heap usage when supported by the backend.
-    fn memory_usage(&self) -> Option<EngineMemory> {
+    fn memory_usage(&mut self) -> Option<EngineMemory> {
         None
     }
 }

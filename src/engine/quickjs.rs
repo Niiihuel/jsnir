@@ -673,7 +673,7 @@ impl JsEngine for QuickJsEngine {
         self.try_invoke::<String>("jsnirReloadState", ()).ok()
     }
 
-    fn memory_usage(&self) -> Option<EngineMemory> {
+    fn memory_usage(&mut self) -> Option<EngineMemory> {
         let u = self.rt.memory_usage();
         Some(EngineMemory {
             used_bytes: u.malloc_size.max(0) as usize,

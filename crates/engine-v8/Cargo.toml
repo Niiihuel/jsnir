@@ -1,0 +1,13 @@
+[package]
+name = "jsnir-v8"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Optional V8 (TurboFan/Maglev) JIT JavaScript engine backend for JSNIR"
+
+[dependencies]
+jsnir = { path = "../..", default-features = false }
+v8 = "152"
+
+[dev-dependencies]
+jsnir = { path = "../..", features = ["engine-quickjs", "stepper"] }
