@@ -28,31 +28,27 @@ See **[docs/benchmarks.md](benchmarks.md)** for verified release measurements an
   - Native Linux Wayland `zwp_text_input_v3` (v1 & v2) client on an isolated `wl_event_queue`.
   - Native Windows `HWND` subclass (`GCS_COMPATTR`, `WM_IME_REQUEST` `IMR_DOCUMENTFEED`/`IMR_RECONVERTSTRING`/`IMR_QUERYCHARPOSITION`, `ImmNotifyIME(CPS_CANCEL)`, TSF `SetInputScope`).
   - Upgraded X11/macOS `winit` fallback with input-to-input focus switch reset.
-- **Virtual lists, rich text, overlays & animations**
-  - Rust-owned virtual list indexing with keyed demand bridged to JS/SDK, rich `spans`, anchored `Popover` placement callbacks, `For`/`Dynamic` cleanup hooks, keyframe animations with reduced motion, and multi-line wrapped `TextInput`.
+- **Native Accessibility via AccessKit & Keyboard Focus (`src/a11y.rs`, `src/host.rs`, `backends/gpu/src/app.rs`)**
+  - Full semantic accessibility tree exposed via **AccessKit 0.25** + **`accesskit_winit` 0.34** (AT-SPI on Linux, UIA on Windows, NSAccessibility on macOS) with zero per-frame overhead when no assistive technology is active and minimal incremental `TreeUpdate` diffing when active.
+  - 100% binary `Paint.a11y` contract (`A11yRole`, `A11yLive`, `label`, `description`, `value`, `checked`, `selected`, `expanded`, `hidden`, `modal`, `level`, `focusable`, numeric ranges), automatic `labelled_by` inference for controls, `Role::TextRun` UTF-8 character/word runs & `TextSelection` for `TextInput` (with password masking), and full AccessKit action dispatch (`Focus`, `Blur`, `Click`, `SetValue`, `ReplaceSelectedText`, `SetTextSelection`, `ScrollUp`/`Down`, `SetScrollOffset`, `ScrollIntoView`, `ShowContextMenu`).
+  - Generalized `Tab` / `Shift+Tab` keyboard focus traversal across focusable controls (`Input`, `Button`, pressable `Box`, `a11y.focusable`) with ARIA `modal` focus trapping, `Enter`/`Space` activation, and automatic scroll-into-view.
+- **Virtual lists, rich text, overlays, animations & event coalescing**
+  - Rust-owned virtual list indexing with keyed demand bridged to JS/SDK, rich `spans`, anchored `Popover` placement callbacks, `For`/`Dynamic` cleanup hooks, keyframe animations with reduced motion, multi-line wrapped `TextInput`, animatable per-corner `Property::Radius`, `paint.exiting` frozen-snapshot exit transitions, and `Host::push_keyed` / `Pusher::push_keyed` event coalescing.
 
 ---
 
 ## Next Priorities
 
-### 1. Native Accessibility via AccessKit (Highest Priority)
-Expose JSNIR's live node tree (`Tree` + layout geometry + focus + `LineEditor` text runs/selection)
-through **AccessKit** (`accesskit` + `accesskit_winit`) so screen readers (Orca on Linux AT-SPI,
-NVDA/Narrator on Windows UIA, VoiceOver on macOS NSAccessibility) and automated UI tests can inspect
-and drive every JSNIR app natively. This is the largest remaining feature gap against GPUI and egui.
-
-### 2. Resilience & Fault Recovery
+### 1. Resilience & Fault Recovery
 - Catch panics / fatal VM failures on the app thread cleanly so the UI thread stays alive, displays
   the native error overlay, and allows restarting or hot-reloading the VM without crashing the window.
 - Preserve unsent field drafts if a JS `onSubmit` handler throws.
 
-### 3. Unified Host & Keyboard Navigation
+### 2. Unified Host Cleanup
 - Migrate the remaining standalone chat/counter measurement demos onto the generic `Host` window and
   remove duplicate window code.
-- Full `Tab` / `Shift+Tab` focus traversal across focusable nodes (`Input`, pressable `Box`, `Button`)
-  with configurable focus rings and ARIA/AccessKit roles.
 
-### 4. Multi-Window, Platform Polish & Packaging
+### 3. Multi-Window, Platform Polish & Packaging
 - Multiple native windows sharing one or more `Host` instances, native OS menu bars / tray hooks,
   and OS reduced-motion / dark-mode preference reading.
 - Verified CI matrix for Linux (Wayland/X11), Windows (Vulkan/DX12 + IMM32/TSF), and macOS (Metal).

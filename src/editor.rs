@@ -300,6 +300,41 @@ impl LineEditor {
         [start as u32, (start + text[range].chars().count()) as u32]
     }
 
+    /// Directed selection `[anchor, head]` in character offsets (preserves backwards selections for AccessKit).
+    pub fn directed_selection(&self) -> [u32; 2] {
+        let selected = self.selected_bytes();
+        let caret = self.caret();
+        let buffer = self.buffer();
+        let backwards = match caret.selection {
+            Selection::Normal(anchor) | Selection::Line(anchor) | Selection::Word(anchor) => {
+                offset_of(buffer, caret.cursor) < offset_of(buffer, anchor)
+            }
+            Selection::None => false,
+        };
+        let text = self.text();
+        let start = text[..selected.start].chars().count() as u32;
+        let end = start + text[selected].chars().count() as u32;
+        if backwards { [end, start] } else { [start, end] }
+    }
+
+    /// Sets the caret or selection to `[anchor, head]` in character offsets, cancelling any active preedit.
+    pub fn set_selection(&mut self, [anchor, head]: [u32; 2]) {
+        if self.preedit.is_some() {
+            self.preedit = None;
+        }
+        let text = self.text().into_owned();
+        let anchor_cur = cursor_at(self.buffer(), byte_at(&text, anchor as usize));
+        let head_cur = cursor_at(self.buffer(), byte_at(&text, head as usize));
+        self.inner.set_cursor(head_cur);
+        if anchor_cur != head_cur {
+            self.inner.set_selection(Selection::Normal(anchor_cur));
+        } else {
+            self.inner.set_selection(Selection::None);
+        }
+        self.follow = true;
+        self.invalidate();
+    }
+
     /// Replaces the text and selects `[anchor, head]` (in characters). A multi-line field keeps the line breaks.
     pub fn reset(&mut self, text: &str, [anchor, head]: [u32; 2], multiline: bool) {
         self.multiline = multiline;

@@ -34,6 +34,7 @@ See the full reproducible numbers in **[docs/benchmarks.md](docs/benchmarks.md)*
   - **Linux Wayland**: native `zwp_text_input_v3` (v1 & v2) over an isolated `wl_event_queue` (`set_surrounding_text`, `set_text_change_cause`, semantic `content_hint`/`content_purpose`, `delete_surrounding_text`, atomic 7-step `done`).
   - **Windows**: Win32 `HWND` subclass decoding multi-clause CJK `GCS_COMPATTR` (`PreeditSegments`), `WM_IME_REQUEST` (`IMR_DOCUMENTFEED`, `IMR_RECONVERTSTRING`, `IMR_QUERYCHARPOSITION`), `ImmNotifyIME(CPS_CANCEL)`, and TSF `SetInputScope`.
   - **Linux X11 / macOS**: deduplicated `winit` fallback with input-to-input focus reset.
+- **Native Accessibility (AccessKit) & Keyboard Navigation**: full semantic tree via `accesskit` + `accesskit_winit` (Linux AT-SPI, Windows UIA, macOS NSAccessibility) with lazy activation (0 µs when inactive), incremental tree diffing, `TextRun` selection/editing, ARIA `Paint.a11y` metadata (100% binary), and `Tab`/`Shift+Tab` focus traversal with modal focus trapping.
 - **Vite-style `jsnir` CLI (`crates/dev`)**: in-memory multi-file TSX/TS compilation via **Oxc** (`~2–5 ms`), signal-preserving hot reload, native in-window error overlay, background `tsc --noEmit`, TTY shortcuts, and `--bytecode` AOT builds.
 - **Single-source Rust↔TypeScript contract**: declared once in [src/contract.rs](src/contract.rs) and generated into [app/jsnir.d.ts](app/jsnir.d.ts) (`JSNIR_UPDATE=1 cargo test contract`).
 

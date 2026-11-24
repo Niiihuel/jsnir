@@ -5,10 +5,10 @@
 //! with a single interpreter instruction, without calling Rust or converting values. Rust is the only
 //! writer and writes only between callbacks, on the VM thread: reads and writes never overlap.
 use crate::tree::{
-    Align, Anchor, AnchorAlign, Animation, Axis, Cursor, Easing, Edges, Exiting, Font, Icon,
-    InlineImage, InputPurpose, Justify, Keyframe, Node, Op, Paint, PlacementSubscription, Position,
-    Property, Radius, ScrollAnchor, ScrollEdge, Scrollbar, Shadow, Side, Span, Starting, Style,
-    TextAlign, Transition, Tree, Variant,
+    A11y, A11yLive, A11yRole, Align, Anchor, AnchorAlign, Animation, Axis, Cursor, Easing, Edges,
+    Exiting, Font, Icon, InlineImage, InputPurpose, Justify, Keyframe, Node, Op, Paint,
+    PlacementSubscription, Position, Property, Radius, ScrollAnchor, ScrollEdge, Scrollbar, Shadow,
+    Side, Span, Starting, Style, TextAlign, Transition, Tree, Variant,
 };
 
 /// TypeScript type of a value that crosses the boundary.
@@ -554,6 +554,102 @@ fn decode_exiting(words: &[u32], i: &mut usize) -> Result<Exiting, String> {
     })
 }
 
+fn decode_a11y_role(code: u32) -> Result<A11yRole, String> {
+    match code {
+        0 => Ok(A11yRole::Generic),
+        1 => Ok(A11yRole::Group),
+        2 => Ok(A11yRole::Region),
+        3 => Ok(A11yRole::Navigation),
+        4 => Ok(A11yRole::Main),
+        5 => Ok(A11yRole::Toolbar),
+        6 => Ok(A11yRole::Button),
+        7 => Ok(A11yRole::Link),
+        8 => Ok(A11yRole::CheckBox),
+        9 => Ok(A11yRole::Switch),
+        10 => Ok(A11yRole::RadioButton),
+        11 => Ok(A11yRole::Tab),
+        12 => Ok(A11yRole::TabList),
+        13 => Ok(A11yRole::TabPanel),
+        14 => Ok(A11yRole::Menu),
+        15 => Ok(A11yRole::MenuItem),
+        16 => Ok(A11yRole::Dialog),
+        17 => Ok(A11yRole::AlertDialog),
+        18 => Ok(A11yRole::Alert),
+        19 => Ok(A11yRole::Status),
+        20 => Ok(A11yRole::Tooltip),
+        21 => Ok(A11yRole::Heading),
+        22 => Ok(A11yRole::Label),
+        23 => Ok(A11yRole::List),
+        24 => Ok(A11yRole::ListItem),
+        25 => Ok(A11yRole::Tree),
+        26 => Ok(A11yRole::TreeItem),
+        27 => Ok(A11yRole::ScrollView),
+        28 => Ok(A11yRole::Slider),
+        29 => Ok(A11yRole::ProgressIndicator),
+        30 => Ok(A11yRole::Image),
+        31 => Ok(A11yRole::Terminal),
+        _ => Err(format!("invalid a11y role code {code}")),
+    }
+}
+
+fn decode_a11y_live(code: u32) -> Result<A11yLive, String> {
+    match code {
+        0 => Ok(A11yLive::Off),
+        1 => Ok(A11yLive::Polite),
+        2 => Ok(A11yLive::Assertive),
+        _ => Err(format!("invalid a11y live code {code}")),
+    }
+}
+
+fn decode_a11y(words: &[u32], i: &mut usize, strings: &mut [String]) -> Result<A11y, String> {
+    let mask = next_word(words, i)?;
+    let mut a = A11y {
+        hidden: mask & (1 << 7) != 0,
+        modal: mask & (1 << 8) != 0,
+        ..A11y::default()
+    };
+    if mask & (1 << 0) != 0 {
+        a.role = Some(decode_a11y_role(next_word(words, i)?)?);
+    }
+    if mask & (1 << 1) != 0 {
+        a.label = Some(take_str(words, i, strings)?);
+    }
+    if mask & (1 << 2) != 0 {
+        a.description = Some(take_str(words, i, strings)?);
+    }
+    if mask & (1 << 3) != 0 {
+        a.value = Some(take_str(words, i, strings)?);
+    }
+    if mask & (1 << 4) != 0 {
+        a.checked = Some(mask & (1 << 16) != 0);
+    }
+    if mask & (1 << 5) != 0 {
+        a.selected = Some(mask & (1 << 17) != 0);
+    }
+    if mask & (1 << 6) != 0 {
+        a.expanded = Some(mask & (1 << 18) != 0);
+    }
+    if mask & (1 << 9) != 0 {
+        a.level = Some(next_u16(words, i)?);
+    }
+    if mask & (1 << 10) != 0 {
+        a.live = Some(decode_a11y_live(next_word(words, i)?)?);
+    }
+    if mask & (1 << 11) != 0 {
+        a.focusable = Some(mask & (1 << 19) != 0);
+    }
+    if mask & (1 << 12) != 0 {
+        a.numeric_value = Some(next_f32(words, i)?);
+    }
+    if mask & (1 << 13) != 0 {
+        a.min_value = Some(next_f32(words, i)?);
+    }
+    if mask & (1 << 14) != 0 {
+        a.max_value = Some(next_f32(words, i)?);
+    }
+    Ok(a)
+}
+
 fn decode_scrollbar(words: &[u32], i: &mut usize) -> Result<Scrollbar, String> {
     let sb_flags = next_word(words, i)?;
     let width = next_f32(words, i)?;
@@ -788,6 +884,9 @@ fn decode_paint(words: &[u32], i: &mut usize, strings: &mut [String]) -> Result<
     }
     if mask & (1 << 24) != 0 {
         paint.exiting = Some(decode_exiting(words, i)?);
+    }
+    if mask & (1 << 25) != 0 {
+        paint.a11y = Some(Box::new(decode_a11y(words, i, strings)?));
     }
     Ok(paint)
 }

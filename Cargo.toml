@@ -27,10 +27,14 @@ name = "sdk_bench"
 required-features = ["stepper", "engine-quickjs"]
 
 [dependencies]
+accesskit = "0.25.2"
 cosmic-text = "=0.14.2"
 rquickjs = { version = "=0.14.0", optional = true }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 taffy = { version = "=0.15.1", default-features = false, features = ["std", "taffy_tree", "flexbox"] }
 unicode-segmentation = "1"
+
+[dev-dependencies]
+accesskit_consumer = "0.39.2"
 

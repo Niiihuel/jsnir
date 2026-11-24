@@ -5,6 +5,7 @@
 //! applies each batch whole or rejects it, and never waits for JS to draw a frame.
 #[macro_use]
 mod contract;
+pub mod a11y;
 #[cfg(feature = "examples")]
 pub mod chat;
 pub mod design;
@@ -1443,6 +1444,22 @@ mod tests {
                         ],
                         starting: { opacity: 0, x: -4, y: 8, scale: 0.95, draw: 0.5 },
                         exiting: { opacity: 0, x: -120, y: 12, scale: 0.92 },
+                        a11y: {
+                            role: "dialog",
+                            label: "Settings",
+                            description: "App preferences",
+                            value: "v1",
+                            checked: true,
+                            selected: false,
+                            expanded: true,
+                            modal: true,
+                            level: 2,
+                            live: "polite",
+                            focusable: true,
+                            numericValue: 42.5,
+                            minValue: 0,
+                            maxValue: 100
+                        },
                         scrollbar: { width: 6, thumb: 0x64748bff, track: 0x1e293bff, radius: 3, minThumb: 24, inset: 2, autoHide: true }
                     }
                 },
@@ -1581,6 +1598,22 @@ mod tests {
                 assert_eq!(ex.x, Some(-120.));
                 assert_eq!(ex.y, Some(12.));
                 assert_eq!(ex.scale, Some(0.92));
+                let a11y = paint.a11y.as_deref().expect("a11y");
+                assert_eq!(a11y.role, Some(tree::A11yRole::Dialog));
+                assert_eq!(a11y.label.as_deref(), Some("Settings"));
+                assert_eq!(a11y.description.as_deref(), Some("App preferences"));
+                assert_eq!(a11y.value.as_deref(), Some("v1"));
+                assert_eq!(a11y.checked, Some(true));
+                assert_eq!(a11y.selected, Some(false));
+                assert_eq!(a11y.expanded, Some(true));
+                assert!(!a11y.hidden);
+                assert!(a11y.modal);
+                assert_eq!(a11y.level, Some(2));
+                assert_eq!(a11y.live, Some(tree::A11yLive::Polite));
+                assert_eq!(a11y.focusable, Some(true));
+                assert_eq!(a11y.numeric_value, Some(42.5));
+                assert_eq!(a11y.min_value, Some(0.));
+                assert_eq!(a11y.max_value, Some(100.));
                 let sb = paint.scrollbar.as_ref().expect("scrollbar");
                 assert_eq!(sb.width, 6.);
                 assert_eq!(sb.thumb, 0x64748bff);

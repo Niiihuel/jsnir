@@ -29,10 +29,25 @@ use winit::{
     window::{CursorIcon, Window, WindowId},
 };
 
+/// User events delivered through the winit event loop proxy (embedder `Pusher` wakes + AccessKit events).
+#[derive(Debug)]
+pub enum AppEvent {
+    Pusher,
+    AccessKit(accesskit_winit::Event),
+}
+
+impl From<accesskit_winit::Event> for AppEvent {
+    fn from(event: accesskit_winit::Event) -> Self {
+        AppEvent::AccessKit(event)
+    }
+}
+
 pub struct AppWindow {
-    // Field drop order is load-bearing: `ime` must detach BEFORE `surface`/`window` drops so
-    // native Wayland (`wl_display`) and Win32 (`HWND`) handles are still live during cleanup.
+    // Field drop order is load-bearing: `ime` must detach BEFORE `a11y`, and both BEFORE
+    // `surface`/`window` drops so native Wayland (`wl_display`) and Win32 (`HWND`) subclass
+    // chains (`SetWindowSubclass` -> `GWLP_WNDPROC`) unwind in exact LIFO order.
     ime: PlatformIme,
+    a11y: Option<accesskit_winit::Adapter>,
     // Created with the window: the backend depends on what the GPU offers.
     instance: Option<wgpu::Instance>,
     surface: Option<Surface>,
@@ -40,12 +55,16 @@ pub struct AppWindow {
     view: View,
     title: String,
     size: [f32; 2],
+    last_frame_size: [f32; 2],
+    last_scale: f32,
     modifiers: ModifiersState,
     clicks: Clicks,
     clipboard: Clipboard,
     window_focused: bool,
+    a11y_active: bool,
     cursor_shape: Cursor,
     wake: Option<Instant>,
+    proxy: Option<EventLoopProxy<AppEvent>>,
     // Messages from `Pusher`; None when the program has no channel (`open`).
     inbox: Option<Receiver<Message>>,
     shared: Arc<Shared>,
@@ -57,18 +76,23 @@ impl AppWindow {
     pub fn new(host: Host, title: &str, size: [f32; 2]) -> Self {
         Self {
             ime: PlatformIme::default(),
+            a11y: None,
             instance: None,
             surface: None,
             host,
             view: View::default(),
             title: title.into(),
             size,
+            last_frame_size: size,
+            last_scale: 1.,
             modifiers: ModifiersState::empty(),
             clicks: Clicks::default(),
             clipboard: Clipboard::default(),
             window_focused: true,
+            a11y_active: false,
             cursor_shape: Cursor::Default,
             wake: None,
+            proxy: None,
             inbox: None,
             shared: Arc::default(),
             dropped_files: Vec::new(),
@@ -190,8 +214,16 @@ impl AppWindow {
         let scale = surface.window.scale_factor() as f32;
         let pixels = [frame.texture.width(), frame.texture.height()];
         let [width, height] = pixels.map(|side| side as f32 / scale);
+        self.last_frame_size = [width, height];
+        self.last_scale = scale;
         let max_side = surface.renderer.device.limits().max_texture_dimension_2d as usize;
         let scene = self.host.frame(width, height, scale, max_side);
+        if self.a11y_active
+            && let Some(a11y) = &mut self.a11y
+            && let Some(update) = self.host.a11y_update(&self.title, [width, height], scale)
+        {
+            a11y.update_if_active(|| update);
+        }
         let draws = self
             .view
             .draws(&mut self.host, &mut surface.renderer, scene.items, scale);
@@ -271,7 +303,37 @@ impl AppWindow {
             self.host.escape();
             self.request_redraw();
         }
+        // Tab / Shift+Tab traverses focusable controls (`Input`, `Button`, pressable `Box`, `a11y.focusable`),
+        // except while an IME composition is active or a command/alt modifier is held.
+        if matches!(key.logical_key, Key::Named(NamedKey::Tab))
+            && !self.host.composing()
+            && !self.modifiers.control_key()
+            && !self.modifiers.alt_key()
+            && !self.modifiers.super_key()
+        {
+            if self.modifiers.shift_key() {
+                self.host.focus_prev();
+            } else {
+                self.host.focus_next();
+            }
+            self.sync_ime();
+            self.request_redraw();
+            return;
+        }
         if !self.host.focused() {
+            // Enter or Space activates a focused non-input control (button, checkbox, tab, menu item).
+            if !key.repeat
+                && matches!(
+                    key.logical_key,
+                    Key::Named(NamedKey::Enter | NamedKey::Space)
+                )
+                && !self.modifiers.control_key()
+                && !self.modifiers.alt_key()
+                && !self.modifiers.super_key()
+                && self.host.activate_focused()
+            {
+                self.request_redraw();
+            }
             return;
         }
         match editor_key(&key, self.modifiers) {
@@ -286,24 +348,43 @@ impl AppWindow {
     }
 }
 
-impl ApplicationHandler for AppWindow {
+impl ApplicationHandler<AppEvent> for AppWindow {
     fn resumed(&mut self, events: &ActiveEventLoop) {
         if self.surface.is_some() {
             return;
         }
         let [width, height] = self.size;
-        let window = events
+        let window = match events
             .create_window(
                 Window::default_attributes()
                     .with_title(&self.title)
-                    .with_inner_size(LogicalSize::new(width, height)),
+                    .with_inner_size(LogicalSize::new(width, height))
+                    .with_visible(false),
             )
             .map_err(Box::from)
-            .and_then(|window| surface::open(&events.owned_display_handle(), Arc::new(window)));
-        match window {
+        {
+            Ok(window) => Arc::new(window),
+            Err(error) => {
+                self.error = Some(error);
+                events.exit();
+                return;
+            }
+        };
+        // Attach AccessKit before the window is made visible (required by accesskit_winit)
+        // and before PlatformIme so Windows subclass chains attach/detach cleanly in LIFO order.
+        if let Some(proxy) = &self.proxy {
+            self.a11y = Some(accesskit_winit::Adapter::with_event_loop_proxy(
+                events,
+                &window,
+                proxy.clone(),
+            ));
+        }
+        match surface::open(&events.owned_display_handle(), window) {
             Ok((instance, surface)) => {
                 let scale = surface.window.scale_factor() as f32;
+                self.last_scale = scale;
                 self.ime.attach(&surface.window);
+                surface.window.set_visible(true);
                 self.instance = Some(instance);
                 self.surface = Some(surface);
                 self.set_scale(scale);
@@ -311,6 +392,7 @@ impl ApplicationHandler for AppWindow {
                 self.request_redraw();
             }
             Err(error) => {
+                self.a11y = None;
                 self.error = Some(error);
                 events.exit();
             }
@@ -325,9 +407,13 @@ impl ApplicationHandler for AppWindow {
         {
             return;
         }
+        if let (Some(a11y), Some(surface)) = (&mut self.a11y, &self.surface) {
+            a11y.process_event(&surface.window, &event);
+        }
         match event {
             WindowEvent::CloseRequested => {
                 self.ime.detach();
+                self.a11y = None;
                 events.exit();
             }
             WindowEvent::Resized(_) => self.resize(),
@@ -385,7 +471,44 @@ impl ApplicationHandler for AppWindow {
         }
     }
 
-    fn user_event(&mut self, events: &ActiveEventLoop, _: ()) {
+    fn user_event(&mut self, events: &ActiveEventLoop, event: AppEvent) {
+        match event {
+            AppEvent::AccessKit(ak) => {
+                if !self
+                    .surface
+                    .as_ref()
+                    .is_some_and(|surface| surface.window.id() == ak.window_id)
+                {
+                    return;
+                }
+                match ak.window_event {
+                    accesskit_winit::WindowEvent::InitialTreeRequested => {
+                        self.a11y_active = true;
+                        let update = self.host.a11y_initial_tree(
+                            &self.title,
+                            self.last_frame_size,
+                            self.last_scale,
+                        );
+                        if let Some(a11y) = &mut self.a11y {
+                            a11y.update_if_active(|| update);
+                        }
+                    }
+                    accesskit_winit::WindowEvent::ActionRequested(request) => {
+                        if self.host.handle_a11y_action(request) {
+                            self.sync_ime();
+                            self.sync_cursor(self.host.cursor());
+                            self.request_redraw();
+                        }
+                    }
+                    accesskit_winit::WindowEvent::AccessibilityDeactivated => {
+                        self.a11y_active = false;
+                        self.host.a11y_deactivate();
+                    }
+                }
+                return;
+            }
+            AppEvent::Pusher => {}
+        }
         let Some(inbox) = &self.inbox else { return };
         let messages = coalesce_messages(inbox.try_iter().collect());
         for message in messages {
@@ -422,6 +545,7 @@ impl ApplicationHandler for AppWindow {
                 }
                 Message::Close => {
                     self.ime.detach();
+                    self.a11y = None;
                     events.exit();
                     return;
                 }
@@ -485,12 +609,14 @@ pub fn open(
     if let Some(path) = output {
         return capture_at(host, size, 1., focus, path);
     }
-    let event_loop = EventLoop::new()?;
+    let event_loop = EventLoop::<AppEvent>::with_user_event().build()?;
+    let proxy = event_loop.create_proxy();
     host.poll();
     if focus {
         host.focus_first_input();
     }
     let mut window = AppWindow::new(host, title, size.map(|side| side as f32));
+    window.proxy = Some(proxy);
     event_loop.run_app(&mut window)?;
     window.finish()
 }
@@ -502,16 +628,18 @@ pub fn open_with(
     size: [u32; 2],
     start: impl FnOnce(Pusher),
 ) -> Result<()> {
-    let event_loop = EventLoop::<()>::with_user_event().build()?;
+    let event_loop = EventLoop::<AppEvent>::with_user_event().build()?;
+    let proxy = event_loop.create_proxy();
     let (tx, inbox) = channel();
     let shared = Arc::<Shared>::default();
     start(Pusher {
         tx,
-        proxy: event_loop.create_proxy(),
+        proxy: proxy.clone(),
         shared: shared.clone(),
     });
     host.poll();
     let mut window = AppWindow::new(host, title, size.map(|side| side as f32));
+    window.proxy = Some(proxy);
     window.inbox = Some(inbox);
     window.shared = shared;
     event_loop.run_app(&mut window)?;
@@ -579,7 +707,7 @@ impl Shared {
 #[derive(Clone)]
 pub struct Pusher {
     tx: Sender<Message>,
-    proxy: EventLoopProxy<()>,
+    proxy: EventLoopProxy<AppEvent>,
     shared: Arc<Shared>,
 }
 impl Pusher {
@@ -601,7 +729,7 @@ impl Pusher {
     }
     /// Requests redraw after native data changed without a JS message.
     pub fn redraw(&self) -> bool {
-        self.proxy.send_event(()).is_ok()
+        self.proxy.send_event(AppEvent::Pusher).is_ok()
     }
     /// Returns false once the window has closed.
     pub fn push(&self, json: String) -> bool {
@@ -667,7 +795,7 @@ impl Pusher {
         self.send(Message::Close)
     }
     fn send(&self, message: Message) -> bool {
-        self.tx.send(message).is_ok() && self.proxy.send_event(()).is_ok()
+        self.tx.send(message).is_ok() && self.proxy.send_event(AppEvent::Pusher).is_ok()
     }
 }
 

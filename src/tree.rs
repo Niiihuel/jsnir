@@ -336,6 +336,82 @@ contract_struct! {
         scale: Option<f32>,
     }
 }
+contract_strings! {
+    /// Accessibility role override (ARIA / AccessKit). When omitted, inferred from the node kind and callbacks.
+    pub enum A11yRole as "A11yRole" {
+        Generic,
+        Group,
+        Region,
+        Navigation,
+        Main,
+        Toolbar,
+        Button,
+        Link,
+        CheckBox,
+        Switch,
+        RadioButton,
+        Tab,
+        TabList,
+        TabPanel,
+        Menu,
+        MenuItem,
+        Dialog,
+        AlertDialog,
+        Alert,
+        Status,
+        Tooltip,
+        Heading,
+        Label,
+        List,
+        ListItem,
+        Tree,
+        TreeItem,
+        ScrollView,
+        Slider,
+        ProgressIndicator,
+        Image,
+        Terminal,
+    }
+}
+contract_strings! {
+    /// Live region politeness for screen reader announcements (`aria-live`).
+    pub enum A11yLive as "A11yLive" { Off, Polite, Assertive }
+}
+contract_struct! {
+    /// Accessibility metadata (AccessKit / ARIA) and keyboard focus participation.
+    pub struct A11y as "A11y" {
+        /// Semantic role override; when omitted, inferred from the node kind and callbacks.
+        role: Option<A11yRole>,
+        /// Accessible name (`aria-label`), especially for icon-only buttons, inputs, dialogs, and regions.
+        label: Option<String>,
+        /// Supplemental description (`aria-description`).
+        description: Option<String>,
+        /// Explicit string value (e.g. custom widget or slider text value).
+        value: Option<String>,
+        /// Checked or pressed state (`aria-checked` / `aria-pressed`) for checkboxes, switches, and toggle buttons.
+        checked: Option<bool>,
+        /// Selected state (`aria-selected`) for tabs, list items, and tree items.
+        selected: Option<bool>,
+        /// Expanded or collapsed state (`aria-expanded`) for disclosures, popovers, and tree items.
+        expanded: Option<bool>,
+        /// Excludes this node and its subtree from the accessibility tree (`aria-hidden`).
+        hidden: bool,
+        /// Marks a dialog as modal (`aria-modal`), trapping `Tab` focus inside its subtree while mounted.
+        modal: bool,
+        /// Heading or tree item hierarchical level (1-based as in ARIA `aria-level`, e.g. 1 for H1).
+        level: Option<u16>,
+        /// Live region politeness (`aria-live`).
+        live: Option<A11yLive>,
+        /// Overrides `Tab` / `Shift+Tab` keyboard focus participation (`true` makes custom controls focusable; `false` skips in Tab order).
+        focusable: Option<bool>,
+        /// Current numeric value (`aria-valuenow`) for sliders and progress indicators.
+        numeric_value: Option<f32>,
+        /// Minimum numeric value (`aria-valuemin`).
+        min_value: Option<f32>,
+        /// Maximum numeric value (`aria-valuemax`).
+        max_value: Option<f32>,
+    }
+}
 contract_struct! {
     /// A thin scrollbar of a `scroll` node whose content is taller than its box. Lengths are logical pixels;
     /// colors are `0xRRGGBBAA`.
@@ -425,6 +501,8 @@ contract_struct! {
         scrollbar: Option<Scrollbar>,
         /// Pointer shape shown over the node (overrides the default pointer for interactive nodes).
         cursor: Option<Cursor>,
+        /// Accessibility metadata (AccessKit / ARIA) and keyboard focus participation.
+        a11y: Option<Box<A11y>>,
     }
 }
 impl Paint {
@@ -475,6 +553,12 @@ impl Paint {
                 self.exiting
                     .iter()
                     .flat_map(|e| [e.opacity, e.x, e.y, e.scale])
+                    .flatten(),
+            )
+            .chain(
+                self.a11y
+                    .iter()
+                    .flat_map(|a| [a.numeric_value, a.min_value, a.max_value])
                     .flatten(),
             )
             .chain(self.shadows.iter().flat_map(|s| [s.y, s.blur, s.spread]))
@@ -706,6 +790,9 @@ pub(crate) fn ts_decls() -> String {
         Variant::ts_decl(),
         Starting::ts_decl(),
         Exiting::ts_decl(),
+        A11yRole::ts_decl(),
+        A11yLive::ts_decl(),
+        A11y::ts_decl(),
         Scrollbar::ts_decl(),
         Paint::ts_decl(),
         Font::ts_decl(),

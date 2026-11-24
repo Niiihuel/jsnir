@@ -1104,7 +1104,11 @@ pub struct Host {
     pointer: Option<[f32; 2]>,
     hovered: Option<u16>,
     pressed: Option<u16>,
-    focused: Option<u16>,
+    pub(crate) focused: Option<u16>,
+    // Sequential focus navigation starting point set by AccessKit (`Action::SetSequentialFocusNavigationStartingPoint`).
+    sequential_focus_start: Option<u16>,
+    // Incremental AccessKit tree diff state (only populated while an assistive technology is active).
+    pub(crate) a11y_cache: crate::a11y::A11yCache,
     // Group nodes drawn in the last frame with their visible rectangles and layers, and the ones the pointer is in.
     group_rects: Vec<(u16, Rect, i32)>,
     hovered_groups: Vec<u16>,
@@ -1116,7 +1120,7 @@ pub struct Host {
     hover_frozen_until: f64,
     dismiss_rects: Vec<(u16, Rect, i32)>,
     // On-screen rectangle of each node in the last frame, by id, unclipped: what a fixed node anchors to.
-    screen: Vec<Option<Rect>>,
+    pub(crate) screen: Vec<Option<Rect>>,
     // Group nodes the pointer was in when the primary button went down.
     pressed_groups: Vec<u16>,
     editor: LineEditor,
@@ -1357,6 +1361,8 @@ impl Host {
             hovered: None,
             pressed: None,
             focused: None,
+            sequential_focus_start: None,
+            a11y_cache: crate::a11y::A11yCache::default(),
             group_rects: Vec::new(),
             hovered_groups: Vec::new(),
             hover_rects: Vec::new(),
@@ -1635,7 +1641,7 @@ impl Host {
         }
     }
 
-    fn row_can_receive(&self, child: u16) -> bool {
+    pub(crate) fn row_can_receive(&self, child: u16) -> bool {
         self.row_input_at(child, None)
     }
 
@@ -2555,6 +2561,12 @@ impl Host {
         if self.focused.is_some_and(|f| removed.contains(&f)) {
             self.focused = None;
         }
+        if self
+            .sequential_focus_start
+            .is_some_and(|s| removed.contains(&s))
+        {
+            self.sequential_focus_start = None;
+        }
         if self.pressed.is_some_and(|p| removed.contains(&p) || !self.pressable(p)) {
             self.pressed = None;
         }
@@ -3281,22 +3293,68 @@ impl Host {
             .filter(|_| self.row_can_receive(id))
     }
 
-    /// Moves keyboard focus to a field, or clears it.
+    /// Whether `id` is currently eligible to hold keyboard focus.
+    pub fn is_node_focusable(&self, id: u16) -> bool {
+        let Some(node) = self.tree.nodes.get(&id) else {
+            return false;
+        };
+        if !self.row_can_receive(id) {
+            return false;
+        }
+        if matches!(node, Node::Box { disabled: true, .. }) {
+            return false;
+        }
+        // Check this node and ancestors for `opacity <= 0.001` or `a11y.hidden`.
+        let mut cur = Some(id);
+        while let Some(n) = cur {
+            if let Some(paint) = self.tree.nodes.get(&n).and_then(Node::paint) {
+                if paint.opacity.is_some_and(|o| o <= 0.001) {
+                    return false;
+                }
+                if paint.a11y.as_ref().is_some_and(|a| a.hidden) {
+                    return false;
+                }
+            }
+            cur = self.tree.parent(n);
+        }
+        if let Some(explicit) = node
+            .paint()
+            .and_then(|p| p.a11y.as_ref())
+            .and_then(|a| a.focusable)
+        {
+            return explicit;
+        }
+        match node {
+            Node::Input { .. } | Node::Button { .. } => true,
+            Node::Box { press, .. } => *press != 0,
+            _ => false,
+        }
+    }
+
+    /// Moves keyboard focus to a focusable node (`Input`, `Button`, pressable `Box`, or `a11y.focusable`), or clears it.
     pub fn focus(&mut self, id: Option<u16>) {
-        let id = id.filter(|&id| self.row_can_receive(id));
+        let id = id.filter(|&id| self.is_node_focusable(id));
         if self.focused == id {
             return;
         }
-        let was_composing = self.editor.composing();
-        if self.focused.is_some() {
+        let prev_was_input = self.focused_input().is_some();
+        let was_composing = prev_was_input && self.editor.composing();
+        if prev_was_input {
             self.edit(&[EditorEvent::Preedit {
                 text: String::new(),
                 active: None,
             }]);
         }
         self.focused = id;
-        self.ime_revision += 1;
-        self.ime_change_cause = ImeChangeCause::Other;
+        self.sequential_focus_start = id;
+        let next_is_input = matches!(
+            id.and_then(|id| self.tree.nodes.get(&id)),
+            Some(Node::Input { .. })
+        );
+        if prev_was_input || next_is_input {
+            self.ime_revision += 1;
+            self.ime_change_cause = ImeChangeCause::Other;
+        }
         if was_composing {
             self.ime_interrupt_pending = true;
         }
@@ -3321,6 +3379,359 @@ impl Host {
         }
     }
 
+    /// The currently focused text input node ID, if any.
+    pub fn focused_input(&self) -> Option<u16> {
+        self.focused.filter(|&id| {
+            self.row_can_receive(id)
+                && matches!(self.tree.nodes.get(&id), Some(Node::Input { .. }))
+        })
+    }
+
+    /// The currently focused node ID (text input, button, pressable box, or custom focusable node).
+    pub fn focused_node(&self) -> Option<u16> {
+        self.focused.filter(|&id| self.is_node_focusable(id))
+    }
+
+    /// Returns focusable node IDs in keyboard `Tab` traversal order (respecting layers and ARIA modal trapping).
+    pub fn focus_order(&self) -> Vec<u16> {
+        let Some(root) = self.tree.root else {
+            return Vec::new();
+        };
+        let mut ordered = Vec::new();
+        let mut deferred: Vec<(u16, i32, usize)> = Vec::new();
+        let mut seq = 0usize;
+        let mut modals: Vec<u16> = Vec::new();
+
+        fn visit(
+            host: &Host,
+            id: u16,
+            cur_layer: i32,
+            is_layer_root: bool,
+            ordered: &mut Vec<u16>,
+            deferred: &mut Vec<(u16, i32, usize)>,
+            seq: &mut usize,
+            modals: &mut Vec<u16>,
+        ) {
+            let Some(node) = host.tree.nodes.get(&id) else {
+                return;
+            };
+            if let Some(paint) = node.paint() {
+                if paint.opacity.is_some_and(|o| o <= 0.001) {
+                    return;
+                }
+                if paint.a11y.as_ref().is_some_and(|a| a.hidden) {
+                    return;
+                }
+            }
+            if !is_layer_root {
+                let style = node.style();
+                let fixed = style.is_some_and(|s| s.position == Position::Fixed);
+                let layer = style.and_then(|s| s.layer.or(fixed.then_some(1)));
+                if let Some(layer) = layer
+                    && (fixed || layer != cur_layer)
+                {
+                    // Skip unanchored fixed nodes whose anchor no longer exists.
+                    if fixed
+                        && let Some(anchor) = style.and_then(|s| s.anchor.as_ref())
+                        && host.tree.nodes.get(&anchor.node).is_none()
+                    {
+                        return;
+                    }
+                    deferred.push((id, layer, *seq));
+                    *seq += 1;
+                    return;
+                }
+            }
+            if node
+                .paint()
+                .and_then(|p| p.a11y.as_ref())
+                .is_some_and(|a| a.modal)
+            {
+                modals.push(id);
+            }
+            ordered.push(id);
+            if host.virtual_lists.contains_key(&id) {
+                for &row in host.layout.visible_rows(id) {
+                    visit(host, row, cur_layer, false, ordered, deferred, seq, modals);
+                }
+            } else if !matches!(node, Node::List { .. }) {
+                for &c in host.tree.children(id) {
+                    visit(host, c, cur_layer, false, ordered, deferred, seq, modals);
+                }
+            }
+        }
+
+        visit(self, root, 0, true, &mut ordered, &mut deferred, &mut seq, &mut modals);
+        while let Some(next) = (0..deferred.len()).min_by_key(|&i| (deferred[i].1, deferred[i].2)) {
+            let (id, layer, _) = deferred.swap_remove(next);
+            visit(self, id, layer, true, &mut ordered, &mut deferred, &mut seq, &mut modals);
+        }
+
+        let active_modal = modals.last().copied();
+        ordered
+            .into_iter()
+            .filter(|&id| {
+                active_modal.is_none_or(|m| within_tree(&self.tree, id, m))
+                    && self.is_node_focusable(id)
+            })
+            .collect()
+    }
+
+    fn focus_step(&mut self, forward: bool) -> Option<u16> {
+        let order = self.focus_order();
+        if order.is_empty() {
+            return None;
+        }
+        let anchor = self.focused_node().or(self.sequential_focus_start);
+        let next = match anchor.and_then(|a| order.iter().position(|&id| id == a)) {
+            Some(idx) => {
+                if forward {
+                    order[(idx + 1) % order.len()]
+                } else {
+                    order[(idx + order.len() - 1) % order.len()]
+                }
+            }
+            None => {
+                if forward {
+                    order[0]
+                } else {
+                    *order.last().unwrap()
+                }
+            }
+        };
+        self.focus(Some(next));
+        self.scroll_node_into_view(next);
+        Some(next)
+    }
+
+    /// Moves keyboard focus to the next focusable node (`Tab`), wrapping around and respecting modal focus traps.
+    pub fn focus_next(&mut self) -> Option<u16> {
+        self.focus_step(true)
+    }
+
+    /// Moves keyboard focus to the previous focusable node (`Shift+Tab`), wrapping around and respecting modal focus traps.
+    pub fn focus_prev(&mut self) -> Option<u16> {
+        self.focus_step(false)
+    }
+
+    /// Activates the currently focused non-input control (`Enter` / `Space`), firing its `press` or button callback.
+    pub fn activate_focused(&mut self) -> bool {
+        let Some(id) = self.focused_node() else {
+            return false;
+        };
+        self.activate_node(id)
+    }
+
+    pub(crate) fn activate_node(&mut self, id: u16) -> bool {
+        if !self.row_can_receive(id) {
+            return false;
+        }
+        match self.tree.nodes.get(&id) {
+            Some(Node::Box {
+                press,
+                disabled: false,
+                ..
+            }) if *press != 0 => {
+                let callback = *press;
+                self.send(Event {
+                    callback,
+                    text: String::new(),
+                });
+                true
+            }
+            Some(Node::Button { callback }) if *callback != 0 => {
+                let callback = *callback;
+                self.send(Event {
+                    callback,
+                    text: String::new(),
+                });
+                true
+            }
+            Some(Node::Input { .. }) => {
+                self.focus(Some(id));
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Scrolls any ancestor scroll containers so `id` is visible inside their viewports.
+    pub fn scroll_node_into_view(&mut self, id: u16) -> bool {
+        if self.tree.nodes.get(&id).is_none() {
+            return false;
+        }
+        let node_rect = self.tree.rect(id);
+        let mut changed = false;
+        let mut anc = self.tree.parent(id);
+        while let Some(a) = anc {
+            if !self.virtual_lists.contains_key(&a)
+                && self.tree.nodes.get(&a).and_then(Node::style).is_some_and(|s| s.scroll)
+            {
+                let anc_rect = self.tree.rect(a);
+                let content = self.layout.content_height(a);
+                let max = (content - anc_rect[3]).max(0.);
+                if max > 0. {
+                    let current = self.scroll.get(&a).copied().unwrap_or(0.).clamp(0., max);
+                    let rel_top = node_rect[1] - anc_rect[1];
+                    let rel_bottom = rel_top + node_rect[3];
+                    let target = if rel_top < current {
+                        rel_top.clamp(0., max)
+                    } else if rel_bottom > current + anc_rect[3] {
+                        (rel_bottom - anc_rect[3]).clamp(0., max)
+                    } else {
+                        current
+                    };
+                    if (target - current).abs() > 0.5 {
+                        self.motion.release(a, Channel::Scroll);
+                        self.scroll.insert(a, target);
+                        changed = true;
+                    }
+                }
+            }
+            anc = self.tree.parent(a);
+        }
+        changed
+    }
+
+    pub(crate) fn a11y_focused_editor_text(&self) -> (String, [u32; 2]) {
+        (
+            self.editor.text().into_owned(),
+            self.editor.directed_selection(),
+        )
+    }
+
+    pub(crate) fn a11y_virtual_rows(&self, id: u16) -> Option<&[u16]> {
+        self.virtual_lists
+            .contains_key(&id)
+            .then(|| self.layout.visible_rows(id))
+    }
+
+    pub(crate) fn a11y_scroll_range(&self, id: u16) -> Option<(f64, f64)> {
+        if let Some((_, vlist)) = self.virtual_lists.get(&id) {
+            let layout_h = self.tree.rect(id)[3];
+            let (offset, extent) = vlist.frame_viewport(layout_h);
+            return Some((offset, vlist.max_offset(extent)));
+        }
+        if self
+            .tree
+            .nodes
+            .get(&id)
+            .and_then(Node::style)
+            .is_some_and(|s| s.scroll)
+        {
+            let view = self.tree.rect(id)[3];
+            let content = self.layout.content_height(id);
+            let max = (content - view).max(0.);
+            let offset = self.scroll.get(&id).copied().unwrap_or(0.).clamp(0., max);
+            return Some((f64::from(offset), f64::from(max)));
+        }
+        None
+    }
+
+    pub(crate) fn send_a11y_context_menu(&mut self, callback: u16, x: f32, y: f32) {
+        self.send_payload(callback, EventPayload::ContextMenu { x, y });
+    }
+
+    pub(crate) fn set_focused_selection(&mut self, sel: [u32; 2]) -> bool {
+        let Some(id) = self.focused_input() else {
+            return false;
+        };
+        if self.editor.composing() {
+            self.ime_interrupt_pending = true;
+        }
+        self.editor.set_selection(sel);
+        self.ime_revision += 1;
+        self.ime_change_cause = ImeChangeCause::Other;
+        self.publish(id);
+        true
+    }
+
+    pub(crate) fn scroll_node_by(&mut self, id: u16, dir: f32, page: bool) -> bool {
+        if let Some((_, vlist)) = self.virtual_lists.get_mut(&id) {
+            let Some(requested) = vlist.auto.as_ref().map(|a| a.requested) else {
+                return false;
+            };
+            let view = self.tree.rect(id)[3];
+            let extent = f64::from(view);
+            let max = vlist.max_offset(extent);
+            if max <= 0. {
+                return false;
+            }
+            let current = vlist.offset_for(requested, extent);
+            let step = if page { (view * 0.85).max(40.) } else { 40. };
+            let next = (current + f64::from(dir * step)).clamp(0., max);
+            if (next - current).abs() < 0.5 {
+                return false;
+            }
+            if let Some(auto) = &mut vlist.auto {
+                auto.requested = Some(ListOffset::Pixels(next));
+            }
+            return true;
+        }
+        if !self
+            .tree
+            .nodes
+            .get(&id)
+            .and_then(Node::style)
+            .is_some_and(|s| s.scroll)
+        {
+            return false;
+        }
+        let view = self.tree.rect(id)[3];
+        let content = self.layout.content_height(id);
+        let max = (content - view).max(0.);
+        if max <= 0. {
+            return false;
+        }
+        let current = self.scroll.get(&id).copied().unwrap_or(0.).clamp(0., max);
+        let step = if page { (view * 0.85).max(40.) } else { 40. };
+        let next = (current + dir * step).clamp(0., max);
+        if (next - current).abs() < 0.5 {
+            return false;
+        }
+        self.motion.release(id, Channel::Scroll);
+        self.scroll.insert(id, next);
+        true
+    }
+
+    pub(crate) fn set_node_scroll_offset(&mut self, id: u16, offset: f32) -> bool {
+        if !offset.is_finite() {
+            return false;
+        }
+        if let Some((_, vlist)) = self.virtual_lists.get_mut(&id) {
+            if vlist.auto.is_none() {
+                return false;
+            }
+            let extent = f64::from(self.tree.rect(id)[3]);
+            let max = vlist.max_offset(extent);
+            let next = f64::from(offset).clamp(0., max);
+            if let Some(auto) = &mut vlist.auto {
+                auto.requested = Some(ListOffset::Pixels(next));
+            }
+            return true;
+        }
+        if !self
+            .tree
+            .nodes
+            .get(&id)
+            .and_then(Node::style)
+            .is_some_and(|s| s.scroll)
+        {
+            return false;
+        }
+        let view = self.tree.rect(id)[3];
+        let content = self.layout.content_height(id);
+        let max = (content - view).max(0.);
+        let next = offset.clamp(0., max);
+        self.motion.release(id, Channel::Scroll);
+        self.scroll.insert(id, next);
+        true
+    }
+
+    pub(crate) fn set_sequential_focus_start(&mut self, id: u16) {
+        self.sequential_focus_start = Some(id);
+    }
+
     /// Consumes a pending IME-interruption signal triggered by clicks, drags, Escape, or JS resets.
     pub fn take_ime_interrupt(&mut self) -> bool {
         std::mem::take(&mut self.ime_interrupt_pending)
@@ -3331,14 +3742,14 @@ impl Host {
         self.pointer
     }
 
-    /// Whether a field has focus: the backend enables the platform's input method only then.
+    /// Whether a text field has focus: the backend enables the platform's input method only then.
     pub fn focused(&self) -> bool {
-        self.focused.is_some_and(|id| self.row_can_receive(id))
+        self.focused_input().is_some()
     }
 
     /// Cross-platform IME state for the focused field (purpose, whether IME is allowed, and surrounding text).
     pub fn ime_state(&self) -> ImeState {
-        let Some(id) = self.focused.filter(|&id| self.row_can_receive(id)) else {
+        let Some(id) = self.focused_input() else {
             return ImeState {
                 focused_id: None,
                 allowed: false,
@@ -3381,7 +3792,7 @@ impl Host {
     /// Keyboard and input-method events for the focused field.
     pub fn edit(&mut self, events: &[EditorEvent]) -> EditorOutput {
         let mut output = EditorOutput::default();
-        let Some(id) = self.focused.filter(|&id| self.row_can_receive(id)) else {
+        let Some(id) = self.focused_input() else {
             return output;
         };
         let composing = self.editor.composing()
@@ -3503,7 +3914,7 @@ impl Host {
     }
 
     // The field's text area: its rectangle minus its padding.
-    fn input_content(&self, id: u16) -> Rect {
+    pub(crate) fn input_content(&self, id: u16) -> Rect {
         let [x, y, w, h] = self.tree.rect(id);
         let [top, right, bottom, left] = self
             .tree
@@ -3812,7 +4223,7 @@ impl Host {
         now: f64,
     ) -> (Frame, Vec<(u16, Placement)>) {
         self.lay_out(width, height, now);
-        if self.focused.is_some() && !self.focused() {
+        if self.focused.is_some() && self.focused_node().is_none() {
             self.focused = None;
             self.editor_dragging = false;
         }
@@ -4935,7 +5346,7 @@ impl<'a> Walker<'a> {
         resolve_variant(paint, disabled, hover, active, self.focused == Some(id))
     }
 
-    fn row_can_receive(&self, mut child: u16) -> bool {
+    pub(crate) fn row_can_receive(&self, mut child: u16) -> bool {
         if self.virtual_lists.is_empty() {
             return true;
         }

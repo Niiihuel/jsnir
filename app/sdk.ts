@@ -544,6 +544,45 @@ var SIDE_CODES: { [k: string]: number | undefined } = {
     bottom: 2,
     left: 3,
 };
+var A11Y_ROLE_CODES: { [k: string]: number | undefined } = {
+    generic: 0,
+    group: 1,
+    region: 2,
+    navigation: 3,
+    main: 4,
+    toolbar: 5,
+    button: 6,
+    link: 7,
+    checkBox: 8,
+    switch: 9,
+    radioButton: 10,
+    tab: 11,
+    tabList: 12,
+    tabPanel: 13,
+    menu: 14,
+    menuItem: 15,
+    dialog: 16,
+    alertDialog: 17,
+    alert: 18,
+    status: 19,
+    tooltip: 20,
+    heading: 21,
+    label: 22,
+    list: 23,
+    listItem: 24,
+    tree: 25,
+    treeItem: 26,
+    scrollView: 27,
+    slider: 28,
+    progressIndicator: 29,
+    image: 30,
+    terminal: 31,
+};
+var A11Y_LIVE_CODES: { [k: string]: number | undefined } = {
+    off: 0,
+    polite: 1,
+    assertive: 2,
+};
 var ANCHOR_ALIGN_CODES: { [k: string]: number | undefined } = {
     start: 0,
     center: 1,
@@ -1000,6 +1039,42 @@ function tryWritePaint(start: number, paint: Paint): number {
         if (ex.y !== undefined) { emask |= 1 << 2; f[p++] = ex.y; }
         if (ex.scale !== undefined) { emask |= 1 << 3; f[p++] = ex.scale; }
         u[exStart] = emask;
+    }
+    v = paint.a11y;
+    if (v !== undefined) {
+        if (p + 10 > cmdCap) return -2;
+        var a11y = v as A11y;
+        var roleCode: number | undefined = undefined;
+        if (a11y.role !== undefined) {
+            roleCode = A11Y_ROLE_CODES[a11y.role];
+            if (roleCode === undefined) return -1;
+        }
+        var liveCode: number | undefined = undefined;
+        if (a11y.live !== undefined) {
+            liveCode = A11Y_LIVE_CODES[a11y.live];
+            if (liveCode === undefined) return -1;
+        }
+        var levelVal = a11y.level;
+        if (levelVal !== undefined && ((levelVal & 0xffff) !== levelVal)) return -1;
+        mask |= 1 << 25;
+        var aStart = p++;
+        var amask = 0;
+        if (roleCode !== undefined) { amask |= 1 << 0; u[p++] = roleCode; }
+        if (a11y.label !== undefined) { amask |= 1 << 1; u[p++] = pushStr(a11y.label); }
+        if (a11y.description !== undefined) { amask |= 1 << 2; u[p++] = pushStr(a11y.description); }
+        if (a11y.value !== undefined) { amask |= 1 << 3; u[p++] = pushStr(a11y.value); }
+        if (a11y.checked !== undefined) { amask |= 1 << 4; if (a11y.checked) amask |= 1 << 16; }
+        if (a11y.selected !== undefined) { amask |= 1 << 5; if (a11y.selected) amask |= 1 << 17; }
+        if (a11y.expanded !== undefined) { amask |= 1 << 6; if (a11y.expanded) amask |= 1 << 18; }
+        if (a11y.hidden) amask |= 1 << 7;
+        if (a11y.modal) amask |= 1 << 8;
+        if (levelVal !== undefined) { amask |= 1 << 9; u[p++] = levelVal; }
+        if (liveCode !== undefined) { amask |= 1 << 10; u[p++] = liveCode; }
+        if (a11y.focusable !== undefined) { amask |= 1 << 11; if (a11y.focusable) amask |= 1 << 19; }
+        if (a11y.numericValue !== undefined) { amask |= 1 << 12; f[p++] = a11y.numericValue; }
+        if (a11y.minValue !== undefined) { amask |= 1 << 13; f[p++] = a11y.minValue; }
+        if (a11y.maxValue !== undefined) { amask |= 1 << 14; f[p++] = a11y.maxValue; }
+        u[aStart] = amask;
     }
     u[start] = mask;
     return p;
