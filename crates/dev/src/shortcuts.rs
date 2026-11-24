@@ -16,12 +16,19 @@ pub enum ShortcutAction {
 }
 
 /// Prints the startup banner (Vite-style) to stderr.
-pub fn print_banner(entry_display: &str, size: [u32; 2], typecheck_label: &str, ready_ms: u128) {
+pub fn print_banner(
+    entry_display: &str,
+    size: [u32; 2],
+    engine_label: &str,
+    typecheck_label: &str,
+    ready_ms: u128,
+) {
     let version = env!("CARGO_PKG_VERSION");
     eprintln!();
     eprintln!("  \x1b[1;36mJSNIR\x1b[0m \x1b[36mv{version}\x1b[0m  \x1b[2mready in\x1b[0m \x1b[1m{ready_ms} ms\x1b[0m");
     eprintln!();
     eprintln!("  \x1b[32m➜\x1b[0m  \x1b[1mEntry:\x1b[0m    {entry_display}");
+    eprintln!("  \x1b[32m➜\x1b[0m  \x1b[1mEngine:\x1b[0m   {engine_label}");
     eprintln!("  \x1b[32m➜\x1b[0m  \x1b[1mWindow:\x1b[0m   {}×{}", size[0], size[1]);
     eprintln!("  \x1b[32m➜\x1b[0m  \x1b[1mTypes:\x1b[0m    {typecheck_label}");
     if io::stdin().is_terminal() {

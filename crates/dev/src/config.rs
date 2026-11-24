@@ -16,6 +16,24 @@ pub enum TypecheckMode {
     Off,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EngineKind {
+    #[default]
+    #[serde(alias = "qjs", alias = "quickjs-ng")]
+    QuickJs,
+    V8,
+}
+
+impl EngineKind {
+    pub fn banner_label(self) -> &'static str {
+        match self {
+            Self::QuickJs => "quickjs-ng (lightweight)",
+            Self::V8 => "v8 (TurboFan JIT · in-place reload)",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
@@ -23,6 +41,7 @@ pub struct AppConfig {
     pub title: String,
     pub size: [u32; 2],
     pub args: String,
+    pub engine: EngineKind,
 }
 
 impl Default for AppConfig {
@@ -32,6 +51,7 @@ impl Default for AppConfig {
             title: String::from("JSNIR"),
             size: [960, 640],
             args: String::from("{}"),
+            engine: EngineKind::QuickJs,
         }
     }
 }

@@ -1,12 +1,13 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use jsnir::{
+    ScriptBundle,
     host::{DevError, Host},
     text::TextEngine,
 };
 use jsnir_dev::{
-    DevConfig, JSNIR_DTS, ModuleGraph, SDK_TS, TypecheckMode, TypecheckOutcome, assets,
-    compile_entry, compiled_sdk, find_tsc, parse_size, run_typecheck, session, shortcuts,
-    start_dev,
+    DevConfig, EngineKind, JSNIR_DTS, ModuleGraph, SDK_TS, TypecheckMode, TypecheckOutcome,
+    assets, compile_entry, compiled_sdk, create_engine_factory, find_tsc, parse_size,
+    run_typecheck, session, shortcuts, start_dev,
 };
 use std::{
     fs,
@@ -43,6 +44,22 @@ impl From<CliTypecheck> for TypecheckMode {
     }
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum CliEngine {
+    #[value(alias = "qjs")]
+    Quickjs,
+    V8,
+}
+
+impl From<CliEngine> for EngineKind {
+    fn from(value: CliEngine) -> Self {
+        match value {
+            CliEngine::Quickjs => EngineKind::QuickJs,
+            CliEngine::V8 => EngineKind::V8,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Start development mode with instant Oxc hot reload, error overlay, and TTY shortcuts.
@@ -50,6 +67,9 @@ enum Commands {
     Dev {
         /// Entry TSX/TS file or project directory (defaults to jsnir.toml or src/app.tsx).
         entry: Option<PathBuf>,
+        /// JavaScript VM backend (`quickjs` default, or `v8` when built with `--features engine-v8`).
+        #[arg(long, value_enum)]
+        engine: Option<CliEngine>,
         /// Window title override.
         #[arg(long)]
         title: Option<String>,
@@ -87,6 +107,9 @@ enum Commands {
     Run {
         /// Compiled bundle `.js` or `.jsbc` file.
         bundle: PathBuf,
+        /// JavaScript VM backend (`quickjs` default, or `v8` when built with `--features engine-v8`).
+        #[arg(long, value_enum, default_value_t = CliEngine::Quickjs)]
+        engine: CliEngine,
         /// Window title.
         #[arg(long, default_value = "JSNIR")]
         title: String,
@@ -117,6 +140,9 @@ enum Commands {
         /// Output PPM file path.
         #[arg(short, long)]
         out: PathBuf,
+        /// JavaScript VM backend (`quickjs` default, or `v8` when built with `--features engine-v8`).
+        #[arg(long, value_enum)]
+        engine: Option<CliEngine>,
         /// Logical size as WIDTHxHEIGHT.
         #[arg(long)]
         size: Option<String>,
@@ -137,16 +163,17 @@ const PLACEHOLDER_APP: &str = r#"mount(() => Box({ style: { width: 1, height: 1 
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
-        None => cmd_dev(None, None, None, None, None, false, false),
+        None => cmd_dev(None, None, None, None, None, None, false, false),
         Some(Commands::Dev {
             entry,
+            engine,
             title,
             size,
             args,
             typecheck,
             no_overlay,
             clear,
-        }) => cmd_dev(entry, title, size, args, typecheck, no_overlay, clear),
+        }) => cmd_dev(entry, engine, title, size, args, typecheck, no_overlay, clear),
         Some(Commands::Build {
             entry,
             out,
@@ -155,20 +182,22 @@ fn main() -> ExitCode {
         }) => cmd_build(entry, out, no_typecheck, bytecode),
         Some(Commands::Run {
             bundle,
+            engine,
             title,
             size,
             args,
-        }) => cmd_run(bundle, title, size, args),
+        }) => cmd_run(bundle, engine.into(), title, size, args),
         Some(Commands::Check { entry }) => cmd_check(entry),
         Some(Commands::Init { dir, name }) => cmd_init(dir, name),
         Some(Commands::Capture {
             entry,
             out,
+            engine,
             size,
             scale,
             focus,
             args,
-        }) => cmd_capture(entry, out, size, scale, focus, args),
+        }) => cmd_capture(entry, out, engine, size, scale, focus, args),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -179,8 +208,10 @@ fn main() -> ExitCode {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_dev(
     entry: Option<PathBuf>,
+    engine: Option<CliEngine>,
     title: Option<String>,
     size: Option<String>,
     args: Option<String>,
@@ -190,6 +221,10 @@ fn cmd_dev(
 ) -> Result<(), String> {
     let started = Instant::now();
     let mut config = DevConfig::discover(entry.as_deref())?;
+    if let Some(engine) = engine {
+        config.app.engine = engine.into();
+    }
+    let factory = create_engine_factory(config.app.engine)?;
     if let Some(title) = title {
         config.app.title = title;
     }
@@ -220,7 +255,12 @@ fn cmd_dev(
         }
     };
 
-    let mut host = match Host::try_new(initial_script, config.app.args.clone(), TextEngine::default()) {
+    let mut host = match Host::try_new_with_engine(
+        factory.clone(),
+        ScriptBundle::Source(initial_script),
+        config.app.args.clone(),
+        TextEngine::default(),
+    ) {
         Ok(host) => host,
         Err(err) => {
             let dev_err = DevError {
@@ -232,7 +272,12 @@ fn cmd_dev(
             session::print_dev_error(&dev_err);
             initial_error = Some(dev_err);
             let fallback = format!("{}\n{PLACEHOLDER_APP}", compiled_sdk().map_err(|e| e.message)?);
-            Host::try_new(fallback, config.app.args.clone(), TextEngine::default())?
+            Host::try_new_with_engine(
+                factory,
+                ScriptBundle::Source(fallback),
+                config.app.args.clone(),
+                TextEngine::default(),
+            )?
         }
     };
 
@@ -262,6 +307,7 @@ fn cmd_dev(
     shortcuts::print_banner(
         &entry_display,
         config.app.size,
+        config.app.engine.banner_label(),
         &tc_label,
         started.elapsed().as_millis(),
     );
@@ -338,10 +384,19 @@ fn cmd_build(
     Ok(())
 }
 
-fn cmd_run(bundle: PathBuf, title: String, size: String, args: String) -> Result<(), String> {
+fn cmd_run(
+    bundle: PathBuf,
+    engine: EngineKind,
+    title: String,
+    size: String,
+    args: String,
+) -> Result<(), String> {
+    let factory = create_engine_factory(engine)?;
     let size = parse_size(&size)?;
     let bytes = fs::read(&bundle).map_err(|e| format!("{}: {e}", bundle.display()))?;
-    let host = Host::try_new_auto(bytes, args, TextEngine::default())
+    let script = ScriptBundle::from_bytes(bytes)
+        .map_err(|e| format!("{}: {e}", bundle.display()))?;
+    let host = Host::try_new_with_engine(factory, script, args, TextEngine::default())
         .map_err(|e| format!("{}: {e}", bundle.display()))?;
     jsnir_gpu::open(host, &title, size, false, None).map_err(|e| e.to_string())
 }
@@ -361,12 +416,17 @@ fn cmd_check(entry: Option<PathBuf>) -> Result<(), String> {
 fn cmd_capture(
     entry: Option<PathBuf>,
     out: PathBuf,
+    engine: Option<CliEngine>,
     size: Option<String>,
     scale: f32,
     focus: bool,
     args: Option<String>,
 ) -> Result<(), String> {
     let mut config = DevConfig::discover(entry.as_deref())?;
+    if let Some(engine) = engine {
+        config.app.engine = engine.into();
+    }
+    let factory = create_engine_factory(config.app.engine)?;
     if let Some(size) = size {
         config.app.size = parse_size(&size)?;
     }
@@ -382,7 +442,8 @@ fn cmd_capture(
     {
         let bytes = fs::read(&config.app.entry)
             .map_err(|e| format!("{}: {e}", config.app.entry.display()))?;
-        Host::try_new_auto(bytes, config.app.args, TextEngine::default())?
+        let bundle = ScriptBundle::from_bytes(bytes)?;
+        Host::try_new_with_engine(factory, bundle, config.app.args, TextEngine::default())?
     } else {
         let script = compile_entry(&config.root, &config.app.entry)
             .map_err(|e| {
@@ -390,7 +451,12 @@ fn cmd_capture(
                 e.message
             })?
             .code;
-        Host::try_new(script, config.app.args, TextEngine::default())?
+        Host::try_new_with_engine(
+            factory,
+            ScriptBundle::Source(script),
+            config.app.args,
+            TextEngine::default(),
+        )?
     };
     assets::load_into_host(
         &mut host,
@@ -425,6 +491,7 @@ fn cmd_init(dir: Option<PathBuf>, name: Option<String>) -> Result<(), String> {
 entry = "src/app.tsx"
 title = {title:?}
 size = [960, 640]
+# engine = "quickjs" # or "v8" when built with --features engine-v8
 
 [dev]
 typecheck = "async"

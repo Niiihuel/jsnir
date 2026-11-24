@@ -7,9 +7,11 @@ license = "MIT"
 [features]
 examples = ["jsnir/examples"]
 stepper = ["jsnir/stepper", "dep:serde_json"]
+engine-v8 = ["dep:jsnir-v8"]
 
 [dependencies]
 jsnir = { path = "../..", default-features = false, features = ["engine-quickjs"] }
+jsnir-v8 = { path = "../../crates/engine-v8", optional = true }
 arboard = { version = "=3.7.0", default-features = false, features = ["wayland-data-control"] }
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "=0.4.0"

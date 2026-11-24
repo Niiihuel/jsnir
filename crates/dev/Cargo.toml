@@ -13,10 +13,15 @@ path = "src/lib.rs"
 name = "jsnir"
 path = "src/main.rs"
 
+[features]
+default = []
+engine-v8 = ["dep:jsnir-v8"]
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 jsnir = { path = "../..", default-features = false, features = ["engine-quickjs"] }
 jsnir-gpu = { path = "../../backends/gpu" }
+jsnir-v8 = { path = "../engine-v8", optional = true }
 notify-debouncer-mini = "0.7"
 oxc = { version = "0.159", features = ["ast_visit", "semantic", "transformer", "codegen"] }
 png = "0.17"

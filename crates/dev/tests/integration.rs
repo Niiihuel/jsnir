@@ -1,10 +1,7 @@
-use jsnir::{
-    editor::PointSelection,
-    host::Host,
-    text::TextEngine,
-    tree::Node,
-};
-use jsnir_dev::{DevConfig, ModuleGraph, compile_entry};
+#[cfg(feature = "engine-v8")]
+use jsnir::ScriptBundle;
+use jsnir::{editor::PointSelection, host::Host, text::TextEngine, tree::Node};
+use jsnir_dev::{DevConfig, EngineKind, ModuleGraph, compile_entry, create_engine_factory};
 use std::{
     fs,
     path::PathBuf,
@@ -277,3 +274,144 @@ fn jsnir_cli_init_build_and_check_work_end_to_end() {
     assert!(rendered.contains(&"Hello from JSNIR".into()), "{rendered:?}");
     assert!(rendered.contains(&"Clicks: 0".into()), "{rendered:?}");
 }
+
+#[test]
+fn config_parses_engine_selection_and_factory_matches_feature_gate() {
+    let dir = TempDir::new("jsnir-engine-cfg");
+    fs::write(
+        dir.0.join("jsnir.toml"),
+        "[app]\nentry = \"src/app.tsx\"\nengine = \"v8\"\n",
+    )
+    .unwrap();
+    let cfg = DevConfig::discover(Some(&dir.0)).unwrap();
+    assert_eq!(cfg.app.engine, EngineKind::V8);
+
+    let qjs = create_engine_factory(EngineKind::QuickJs).expect("quickjs factory");
+    assert_eq!(qjs.name(), "quickjs-ng");
+
+    #[cfg(not(feature = "engine-v8"))]
+    {
+        let err = create_engine_factory(EngineKind::V8)
+            .err()
+            .expect("v8 must be disabled in default lightweight build");
+        assert!(
+            err.contains("--features engine-v8"),
+            "expected actionable rebuild hint, got: {err}"
+        );
+
+        let bin = env!("CARGO_BIN_EXE_jsnir");
+        let out = Command::new(bin)
+            .args([
+                "capture",
+                dir.0.to_str().unwrap(),
+                "--out",
+                dir.0.join("out.ppm").to_str().unwrap(),
+                "--engine",
+                "v8",
+            ])
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("--features engine-v8"),
+            "unexpected CLI stderr: {stderr}"
+        );
+    }
+
+    #[cfg(feature = "engine-v8")]
+    {
+        let v8 = create_engine_factory(EngineKind::V8).expect("v8 factory");
+        assert_eq!(v8.name(), "v8");
+        assert!(v8.capabilities().jit);
+        assert!(v8.capabilities().in_place_reload);
+
+        // Full Oxc TSX compile + V8 Host + keyed-signal in-place reload!
+        let src = dir.0.join("src");
+        fs::create_dir_all(&src).unwrap();
+        let app = src.join("app.tsx");
+        fs::write(
+            &app,
+            r#"
+function App(): Element {
+    const count = signal(0);
+    return (
+        <Box style={{ width: 160, height: 48 }} onPress={() => count.update((n) => n + 1)}>
+            <Text>{() => `v8-count:${count.value}`}</Text>
+        </Box>
+    );
+}
+mount(App);
+"#,
+        )
+        .unwrap();
+        let b1 = compile_entry(&dir.0, &app).expect("compile v1");
+        let mut host = Host::try_new_with_engine(
+            v8,
+            ScriptBundle::Source(b1.code),
+            "{}".into(),
+            TextEngine::default(),
+        )
+        .expect("v8 host");
+        settle(&mut host);
+        assert!(texts(&host).contains(&"v8-count:0".into()));
+
+        host.pointer_move(Some([20., 20.]));
+        host.pointer_down(PointSelection::Place);
+        host.pointer_up();
+        settle(&mut host);
+        assert!(texts(&host).contains(&"v8-count:1".into()));
+
+        // Edit app.tsx and hot-reload in-place on V8, keeping count=1.
+        fs::write(
+            &app,
+            r#"
+function App(): Element {
+    const extra = signal(7);
+    const count = signal(0);
+    return (
+        <Box style={{ width: 160, height: 48 }} onPress={() => count.update((n) => n + 1)}>
+            <Text>{() => `v8-reloaded:${extra.value}:${count.value}`}</Text>
+        </Box>
+    );
+}
+mount(App);
+"#,
+        )
+        .unwrap();
+        let b2 = compile_entry(&dir.0, &app).expect("compile v2");
+        assert!(host.reload(b2.code));
+        settle(&mut host);
+        assert!(
+            texts(&host).contains(&"v8-reloaded:7:1".into()),
+            "expected in-place V8 reload to preserve count=1, got {:?}",
+            texts(&host)
+        );
+
+        // CLI `jsnir capture --engine v8` end-to-end offscreen render.
+        let bin = env!("CARGO_BIN_EXE_jsnir");
+        let ppm = dir.0.join("v8_frame.ppm");
+        let out = Command::new(bin)
+            .args([
+                "capture",
+                dir.0.to_str().unwrap(),
+                "--out",
+                ppm.to_str().unwrap(),
+                "--engine",
+                "v8",
+                "--size",
+                "320x180",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "v8 capture failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let bytes = fs::read(&ppm).expect("read ppm");
+        assert!(bytes.starts_with(b"P6\n320 180\n255\n"));
+    }
+}
+

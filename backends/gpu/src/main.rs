@@ -7,12 +7,18 @@ mod window;
 use chat::Scene;
 #[cfg(feature = "examples")]
 use jsnir::{Mode, editor::EditorEvent};
-use jsnir::{host::Host, text::TextEngine};
+use jsnir::{
+    ScriptBundle,
+    engine::{JsEngineFactory, default_factory},
+    host::Host,
+    text::TextEngine,
+};
 use jsnir_gpu::open;
 #[cfg(feature = "examples")]
 use jsnir_gpu::renderer::{self, Renderer};
 #[cfg(any(feature = "examples", feature = "stepper"))]
 use std::path::Path;
+use std::sync::Arc;
 #[cfg(feature = "examples")]
 use std::time::{Duration, Instant};
 use std::{ffi::OsString, fs, path::PathBuf};
@@ -22,7 +28,7 @@ use winit::event_loop::EventLoop;
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 const USAGE: &str =
-    "usage: jsnir-gpu run APP.js [--title TITLE] [--size WIDTHxHEIGHT] [--offscreen file.ppm]
+    "usage: jsnir-gpu run APP.js [--engine quickjs|v8] [--title TITLE] [--size WIDTHxHEIGHT] [--offscreen file.ppm]
        jsnir-gpu --version";
 
 fn main() -> Result<()> {
@@ -38,7 +44,7 @@ fn main() -> Result<()> {
             println!("       jsnir-gpu rust|js [--offscreen file.ppm]");
             #[cfg(feature = "stepper")]
             println!(
-                "       jsnir-gpu stepper [--step N] [--name NAME] [--plan pro|starter] [--focus] [--offscreen file.ppm]"
+                "       jsnir-gpu stepper [--engine quickjs|v8] [--step N] [--name NAME] [--plan pro|starter] [--focus] [--offscreen file.ppm]"
             );
             Ok(())
         }
@@ -51,14 +57,40 @@ fn main() -> Result<()> {
     }
 }
 
+fn resolve_engine(name: &str) -> Result<Arc<dyn JsEngineFactory>> {
+    match name {
+        "quickjs" | "qjs" => Ok(default_factory()),
+        "v8" => {
+            #[cfg(feature = "engine-v8")]
+            {
+                Ok(Arc::new(jsnir_v8::V8Factory))
+            }
+            #[cfg(not(feature = "engine-v8"))]
+            {
+                Err(
+                    "V8 engine is not enabled in this build. Rebuild with: cargo build --manifest-path backends/gpu/Cargo.toml --features engine-v8"
+                        .into(),
+                )
+            }
+        }
+        other => Err(format!("unknown JS engine {other:?}: expected \"quickjs\" or \"v8\"").into()),
+    }
+}
+
 fn run_external(mut args: impl Iterator<Item = OsString>) -> Result<()> {
     let source = PathBuf::from(args.next().ok_or(USAGE)?);
     let mut title = String::from("JSNIR");
     let mut size = [800, 600];
     let mut output = None;
+    let mut engine = String::from("quickjs");
     while let Some(flag) = args.next() {
         let value = args.next().ok_or(USAGE)?;
         match flag.to_str() {
+            Some("--engine") => {
+                engine = value
+                    .into_string()
+                    .map_err(|_| "engine must be UTF-8")?
+            }
             Some("--title") => title = value.into_string().map_err(|_| "title must be UTF-8")?,
             Some("--size") => {
                 size = value
@@ -70,9 +102,12 @@ fn run_external(mut args: impl Iterator<Item = OsString>) -> Result<()> {
             _ => return Err(USAGE.into()),
         }
     }
+    let factory = resolve_engine(&engine)?;
     let bytes =
         fs::read(&source).map_err(|error| format!("{}: {error}", source.display()))?;
-    let host = Host::try_new_auto(bytes, "{}".into(), TextEngine::default())
+    let bundle = ScriptBundle::from_bytes(bytes)
+        .map_err(|error| format!("{}: {error}", source.display()))?;
+    let host = Host::try_new_with_engine(factory, bundle, "{}".into(), TextEngine::default())
         .map_err(|error| format!("{}: {error}", source.display()))?;
     open(host, &title, size, false, output.as_deref())
 }
@@ -143,10 +178,12 @@ fn inter() -> TextEngine {
 fn stepper(args: Vec<String>) -> Result<()> {
     let mut state = serde_json::Map::new();
     let (mut focus, mut output) = (false, None);
+    let mut engine = String::from("quickjs");
     let mut args = args.into_iter();
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or(USAGE);
         match flag.as_str() {
+            "--engine" => engine = value()?,
             "--step" => {
                 let step: u32 = value()?.parse().map_err(|_| USAGE)?;
                 state.insert("step".into(), step.into());
@@ -162,8 +199,14 @@ fn stepper(args: Vec<String>) -> Result<()> {
             _ => return Err(USAGE.into()),
         }
     }
+    let factory = resolve_engine(&engine)?;
     let state = serde_json::Value::Object(state).to_string();
-    let host = Host::new(jsnir::apps::STEPPER.into(), state, inter());
+    let host = Host::try_new_with_engine(
+        factory,
+        ScriptBundle::Source(jsnir::apps::STEPPER.into()),
+        state,
+        inter(),
+    )?;
     open(
         host,
         "Stepper · JSNIR",
