@@ -355,6 +355,10 @@ impl Chat {
     pub fn composing(&self) -> bool {
         self.editor.composing()
     }
+
+    pub fn surrounding_text(&self) -> crate::editor::SurroundingText {
+        self.editor.surrounding_text(4000)
+    }
     /// Applies the events of one platform delivery. Enter may arrive before or after the Commit.
     pub fn edit(&mut self, events: &[EditorEvent]) -> EditorOutput {
         if events.is_empty() {

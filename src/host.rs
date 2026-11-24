@@ -161,13 +161,34 @@ pub struct DevError {
     pub frame: Option<String>,
 }
 
+/// Why the focused input's text or selection changed (used by Wayland `zwp_text_input_v3`
+/// `set_text_change_cause` so IMEs distinguish their own commits from external edits).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ImeChangeCause {
+    /// Text or selection changed due to an input-method event (`Commit`, `DeleteSurrounding*`).
+    InputMethod,
+    /// Text or selection changed externally (keyboard, pointer, Paste, Undo, JS `SetField`, focus).
+    #[default]
+    Other,
+}
+
 /// Cross-platform IME state for the currently focused field (Linux Wayland/X11, Windows TSF, macOS).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImeState {
+    /// Focused input node ID (`None` when unfocused). Distinguishes switching between two inputs.
+    pub focused_id: Option<u16>,
     /// Whether platform IME composition should be enabled (false when unfocused or focused on a password field).
     pub allowed: bool,
     /// Semantic purpose of the focused input.
     pub purpose: InputPurpose,
+    /// Whether the focused field accepts line breaks (`ContentHint::Multiline` on Wayland).
+    pub multiline: bool,
+    /// Whether Enter submits the focused field (`zwp_text_input_v3` v2 submit action hint).
+    pub submit_on_enter: bool,
+    /// Cause of the latest text/selection change (`InputMethod` vs `Other`).
+    pub change_cause: ImeChangeCause,
+    /// Monotonic revision incremented on edits, focus changes, and external resets.
+    pub revision: u64,
     /// Window of text surrounding the caret/selection (at most 4000 UTF-8 bytes) when `allowed` is true.
     pub surrounding: Option<SurroundingText>,
 }
@@ -670,6 +691,9 @@ pub struct Host {
     editor_key: Option<EditorBitmapKey>,
     // A press inside the focused field extends the selection while the pointer moves.
     editor_dragging: bool,
+    ime_revision: u64,
+    ime_change_cause: ImeChangeCause,
+    ime_interrupt_pending: bool,
     published: (String, [u32; 2]),
     hits: Vec<Hit>,
     cursor_rects: Vec<CursorHit>,
@@ -910,6 +934,9 @@ impl Host {
             editor: LineEditor::default(),
             editor_key: None,
             editor_dragging: false,
+            ime_revision: 0,
+            ime_change_cause: ImeChangeCause::Other,
+            ime_interrupt_pending: false,
             published: Default::default(),
             hits: Vec::new(),
             cursor_rects: Vec::new(),
@@ -1767,6 +1794,8 @@ impl Host {
                 self.node_drag = None;
                 self.pending_drag_move = None;
                 self.focused = None;
+                self.ime_revision += 1;
+                self.ime_change_cause = ImeChangeCause::Other;
             }
         }
     }
@@ -1815,6 +1844,8 @@ impl Host {
                 let (multiline, password) = (*multiline, *purpose == InputPurpose::Password);
                 self.editor.reset(&text, selection, multiline);
                 self.editor.set_password(password);
+                self.ime_revision += 1;
+                self.ime_change_cause = ImeChangeCause::Other;
                 self.publish(id);
             }
         }
@@ -2066,6 +2097,11 @@ impl Host {
                     .set_password(*purpose == InputPurpose::Password);
                 self.published = (text.clone(), *selection);
                 self.editor_key = None;
+                self.ime_revision += 1;
+                self.ime_change_cause = ImeChangeCause::Other;
+                if self.editor.composing() {
+                    self.ime_interrupt_pending = true;
+                }
             }
         }
         if let Some(id) = focus_request {
@@ -2717,6 +2753,7 @@ impl Host {
         if self.focused == id {
             return;
         }
+        let was_composing = self.editor.composing();
         if self.focused.is_some() {
             self.edit(&[EditorEvent::Preedit {
                 text: String::new(),
@@ -2724,6 +2761,11 @@ impl Host {
             }]);
         }
         self.focused = id;
+        self.ime_revision += 1;
+        self.ime_change_cause = ImeChangeCause::Other;
+        if was_composing {
+            self.ime_interrupt_pending = true;
+        }
         if let Some(Node::Input {
             text,
             selection,
@@ -2745,6 +2787,11 @@ impl Host {
         }
     }
 
+    /// Consumes a pending IME-interruption signal triggered by clicks, drags, Escape, or JS resets.
+    pub fn take_ime_interrupt(&mut self) -> bool {
+        std::mem::take(&mut self.ime_interrupt_pending)
+    }
+
     /// Where the pointer is, if it is over the window.
     pub fn pointer(&self) -> Option<[f32; 2]> {
         self.pointer
@@ -2759,20 +2806,36 @@ impl Host {
     pub fn ime_state(&self) -> ImeState {
         let Some(id) = self.focused.filter(|&id| self.row_can_receive(id)) else {
             return ImeState {
+                focused_id: None,
                 allowed: false,
                 purpose: InputPurpose::Normal,
+                multiline: false,
+                submit_on_enter: false,
+                change_cause: self.ime_change_cause,
+                revision: self.ime_revision,
                 surrounding: None,
             };
         };
-        let purpose = match self.tree.nodes.get(&id) {
-            Some(Node::Input { purpose, .. }) => *purpose,
-            _ => InputPurpose::Normal,
+        let (purpose, multiline, submit_on_enter) = match self.tree.nodes.get(&id) {
+            Some(Node::Input {
+                purpose,
+                multiline,
+                submit,
+                submit_on_enter,
+                ..
+            }) => (*purpose, *multiline, *submit != 0 && (!*multiline || *submit_on_enter)),
+            _ => (InputPurpose::Normal, false, false),
         };
         let allowed = purpose != InputPurpose::Password;
         let surrounding = allowed.then(|| self.editor.surrounding_text(4000));
         ImeState {
+            focused_id: Some(id),
             allowed,
             purpose,
+            multiline,
+            submit_on_enter,
+            change_cause: self.ime_change_cause,
+            revision: self.ime_revision,
             surrounding,
         }
     }
@@ -2846,6 +2909,18 @@ impl Host {
                 output.clipboard = effect.clipboard;
             }
             output.interrupt_ime |= effect.interrupt_ime;
+        }
+        if !events.is_empty() {
+            let all_ime = events.iter().all(EditorEvent::involves_ime);
+            self.ime_change_cause = if all_ime {
+                ImeChangeCause::InputMethod
+            } else {
+                ImeChangeCause::Other
+            };
+            self.ime_revision += 1;
+        }
+        if output.interrupt_ime {
+            self.ime_interrupt_pending = true;
         }
         self.publish(id);
         output
@@ -5165,7 +5240,20 @@ impl<'a> Walker<'a> {
                         line[3],
                     ];
                     if *purpose != InputPurpose::Password {
-                        *self.ime_area = Some(caret);
+                        let visible_box = intersect(content, clip);
+                        let area = if visible_box[2] > 0. && visible_box[3] > 0. {
+                            let max_x = (visible_box[0] + visible_box[2] - caret[2]).max(visible_box[0]);
+                            let max_y = (visible_box[1] + visible_box[3] - caret[3]).max(visible_box[1]);
+                            [
+                                caret[0].clamp(visible_box[0], max_x),
+                                caret[1].clamp(visible_box[1], max_y),
+                                caret[2],
+                                caret[3].min(visible_box[3]),
+                            ]
+                        } else {
+                            caret
+                        };
+                        *self.ime_area = Some(area);
                     }
                     let caret = (frame.caret_visible && !self.hide_caret).then_some(caret);
                     self.items.push(Item::Editor {
@@ -9078,5 +9166,72 @@ mount(ResizeApp);
         assert_eq!(surrounding.text, "hello 茶");
         let search_frame = host.frame(300., 120., 1., 4096);
         assert!(search_frame.ime_area.is_some());
+    }
+
+    #[test]
+    fn ime_state_tracks_focus_switch_change_cause_interrupt_and_atomic_batch() {
+        let script = r#"
+            function jsnirMount() {
+                jsnir.batch(JSON.stringify({ ops: [
+                    { op: 'create', id: 1, node: { kind: 'column', style: { width: 320, height: 200 } } },
+                    { op: 'create', id: 2, parent: 1, node: { kind: 'input', text: 'abc茶', multiline: true, submitOnEnter: true, submit: 1, style: { width: 260, height: 80 } } },
+                    { op: 'create', id: 3, parent: 1, node: { kind: 'input', text: 'dev@jsnir.dev', purpose: 'email', style: { width: 260, height: 32 } } },
+                ] }));
+            }
+        "#;
+        let mut host = Host::new(script.into(), "{}".into(), TextEngine::default());
+        settle(&mut host);
+
+        host.focus(Some(2));
+        let st1 = host.ime_state();
+        assert_eq!(st1.focused_id, Some(2));
+        assert!(st1.allowed);
+        assert!(st1.multiline);
+        assert!(st1.submit_on_enter);
+        assert_eq!(st1.change_cause, ImeChangeCause::Other);
+        let rev1 = st1.revision;
+
+        // Place caret at end (`abc茶`) and apply an atomic Wayland zwp_text_input_v3::done sequence:
+        // delete "茶" (3 UTF-8 bytes) -> commit "日本" -> start next preedit "語".
+        host.edit(&[EditorEvent::Move {
+            direction: Direction::TextEnd,
+            extend: false,
+        }]);
+        host.edit(&[
+            EditorEvent::DeleteSurroundingBytes {
+                before_bytes: 3,
+                after_bytes: 0,
+            },
+            EditorEvent::Commit("日本".into()),
+            EditorEvent::Preedit {
+                text: "語".into(),
+                active: Some(1..1),
+            },
+        ]);
+        let st2 = host.ime_state();
+        assert_eq!(st2.change_cause, ImeChangeCause::InputMethod);
+        assert!(st2.revision > rev1);
+        assert!(host.composing());
+        let surr = st2.surrounding.expect("surrounding text");
+        assert_eq!(surr.text, "abc日本");
+        assert_eq!(surr.cursor_byte, "abc日本".len());
+
+        // Clicking inside the focused input while composing MUST record a pending IME interrupt!
+        let _ = host.frame(320., 200., 1., 4096);
+        host.pointer_move(Some([20., 20.]));
+        host.pointer_down(PointSelection::Place);
+        host.pointer_up();
+        assert!(host.take_ime_interrupt(), "click during composition must trigger IME interrupt");
+        assert!(!host.composing());
+        assert_eq!(host.ime_state().change_cause, ImeChangeCause::Other);
+
+        // Switching focus directly from Input 2 -> Input 3 updates focused_id, purpose, and multiline.
+        host.focus(Some(3));
+        let st3 = host.ime_state();
+        assert_eq!(st3.focused_id, Some(3));
+        assert!(st3.allowed);
+        assert_eq!(st3.purpose, InputPurpose::Email);
+        assert!(!st3.multiline);
+        assert_eq!(st3.surrounding.unwrap().text, "dev@jsnir.dev");
     }
 }

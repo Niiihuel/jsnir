@@ -15,7 +15,24 @@ jsnir-v8 = { path = "../../crates/engine-v8", optional = true }
 arboard = { version = "=3.7.0", default-features = false, features = ["wayland-data-control"] }
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "=0.4.0"
+raw-window-handle = "0.6"
 serde_json = { version = "1", optional = true }
 wgpu = { version = "=30.0.1", default-features = false, features = ["std", "parking_lot", "gles", "vulkan", "wgsl"] }
 winit = { version = "=0.30.13", default-features = false, features = ["rwh_06", "wayland", "wayland-dlopen", "x11"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+wayland-backend = { version = "0.3", features = ["client_system", "dlopen"] }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Input_Ime",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
 

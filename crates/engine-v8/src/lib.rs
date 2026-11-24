@@ -680,9 +680,7 @@ fn build_context(
         }
     };
 
-    if let Some(wd) = watchdog {
-        wd.arm();
-    }
+    let mut eval_terminated = false;
     let result = (|| -> Result<ContextState, String> {
         v8::scope!(let handle_scope, isolate);
         let context = v8::Context::new(handle_scope, Default::default());
@@ -766,16 +764,28 @@ fn build_context(
             bind_fn(scope, global, ext, "jsnirRequest", cb_request)?;
         }
 
-        // Compile and run the script inside a TryCatch.
+        // Compile and run the user script inside a TryCatch, timing ONLY user JS evaluation
+        // (never V8's internal Context allocation and native bridge wiring).
         {
-            v8::tc_scope!(let tc, scope);
-            let source = v8::String::new(tc, js).ok_or("script too large for V8 string")?;
-            let Some(script) = v8::Script::compile(tc, source, None) else {
-                return Err(format_exception(tc, false));
-            };
-            if script.run(tc).is_none() {
-                return Err(format_exception(tc, false));
+            if let Some(wd) = watchdog {
+                wd.arm();
             }
+            let eval_res = {
+                v8::tc_scope!(let tc, scope);
+                let source = v8::String::new(tc, js).ok_or("script too large for V8 string")?;
+                match v8::Script::compile(tc, source, None) {
+                    None => Err(format_exception(tc, false)),
+                    Some(script) => {
+                        if script.run(tc).is_none() {
+                            Err(format_exception(tc, false))
+                        } else {
+                            Ok(())
+                        }
+                    }
+                }
+            };
+            eval_terminated = watchdog.is_some_and(Watchdog::disarm);
+            eval_res?;
         }
 
         let fn_mount = lookup_fn(scope, global, "jsnirMount");
@@ -803,8 +813,7 @@ fn build_context(
         })
     })();
 
-    let terminated = watchdog.is_some_and(Watchdog::disarm);
-    if terminated {
+    if eval_terminated {
         isolate.cancel_terminate_execution();
         if result.is_ok() {
             return Err("execution timed out (interrupted by VmLimits)".to_string());

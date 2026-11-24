@@ -6,8 +6,11 @@ use jsnir::{
     Mode,
     editor::{EditorEvent, PointSelection},
     history::{ROW_HEIGHT, ScrollEvent},
+    host::{ImeChangeCause, ImeState},
+    tree::InputPurpose,
 };
-use jsnir_gpu::input::{Clicks, Clipboard, ImeArea, KeyInput, editor_key, ime_event};
+use jsnir_gpu::ime::PlatformIme;
+use jsnir_gpu::input::{Clicks, Clipboard, KeyInput, editor_key};
 use jsnir_gpu::surface::{self, Surface};
 use std::{
     sync::Arc,
@@ -38,6 +41,9 @@ enum Drag {
 }
 
 pub struct App {
+    // Field drop order: `ime` detaches before `surface` drops.
+    ime: PlatformIme,
+    ime_revision: u64,
     // Created with the window: the backend depends on what the GPU offers.
     instance: Option<wgpu::Instance>,
     surface: Option<Surface>,
@@ -51,7 +57,6 @@ pub struct App {
     clipboard: Clipboard,
     clicks: Clicks,
     wake: Option<Instant>,
-    ime_area: ImeArea,
     error: Option<Box<dyn std::error::Error>>,
 }
 
@@ -62,6 +67,8 @@ impl App {
             scene.chat.watch();
         }
         Self {
+            ime: PlatformIme::default(),
+            ime_revision: 0,
             instance: None,
             scene,
             surface: None,
@@ -74,7 +81,6 @@ impl App {
             clipboard: Clipboard::default(),
             clicks: Clicks::default(),
             wake: None,
-            ime_area: ImeArea::default(),
             error: None,
         }
     }
@@ -84,6 +90,7 @@ impl App {
     }
 
     fn fail(&mut self, events: &ActiveEventLoop, error: impl Into<Box<dyn std::error::Error>>) {
+        self.ime.detach();
         self.error = Some(error.into());
         events.exit();
     }
@@ -98,10 +105,32 @@ impl App {
         self.window_focused && self.focus == Focus::Editor
     }
 
-    fn sync_ime(&mut self) {
-        self.ime_area.forget();
+    fn ime_state(&self, change_cause: ImeChangeCause) -> ImeState {
+        let allowed = self.focus == Focus::Editor;
+        ImeState {
+            focused_id: allowed.then_some(1),
+            allowed,
+            purpose: InputPurpose::Normal,
+            multiline: false,
+            submit_on_enter: true,
+            change_cause,
+            revision: self.ime_revision,
+            surrounding: allowed.then(|| self.scene.chat.surrounding_text()),
+        }
+    }
+
+    fn sync_ime(&mut self, change_cause: ImeChangeCause) {
+        let state = self.ime_state(change_cause);
         if let Some(surface) = &self.surface {
-            surface.window.set_ime_allowed(self.ime_allowed());
+            self.ime.sync(&surface.window, self.window_focused, state);
+        }
+    }
+
+    fn poll_ime(&mut self) {
+        let events = self.ime.poll_events();
+        if !events.is_empty() && self.ime_allowed() {
+            self.events.extend(events);
+            self.request_redraw();
         }
     }
 
@@ -116,26 +145,46 @@ impl App {
             });
         }
         self.focus = next;
-        self.sync_ime();
+        self.ime_revision += 1;
+        self.sync_ime(ImeChangeCause::Other);
     }
 
     fn apply_editor_events(&mut self) {
+        if self.events.is_empty() {
+            return;
+        }
+        let all_ime = self.events.iter().all(|e| {
+            matches!(
+                e,
+                EditorEvent::Preedit { .. }
+                    | EditorEvent::PreeditSegments { .. }
+                    | EditorEvent::Commit(_)
+                    | EditorEvent::DeleteSurrounding { .. }
+                    | EditorEvent::DeleteSurroundingBytes { .. }
+            )
+        });
         let output = self.scene.chat.edit(&self.events);
         self.events.clear();
+        self.ime_revision += 1;
         if let Some(text) = output.clipboard {
             self.clipboard.set_text(text);
         }
-        if output.interrupt_ime && self.ime_allowed() {
-            self.ime_area.forget();
-            if let Some(surface) = &self.surface {
-                surface.window.set_ime_allowed(false);
-                surface.window.set_ime_allowed(true);
-            }
+        if output.interrupt_ime
+            && let Some(surface) = &self.surface
+        {
+            self.ime.interrupt(&surface.window);
         }
+        let cause = if all_ime {
+            ImeChangeCause::InputMethod
+        } else {
+            ImeChangeCause::Other
+        };
+        self.sync_ime(cause);
     }
 
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
         self.wake = None;
+        self.poll_ime();
         self.scene.chat.poll();
         self.apply_editor_events();
 
@@ -190,7 +239,7 @@ impl App {
             self.scene
                 .draws(&surface.renderer, size, scale, focused, send_focused);
         if focused {
-            self.ime_area.update(&surface.window, caret);
+            self.ime.update_area(&surface.window, Some(caret));
         }
         surface.renderer.draw(&frame.texture, size, scale, &draws);
         surface.window.pre_present_notify();
@@ -328,7 +377,7 @@ impl App {
         if !self.ime_allowed() {
             return;
         }
-        if let Some(event) = ime_event(event) {
+        if let Some(event) = self.ime.handle_winit_ime(event) {
             self.events.push(event);
             self.request_redraw();
         }
@@ -352,10 +401,11 @@ impl ApplicationHandler for App {
         })();
         match result {
             Ok((instance, surface)) => {
+                self.ime.attach(&surface.window);
                 self.instance = Some(instance);
                 self.surface = Some(surface);
                 self.layout();
-                self.sync_ime();
+                self.sync_ime(ImeChangeCause::Other);
                 self.request_redraw();
             }
             Err(error) => self.fail(events, error),
@@ -371,7 +421,10 @@ impl ApplicationHandler for App {
             return;
         }
         match event {
-            WindowEvent::CloseRequested => events.exit(),
+            WindowEvent::CloseRequested => {
+                self.ime.detach();
+                events.exit();
+            }
             WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
                 if let Some(surface) = &mut self.surface {
                     surface.resize();
@@ -392,7 +445,7 @@ impl ApplicationHandler for App {
                         active: None,
                     });
                 }
-                self.sync_ime();
+                self.sync_ime(ImeChangeCause::Other);
                 self.request_redraw();
             }
             WindowEvent::MouseInput {
@@ -413,6 +466,7 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, events: &ActiveEventLoop) {
+        self.poll_ime();
         let interval = if self.scene.chat.pending() {
             Some(Duration::from_millis(8))
         } else if self.scene.chat.watching() {

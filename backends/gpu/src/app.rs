@@ -1,7 +1,8 @@
 //! A window that runs any TSX app through `jsnir::host::Host`: winit input in, wgpu frames out.
 use crate::{
     Result,
-    input::{Clicks, Clipboard, KeyInput, PlatformIme, editor_key, ime_event},
+    ime::PlatformIme,
+    input::{Clicks, Clipboard, KeyInput, editor_key},
     renderer::Renderer,
     surface::{self, Surface},
     view::View,
@@ -29,6 +30,9 @@ use winit::{
 };
 
 pub struct AppWindow {
+    // Field drop order is load-bearing: `ime` must detach BEFORE `surface`/`window` drops so
+    // native Wayland (`wl_display`) and Win32 (`HWND`) handles are still live during cleanup.
+    ime: PlatformIme,
     // Created with the window: the backend depends on what the GPU offers.
     instance: Option<wgpu::Instance>,
     surface: Option<Surface>,
@@ -39,7 +43,6 @@ pub struct AppWindow {
     modifiers: ModifiersState,
     clicks: Clicks,
     clipboard: Clipboard,
-    ime: PlatformIme,
     window_focused: bool,
     cursor_shape: Cursor,
     wake: Option<Instant>,
@@ -53,6 +56,7 @@ pub struct AppWindow {
 impl AppWindow {
     pub fn new(host: Host, title: &str, size: [f32; 2]) -> Self {
         Self {
+            ime: PlatformIme::default(),
             instance: None,
             surface: None,
             host,
@@ -62,7 +66,6 @@ impl AppWindow {
             modifiers: ModifiersState::empty(),
             clicks: Clicks::default(),
             clipboard: Clipboard::default(),
-            ime: PlatformIme::default(),
             window_focused: true,
             cursor_shape: Cursor::Default,
             wake: None,
@@ -98,9 +101,21 @@ impl AppWindow {
 
     // The platform input method is on only while a non-password field has focus.
     fn sync_ime(&mut self) {
+        let interrupted = self.host.take_ime_interrupt();
         if let Some(surface) = &self.surface {
+            if interrupted {
+                self.ime.interrupt(&surface.window);
+            }
             self.ime
                 .sync(&surface.window, self.window_focused, self.host.ime_state());
+        }
+    }
+
+    /// Drains any pending native Wayland (`zwp_text_input_v3`) or Windows (`WM_IME_*`) events.
+    fn poll_ime(&mut self) {
+        let events = self.ime.poll_events();
+        if !events.is_empty() && self.host.focused() {
+            self.edit(&events);
         }
     }
 
@@ -109,17 +124,13 @@ impl AppWindow {
         if let Some(text) = output.clipboard {
             self.clipboard.set_text(text);
         }
-        if output.interrupt_ime
-            && let Some(surface) = &self.surface
-        {
-            self.ime.interrupt(&surface.window);
-        }
         self.sync_ime();
         self.request_redraw();
     }
 
     fn redraw(&mut self, events: &ActiveEventLoop) {
         self.wake = None;
+        self.poll_ime();
         self.host.poll();
         if let Some(update) = self.shared.on_frame.lock().unwrap().as_mut() {
             update(&mut self.host);
@@ -254,8 +265,9 @@ impl AppWindow {
         if key.state == ElementState::Released {
             return;
         }
-        // Escape reaches the app even when no field has focus, so menus and popovers can close.
-        if matches!(key.logical_key, Key::Named(NamedKey::Escape)) {
+        // Escape reaches the app even when no field has focus, so menus and popovers can close,
+        // EXCEPT while an IME preedit is active (first Escape cancels composition, not the popover).
+        if matches!(key.logical_key, Key::Named(NamedKey::Escape)) && !self.host.composing() {
             self.host.escape();
             self.request_redraw();
         }
@@ -291,6 +303,7 @@ impl ApplicationHandler for AppWindow {
         match window {
             Ok((instance, surface)) => {
                 let scale = surface.window.scale_factor() as f32;
+                self.ime.attach(&surface.window);
                 self.instance = Some(instance);
                 self.surface = Some(surface);
                 self.set_scale(scale);
@@ -313,7 +326,10 @@ impl ApplicationHandler for AppWindow {
             return;
         }
         match event {
-            WindowEvent::CloseRequested => events.exit(),
+            WindowEvent::CloseRequested => {
+                self.ime.detach();
+                events.exit();
+            }
             WindowEvent::Resized(_) => self.resize(),
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 self.set_scale(scale_factor as f32);
@@ -360,7 +376,7 @@ impl ApplicationHandler for AppWindow {
             } => self.keyboard(event),
             WindowEvent::Ime(event) => {
                 if self.host.focused()
-                    && let Some(event) = ime_event(event)
+                    && let Some(event) = self.ime.handle_winit_ime(event)
                 {
                     self.edit(&[event]);
                 }
@@ -403,6 +419,7 @@ impl ApplicationHandler for AppWindow {
                     }
                 }
                 Message::Close => {
+                    self.ime.detach();
                     events.exit();
                     return;
                 }
@@ -411,6 +428,7 @@ impl ApplicationHandler for AppWindow {
         self.request_redraw();
     }
     fn about_to_wait(&mut self, events: &ActiveEventLoop) {
+        self.poll_ime();
         if !self.dropped_files.is_empty() {
             let paths = std::mem::take(&mut self.dropped_files);
             if let Some(on_drop) = self.shared.on_drop.lock().unwrap().as_ref() {

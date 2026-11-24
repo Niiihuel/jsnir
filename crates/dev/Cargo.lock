@@ -1312,7 +1312,12 @@ dependencies = [
  "bytemuck",
  "jsnir",
  "pollster",
+ "raw-window-handle",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-protocols",
  "wgpu",
+ "windows-sys 0.59.0",
  "winit",
 ]
 

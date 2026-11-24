@@ -1,15 +1,11 @@
 //! Platform input shared by every window: keys and input-method events for the line editor, the
 //! clipboard, and click counting for word and line selection.
-use jsnir::{
-    editor::{Direction, EditorEvent, PointSelection, SurroundingText},
-    host::ImeState,
-    tree::InputPurpose,
-};
+pub use crate::ime::{PlatformIme, winit_ime_purpose};
+use jsnir::editor::{Direction, EditorEvent, PointSelection};
 use std::time::{Duration, Instant};
 use winit::{
     event::{Ime, KeyEvent},
     keyboard::{Key, ModifiersState, NamedKey},
-    window::ImePurpose,
 };
 
 /// What a key press means for a focused line editor.
@@ -171,74 +167,6 @@ impl ImeArea {
     }
     pub fn forget(&mut self) {
         self.0 = None;
-    }
-}
-
-/// Maps JSNIR's semantic `InputPurpose` to winit's `ImePurpose` (Linux Wayland/X11 & Windows TSF).
-pub fn winit_ime_purpose(purpose: InputPurpose) -> ImePurpose {
-    match purpose {
-        InputPurpose::Password => ImePurpose::Password,
-        InputPurpose::Normal
-        | InputPurpose::Search
-        | InputPurpose::Email
-        | InputPurpose::Number => ImePurpose::Normal,
-    }
-}
-
-/// Cross-platform IME controller for a native window (Linux Wayland `zwp_text_input_v3` / X11 XIM,
-/// Windows TSF / IMM32, macOS). Deduplicates every state transition so Wayland never receives
-/// redundant `commit` requests that flicker candidate popups.
-#[derive(Default)]
-pub struct PlatformIme {
-    allowed: bool,
-    purpose: Option<ImePurpose>,
-    area: ImeArea,
-    surrounding: Option<SurroundingText>,
-}
-
-impl PlatformIme {
-    pub fn allowed(&self) -> bool {
-        self.allowed
-    }
-
-    /// Synchronizes IME enablement, semantic purpose, and surrounding text cache with the host.
-    pub fn sync(&mut self, window: &winit::window::Window, window_focused: bool, state: ImeState) {
-        let allowed = window_focused && state.allowed;
-        let purpose = winit_ime_purpose(state.purpose);
-        if self.purpose != Some(purpose) {
-            window.set_ime_purpose(purpose);
-            self.purpose = Some(purpose);
-        }
-        if allowed != self.allowed {
-            window.set_ime_allowed(allowed);
-            self.allowed = allowed;
-            self.area.forget();
-        }
-        self.surrounding = if allowed { state.surrounding } else { None };
-    }
-
-    /// Updates the candidate window anchor rectangle when IME is active.
-    pub fn update_area(&mut self, window: &winit::window::Window, area: Option<[f32; 4]>) {
-        if let (true, Some(rect)) = (self.allowed, area) {
-            self.area.update(window, rect);
-        }
-    }
-
-    /// Resets active OS preedit (e.g. after mouse click or Escape) while preserving purpose.
-    pub fn interrupt(&mut self, window: &winit::window::Window) {
-        if self.allowed {
-            self.area.forget();
-            window.set_ime_allowed(false);
-            window.set_ime_allowed(true);
-            if let Some(purpose) = self.purpose {
-                window.set_ime_purpose(purpose);
-            }
-        }
-    }
-
-    /// Latest deduplicated surrounding text window (ready for native Wayland/TSF extensions).
-    pub fn surrounding(&self) -> Option<&SurroundingText> {
-        self.surrounding.as_ref()
     }
 }
 

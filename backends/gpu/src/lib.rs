@@ -1,5 +1,6 @@
 //! Rendering and native surfaces for the JSNIR backends and examples.
 mod app;
+pub mod ime;
 pub mod input;
 pub mod renderer;
 pub mod surface;

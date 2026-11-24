@@ -1014,8 +1014,13 @@ dependencies = [
  "jsnir",
  "jsnir-v8",
  "pollster",
+ "raw-window-handle",
  "serde_json",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-protocols",
  "wgpu",
+ "windows-sys 0.59.0",
  "winit",
 ]
 

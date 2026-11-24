@@ -709,11 +709,25 @@ impl LineEditor {
                     return output;
                 }
                 let text = clean(text, self.multiline);
+                let char_len = text.chars().count();
+                let (active, cursor) = match active {
+                    Some(range) => {
+                        let start = range.start.min(char_len);
+                        let end = range.end.min(char_len);
+                        if start == end {
+                            (None, Some(start))
+                        } else {
+                            let (lo, hi) = (start.min(end), start.max(end));
+                            (Some(lo..hi), Some(hi))
+                        }
+                    }
+                    None => (None, None),
+                };
                 self.preedit = (!text.is_empty()).then(|| Preedit {
                     text: text.into_owned(),
-                    active: active.clone(),
+                    active,
                     segments: Vec::new(),
-                    cursor: None,
+                    cursor,
                 });
                 self.invalidate();
             }
@@ -1444,5 +1458,53 @@ mod tests {
         );
         assert!(!frame.selection.is_empty());
         assert!(frame.caret_x > 0.);
+    }
+
+    #[test]
+    fn preedit_cursor_position_and_hidden_cursor_follow_wayland_spec() {
+        let mut engine = TextEngine::default();
+        let mut editor = LineEditor::default();
+        editor.reset("", [0, 0], false);
+
+        // Cursor in the middle of preedit (`2..2`): visible caret, no selection highlight, caret_x < end.
+        editor.handle(
+            &mut engine,
+            &EditorEvent::Preedit {
+                text: "にほんご".into(),
+                active: Some(2..2),
+            },
+        );
+        let mid = editor.frame(&mut engine, &TextStyle::default(), [300., 30.], 1., 2048, None);
+        assert!(mid.caret_visible);
+        assert!(mid.selection.is_empty(), "zero-width active cursor must not draw selection");
+
+        // Cursor at end (`4..4`): caret_x must be strictly to the right of mid.caret_x.
+        editor.handle(
+            &mut engine,
+            &EditorEvent::Preedit {
+                text: "にほんご".into(),
+                active: Some(4..4),
+            },
+        );
+        let end = editor.frame(&mut engine, &TextStyle::default(), [300., 30.], 1., 2048, None);
+        assert!(end.caret_visible);
+        assert!(
+            end.caret_x > mid.caret_x,
+            "expected end caret ({}) > mid caret ({})",
+            end.caret_x,
+            mid.caret_x
+        );
+
+        // Cursor hidden (`None`, Wayland -1/-1): caret_visible must be false.
+        editor.handle(
+            &mut engine,
+            &EditorEvent::Preedit {
+                text: "にほんご".into(),
+                active: None,
+            },
+        );
+        let hidden = editor.frame(&mut engine, &TextStyle::default(), [300., 30.], 1., 2048, None);
+        assert!(!hidden.caret_visible);
+        assert!(!hidden.composition.is_empty());
     }
 }
