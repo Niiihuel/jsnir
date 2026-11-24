@@ -83,9 +83,13 @@ fn main() {
             fs::read_to_string(dir.join(name))
                 .unwrap_or_else(|e| panic!("tsc did not emit {name}: {e}"))
         };
+        let sdk = read("sdk.js");
+        if app == "stepper" {
+            fs::write(out.join("sdk.js"), &sdk).unwrap();
+        }
         fs::write(
             out.join(format!("{app}.js")),
-            read("sdk.js") + &read(&format!("{app}.js")),
+            sdk + &read(&format!("{app}.js")),
         )
         .unwrap();
     }

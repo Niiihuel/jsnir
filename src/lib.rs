@@ -31,6 +31,8 @@ pub const SHARP_APP: &str = include_str!(concat!(env!("OUT_DIR"), "/sharp.js"));
 /// The Stepper comparison script compiled at build time (SDK + app in one script).
 #[cfg(feature = "stepper")]
 pub mod apps {
+    /// Compiled JSNIR TSX SDK (`app/sdk.ts`) alone, for embedding custom scripts and benchmarks.
+    pub const SDK: &str = include_str!(concat!(env!("OUT_DIR"), "/sdk.js"));
     pub const STEPPER: &str = include_str!(concat!(env!("OUT_DIR"), "/stepper.js"));
     /// Test app for `Host::push` (SDK + app).
     pub const HOSTED: &str = include_str!(concat!(env!("OUT_DIR"), "/hosted.js"));
@@ -1803,5 +1805,283 @@ mod tests {
             tree::Node::Image { source, .. } => assert_eq!(source, "avatar.png"),
             other => panic!("expected Image, got {other:?}"),
         }
+    }
+
+    #[cfg(feature = "stepper")]
+    #[test]
+    fn binary_sdk_roundtrip_covers_all_opcodes_rich_paint_spans_and_overflow_flush() {
+        let app = r#"
+            var jsonCalls = 0;
+            var binCalls = 0;
+            var origBatch = jsnir.batch;
+            var origCommit = jsnir.commit;
+            var origCommitStrings = jsnir.commitStrings;
+            jsnir.batch = function (j) { jsonCalls++; return origBatch(j); };
+            jsnir.commit = function (n) { binCalls++; return origCommit(n); };
+            jsnir.commitStrings = function (n, s) { binCalls++; return origCommitStrings(n, s); };
+
+            var spansSig = signal([
+                { text: "hello ", color: 0xff0000ff, weight: 700, size: 15, family: "Inter", underline: true, italic: true, strike: true, background: 0x112233ff, backgroundRadius: 4 },
+                { text: "", image: { source: "emoji:wave", width: 18, height: 18 } }
+            ]);
+            var fieldRef = null;
+            var listItems = list(["row-a"]);
+
+            function App() {
+                return h(Column, {
+                    style: { width: 800, height: 600, padding: [4, 8, 12, 16], margin: 6, gap: 4, scroll: true, scrollAnchor: "end", group: true },
+                    paint: {
+                        background: 0x10141dff,
+                        radius: [2, 4, 6, 8],
+                        edge: 0x334455ff,
+                        edgeWidth: 1.5,
+                        edgeSides: [1, 0, 1, 0],
+                        mask: "fade-mask",
+                        shadows: [
+                            { y: 4, blur: 12, spread: -1, color: 0x00000080 },
+                            { y: 1, blur: 3, spread: 0, color: 0x00000040 }
+                        ],
+                        transitions: [
+                            { property: "opacity", duration: 180, delay: 20, hold: 10, easing: "bezier", bezier: [0.2, 0.8, 0.2, 1.0] }
+                        ],
+                        animations: [
+                            {
+                                property: "scale",
+                                duration: 400,
+                                delay: 50,
+                                easing: "spring",
+                                iterations: 2,
+                                alternate: true,
+                                keyframes: [
+                                    { offset: 0, value: 0.9, color: 0x111111ff },
+                                    { offset: 1, value: 1.0 }
+                                ]
+                            }
+                        ],
+                        starting: { opacity: 0, x: -4, y: 8, scale: 0.95, draw: 0.5 },
+                        scrollbar: { width: 6, thumb: 0x64748bff, track: 0x1e293bff, radius: 3, minThumb: 24, inset: 2, autoHide: true }
+                    }
+                },
+                    h(Box, {
+                        style: {
+                            position: "fixed",
+                            layer: 50,
+                            anchor: { node: 1, side: "right", align: "end", gap: 10, flip: true, placement: { callback: 9, token: "0:tok" } }
+                        }
+                    }),
+                    h(Text, {
+                        font: { size: 14, weight: 600, lineHeight: 20, letterSpacing: 0.5, family: "Inter" },
+                        spans: spansSig,
+                        children: "hello "
+                    }),
+                    h(TextInput, {
+                        value: "secret",
+                        placeholder: "Enter password",
+                        placeholderColor: 0x64748bff,
+                        multiline: true,
+                        submitOnEnter: true,
+                        retainOnSubmit: true,
+                        purpose: "password",
+                        onSubmit: function () {},
+                        onChange: function () {},
+                        ref: function (f) { fieldRef = f; },
+                        style: { height: 42 },
+                        font: { size: 13 },
+                        paint: { color: 0xffffffff }
+                    }),
+                    h(List, {
+                        items: listItems,
+                        style: { grow: 1 },
+                        children: function (item) { return h(Text, null, item); }
+                    }),
+                    h(VirtualList, {
+                        name: "feed",
+                        style: { grow: 1 },
+                        children: function (_k, item) { return h(Text, null, function () { return String(item()); }); }
+                    }),
+                    // Trigger mid-mount binary command buffer flush (-2 overflow retry path) across >16,384 words.
+                    h(Column, null, Array.from({ length: 700 }, function (_, i) {
+                        return h(Box, {
+                            style: { width: 100 + i, height: 24, padding: 4 },
+                            paint: {
+                                background: 0x1a1d24ff,
+                                radius: 4,
+                                shadows: [{ y: 2, blur: 6, spread: 0, color: 0x00000044 }],
+                                transitions: [{ property: "background", duration: 120, easing: "easeOut" }]
+                            }
+                        });
+                    })),
+                    h(Button, {
+                        onClick: function () {
+                            spansSig.value = [{ text: "updated", color: 0x00ff00ff, italic: true }];
+                            fieldRef.replace("next-secret", "secret");
+                        }
+                    })
+                );
+            }
+            mount(App);
+        "#;
+        let vm = Vm::load(&format!("{}\n{app}", crate::apps::SDK), Rc::default());
+        let mount_ops = vm.call_mount().expect("mount binary sdk");
+        let (json_after_mount, bin_after_mount): (u32, u32) = vm.ctx.with(|c| {
+            let j: u32 = c.eval("jsonCalls").unwrap();
+            let b: u32 = c.eval("binCalls").unwrap();
+            (j, b)
+        });
+        assert_eq!(json_after_mount, 0, "expected 0 JSON fallbacks on mount");
+        assert!(
+            bin_after_mount >= 2,
+            "expected >16384 words to trigger binary overflow flush & retry, got {bin_after_mount} commits"
+        );
+        assert!(
+            mount_ops
+                .iter()
+                .any(|op| matches!(op, Op::VirtualList { id: 7, name } if name == "feed")),
+            "expected Op::VirtualList for node 7"
+        );
+        let button_cb = mount_ops
+            .iter()
+            .find_map(|op| match op {
+                Op::Create {
+                    node: tree::Node::Button { callback },
+                    ..
+                } => Some(*callback),
+                _ => None,
+            })
+            .expect("button node");
+
+        let mut tree = Tree::default();
+        tree.apply(Batch {
+            base: 0,
+            ops: mount_ops,
+        })
+        .expect("mount batch must be valid");
+
+        // Verify root Column (id 1): Style + extended Paint fields
+        match &tree.nodes[&1] {
+            tree::Node::Box { style, paint, .. } => {
+                assert_eq!(style.direction, tree::Axis::Column);
+                assert_eq!(style.padding, tree::Edges::Sides([4., 8., 12., 16.]));
+                assert_eq!(style.margin, tree::Edges::Sides([6., 6., 6., 6.]));
+                assert!(style.scroll && style.group);
+                assert_eq!(style.scroll_anchor, tree::ScrollAnchor::End);
+                assert_eq!(paint.mask.as_deref(), Some("fade-mask"));
+                assert_eq!(paint.shadows.len(), 2);
+                assert_eq!(paint.shadows[0].blur, 12.);
+                assert_eq!(paint.shadows[0].spread, -1.);
+                assert_eq!(paint.transitions.len(), 1);
+                assert_eq!(paint.transitions[0].property, tree::Property::Opacity);
+                assert_eq!(paint.transitions[0].easing, tree::Easing::Bezier);
+                assert_eq!(paint.transitions[0].bezier, Some([0.2, 0.8, 0.2, 1.0]));
+                assert_eq!(paint.transitions[0].delay, 20.);
+                assert_eq!(paint.transitions[0].hold, 10.);
+                let anims = paint.animations.as_ref().expect("animations");
+                assert_eq!(anims.len(), 1);
+                assert_eq!(anims[0].property, tree::Property::Scale);
+                assert_eq!(anims[0].easing, tree::Easing::Spring);
+                assert_eq!(anims[0].iterations, Some(2.));
+                assert!(anims[0].alternate);
+                assert_eq!(anims[0].keyframes.len(), 2);
+                assert_eq!(anims[0].keyframes[0].color, Some(0x111111ff));
+                let st = paint.starting.as_ref().expect("starting");
+                assert_eq!(st.opacity, Some(0.));
+                assert_eq!(st.x, Some(-4.));
+                assert_eq!(st.y, Some(8.));
+                assert_eq!(st.scale, Some(0.95));
+                assert_eq!(st.draw, Some(0.5));
+                let sb = paint.scrollbar.as_ref().expect("scrollbar");
+                assert_eq!(sb.width, 6.);
+                assert_eq!(sb.thumb, 0x64748bff);
+                assert_eq!(sb.track, Some(0x1e293bff));
+                assert_eq!(sb.min_thumb, 24.);
+                assert!(sb.auto_hide);
+            }
+            other => panic!("expected root Box, got {other:?}"),
+        }
+
+        // Verify anchored fixed Box (id 2)
+        match &tree.nodes[&2] {
+            tree::Node::Box { style, .. } => {
+                assert_eq!(style.position, tree::Position::Fixed);
+                assert_eq!(style.layer, Some(50));
+                let anchor = style.anchor.as_ref().expect("anchor");
+                assert_eq!(anchor.node, 1);
+                assert_eq!(anchor.side, tree::Side::Right);
+                assert_eq!(anchor.align, tree::AnchorAlign::End);
+                assert_eq!(anchor.gap, 10.);
+                assert!(anchor.flip);
+                let pl = anchor.placement.as_ref().expect("placement");
+                assert_eq!(pl.callback, 9);
+                assert_eq!(pl.token, "0:tok");
+            }
+            other => panic!("expected anchored Box, got {other:?}"),
+        }
+
+        // Verify rich Text with spans (id 3)
+        match &tree.nodes[&3] {
+            tree::Node::Text { font, spans, .. } => {
+                assert_eq!(font.line_height, Some(20.));
+                assert_eq!(font.letter_spacing, 0.5);
+                let spans = spans.as_ref().expect("spans");
+                assert_eq!(spans.len(), 2);
+                assert_eq!(spans[0].text, "hello ");
+                assert_eq!(spans[0].color, Some(0xff0000ff));
+                assert_eq!(spans[0].weight, Some(700));
+                assert_eq!(spans[0].size, Some(15.));
+                assert_eq!(spans[0].family.as_deref(), Some("Inter"));
+                assert!(spans[0].underline && spans[0].italic && spans[0].strike);
+                assert_eq!(spans[0].background, Some(0x112233ff));
+                assert_eq!(spans[0].background_radius, 4.);
+                let img = spans[1].image.as_ref().expect("inline image");
+                assert_eq!(img.source, "emoji:wave");
+                assert_eq!((img.width, img.height), (18., 18.));
+            }
+            other => panic!("expected Text with spans, got {other:?}"),
+        }
+
+        // Verify TextInput (id 4)
+        match &tree.nodes[&4] {
+            tree::Node::Input {
+                text,
+                selection,
+                placeholder,
+                placeholder_color,
+                multiline,
+                submit_on_enter,
+                retain_on_submit,
+                purpose,
+                ..
+            } => {
+                assert_eq!(text, "secret");
+                assert_eq!(*selection, [6, 6]);
+                assert_eq!(placeholder, "Enter password");
+                assert_eq!(*placeholder_color, Some(0x64748bff));
+                assert!(*multiline && *submit_on_enter && *retain_on_submit);
+                assert_eq!(*purpose, tree::InputPurpose::Password);
+            }
+            other => panic!("expected Input, got {other:?}"),
+        }
+
+        // Verify List (id 5) + VirtualList (id 7)
+        assert!(matches!(tree.nodes[&5], tree::Node::List { .. }));
+        assert!(matches!(tree.nodes[&7], tree::Node::List { .. }));
+
+        // Trigger OP_SET_SPANS + OP_SET_FIELD via the Button click handler
+        let ev_ops = event(&vm, button_cb, "");
+        let json_after_ev: u32 = vm.ctx.with(|c| c.eval("jsonCalls").unwrap());
+        assert_eq!(json_after_ev, 0, "expected 0 JSON fallbacks on SetSpans/SetField");
+        assert!(
+            ev_ops.iter().any(|op| matches!(op, Op::SetSpans { id: 3, spans } if spans.len() == 1 && spans[0].text == "updated" && spans[0].italic)),
+            "expected Op::SetSpans in {ev_ops:?}"
+        );
+        assert!(
+            ev_ops.iter().any(|op| matches!(op, Op::SetField { id: 4, expected, text } if expected == "secret" && text == "next-secret")),
+            "expected Op::SetField in {ev_ops:?}"
+        );
+        tree.apply(Batch {
+            base: 1,
+            ops: ev_ops,
+        })
+        .expect("event batch must apply cleanly");
     }
 }

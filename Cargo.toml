@@ -20,6 +20,10 @@ required-features = ["stepper"]
 name = "frame_bench"
 required-features = ["stepper"]
 
+[[example]]
+name = "sdk_bench"
+required-features = ["stepper"]
+
 [dependencies]
 cosmic-text = "=0.14.2"
 rquickjs = "=0.14.0"

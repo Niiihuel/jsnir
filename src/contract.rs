@@ -5,8 +5,10 @@
 //! with a single interpreter instruction, without calling Rust or converting values. Rust is the only
 //! writer and writes only between callbacks, on the VM thread: reads and writes never overlap.
 use crate::tree::{
-    Align, Axis, Cursor, Edges, Font, Icon, Justify, Node, Op, Paint, Position, Radius,
-    ScrollAnchor, ScrollEdge, Style, TextAlign, Tree, Variant,
+    Align, Anchor, AnchorAlign, Animation, Axis, Cursor, Easing, Edges, Font, Icon, InlineImage,
+    InputPurpose, Justify, Keyframe, Node, Op, Paint, PlacementSubscription, Position, Property,
+    Radius, ScrollAnchor, ScrollEdge, Scrollbar, Shadow, Side, Span, Starting, Style, TextAlign,
+    Transition, Tree, Variant,
 };
 use rquickjs::{ArrayBuffer, ArrayBufferSource, Ctx, Object, Persistent, TypedArray};
 
@@ -453,6 +455,11 @@ pub(crate) const OP_CREATE_ICON: u32 = 16;
 pub(crate) const OP_CREATE_IMAGE: u32 = 17;
 pub(crate) const OP_SET_SOURCE: u32 = 18;
 pub(crate) const OP_CALLBACK_GUARD: u32 = 19;
+pub(crate) const OP_CREATE_INPUT: u32 = 20;
+pub(crate) const OP_CREATE_LIST: u32 = 21;
+pub(crate) const OP_SET_FIELD: u32 = 22;
+pub(crate) const OP_SET_SPANS: u32 = 23;
+pub(crate) const OP_VIRTUAL_LIST: u32 = 24;
 
 #[inline]
 fn next_word(words: &[u32], i: &mut usize) -> Result<u32, String> {
@@ -565,7 +572,225 @@ fn decode_variant(words: &[u32], i: &mut usize) -> Result<Variant, String> {
     Ok(v)
 }
 
-fn decode_style(words: &[u32], i: &mut usize) -> Result<Style, String> {
+fn decode_anchor(words: &[u32], i: &mut usize, strings: &mut [String]) -> Result<Anchor, String> {
+    let node = next_u16(words, i)?;
+    let aflags = next_word(words, i)?;
+    let side = match aflags & 0x3 {
+        0 => Side::Top,
+        1 => Side::Right,
+        2 => Side::Bottom,
+        _ => Side::Left,
+    };
+    let align = match (aflags >> 2) & 0x3 {
+        1 => AnchorAlign::Center,
+        2 => AnchorAlign::End,
+        _ => AnchorAlign::Start,
+    };
+    let flip = aflags & (1 << 4) != 0;
+    let gap = next_f32(words, i)?;
+    let placement = if aflags & (1 << 5) != 0 {
+        let callback = next_u16(words, i)?;
+        let token = take_str(words, i, strings)?;
+        Some(PlacementSubscription { callback, token })
+    } else {
+        None
+    };
+    Ok(Anchor {
+        node,
+        side,
+        align,
+        gap,
+        flip,
+        placement,
+    })
+}
+
+fn decode_shadows(words: &[u32], i: &mut usize) -> Result<Vec<Shadow>, String> {
+    let len = next_word(words, i)? as usize;
+    let mut shadows = Vec::with_capacity(len);
+    for _ in 0..len {
+        shadows.push(Shadow {
+            y: next_f32(words, i)?,
+            blur: next_f32(words, i)?,
+            spread: next_f32(words, i)?,
+            color: next_word(words, i)?,
+        });
+    }
+    Ok(shadows)
+}
+
+fn decode_transitions(words: &[u32], i: &mut usize) -> Result<Vec<Transition>, String> {
+    let len = next_word(words, i)? as usize;
+    let mut transitions = Vec::with_capacity(len);
+    for _ in 0..len {
+        let hdr = next_word(words, i)?;
+        let property = decode_property(hdr & 0xf)?;
+        let easing = decode_easing((hdr >> 4) & 0x7)?;
+        let has_bezier = hdr & (1 << 7) != 0;
+        let duration = next_f32(words, i)?;
+        let delay = next_f32(words, i)?;
+        let hold = next_f32(words, i)?;
+        let bezier = if has_bezier {
+            Some(next_f32x4(words, i)?)
+        } else {
+            None
+        };
+        transitions.push(Transition {
+            property,
+            duration,
+            delay,
+            easing,
+            bezier,
+            hold,
+        });
+    }
+    Ok(transitions)
+}
+
+fn decode_animations(words: &[u32], i: &mut usize) -> Result<Vec<Animation>, String> {
+    let len = next_word(words, i)? as usize;
+    let mut animations = Vec::with_capacity(len);
+    for _ in 0..len {
+        let hdr = next_word(words, i)?;
+        let property = decode_property(hdr & 0xf)?;
+        let easing = decode_easing((hdr >> 4) & 0x7)?;
+        let has_bezier = hdr & (1 << 7) != 0;
+        let has_iterations = hdr & (1 << 8) != 0;
+        let alternate = hdr & (1 << 9) != 0;
+        let duration = next_f32(words, i)?;
+        let delay = next_f32(words, i)?;
+        let bezier = if has_bezier {
+            Some(next_f32x4(words, i)?)
+        } else {
+            None
+        };
+        let iterations = if has_iterations {
+            Some(next_f32(words, i)?)
+        } else {
+            None
+        };
+        let kf_len = next_word(words, i)? as usize;
+        let mut keyframes = Vec::with_capacity(kf_len);
+        for _ in 0..kf_len {
+            let kf_flags = next_word(words, i)?;
+            let offset = next_f32(words, i)?;
+            let value = if kf_flags & 1 != 0 {
+                Some(next_f32(words, i)?)
+            } else {
+                None
+            };
+            let color = if kf_flags & 2 != 0 {
+                Some(next_word(words, i)?)
+            } else {
+                None
+            };
+            keyframes.push(Keyframe {
+                offset,
+                value,
+                color,
+            });
+        }
+        animations.push(Animation {
+            property,
+            keyframes,
+            duration,
+            delay,
+            easing,
+            bezier,
+            iterations,
+            alternate,
+        });
+    }
+    Ok(animations)
+}
+
+fn decode_starting(words: &[u32], i: &mut usize) -> Result<Starting, String> {
+    let smask = next_word(words, i)?;
+    Ok(Starting {
+        opacity: (smask & (1 << 0) != 0)
+            .then(|| next_f32(words, i))
+            .transpose()?,
+        x: (smask & (1 << 1) != 0)
+            .then(|| next_f32(words, i))
+            .transpose()?,
+        y: (smask & (1 << 2) != 0)
+            .then(|| next_f32(words, i))
+            .transpose()?,
+        scale: (smask & (1 << 3) != 0)
+            .then(|| next_f32(words, i))
+            .transpose()?,
+        draw: (smask & (1 << 4) != 0)
+            .then(|| next_f32(words, i))
+            .transpose()?,
+    })
+}
+
+fn decode_scrollbar(words: &[u32], i: &mut usize) -> Result<Scrollbar, String> {
+    let sb_flags = next_word(words, i)?;
+    let width = next_f32(words, i)?;
+    let thumb = next_word(words, i)?;
+    let radius = next_f32(words, i)?;
+    let min_thumb = next_f32(words, i)?;
+    let inset = next_f32(words, i)?;
+    let track = if sb_flags & 1 != 0 {
+        Some(next_word(words, i)?)
+    } else {
+        None
+    };
+    let auto_hide = sb_flags & 2 != 0;
+    Ok(Scrollbar {
+        width,
+        thumb,
+        track,
+        radius,
+        min_thumb,
+        inset,
+        auto_hide,
+    })
+}
+
+fn decode_property(code: u32) -> Result<Property, String> {
+    match code {
+        0 => Ok(Property::Opacity),
+        1 => Ok(Property::X),
+        2 => Ok(Property::Y),
+        3 => Ok(Property::Scale),
+        4 => Ok(Property::Brightness),
+        5 => Ok(Property::Background),
+        6 => Ok(Property::Edge),
+        7 => Ok(Property::Color),
+        8 => Ok(Property::Draw),
+        9 => Ok(Property::Left),
+        10 => Ok(Property::Width),
+        11 => Ok(Property::Height),
+        _ => Err(format!("invalid property code {code}")),
+    }
+}
+
+fn decode_easing(code: u32) -> Result<Easing, String> {
+    match code {
+        0 => Ok(Easing::Linear),
+        1 => Ok(Easing::Ease),
+        2 => Ok(Easing::EaseOut),
+        3 => Ok(Easing::EaseInOut),
+        4 => Ok(Easing::Spring),
+        5 => Ok(Easing::Bezier),
+        _ => Err(format!("invalid easing code {code}")),
+    }
+}
+
+fn decode_input_purpose(code: u32) -> Result<InputPurpose, String> {
+    match code {
+        0 => Ok(InputPurpose::Normal),
+        1 => Ok(InputPurpose::Password),
+        2 => Ok(InputPurpose::Search),
+        3 => Ok(InputPurpose::Email),
+        4 => Ok(InputPurpose::Number),
+        _ => Err(format!("invalid input purpose code {code}")),
+    }
+}
+
+fn decode_style(words: &[u32], i: &mut usize, strings: &mut [String]) -> Result<Style, String> {
     let mask = next_word(words, i)?;
     let flags = next_word(words, i)?;
     let mut style = Style {
@@ -650,10 +875,13 @@ fn decode_style(words: &[u32], i: &mut usize) -> Result<Style, String> {
     if mask & (1 << 15) != 0 {
         style.max_height = Some(next_f32(words, i)?);
     }
+    if mask & (1 << 16) != 0 {
+        style.anchor = Some(decode_anchor(words, i, strings)?);
+    }
     Ok(style)
 }
 
-fn decode_paint(words: &[u32], i: &mut usize) -> Result<Paint, String> {
+fn decode_paint(words: &[u32], i: &mut usize, strings: &mut [String]) -> Result<Paint, String> {
     let mask = next_word(words, i)?;
     let mut paint = Paint::default();
     if mask & (1 << 0) != 0 {
@@ -710,7 +938,72 @@ fn decode_paint(words: &[u32], i: &mut usize) -> Result<Paint, String> {
     if mask & (1 << 17) != 0 {
         paint.focus = Some(decode_variant(words, i)?);
     }
+    if mask & (1 << 18) != 0 {
+        paint.mask = Some(take_str(words, i, strings)?);
+    }
+    if mask & (1 << 19) != 0 {
+        paint.shadows = decode_shadows(words, i)?;
+    }
+    if mask & (1 << 20) != 0 {
+        paint.transitions = decode_transitions(words, i)?;
+    }
+    if mask & (1 << 21) != 0 {
+        paint.animations = Some(decode_animations(words, i)?);
+    }
+    if mask & (1 << 22) != 0 {
+        paint.starting = Some(decode_starting(words, i)?);
+    }
+    if mask & (1 << 23) != 0 {
+        paint.scrollbar = Some(decode_scrollbar(words, i)?);
+    }
     Ok(paint)
+}
+
+fn decode_spans(words: &[u32], i: &mut usize, strings: &mut [String]) -> Result<Vec<Span>, String> {
+    let len = next_word(words, i)? as usize;
+    let mut spans = Vec::with_capacity(len);
+    for _ in 0..len {
+        let mask = next_word(words, i)?;
+        let mut span = Span {
+            underline: mask & (1 << 5) != 0,
+            italic: mask & (1 << 6) != 0,
+            strike: mask & (1 << 7) != 0,
+            ..Span::default()
+        };
+        if mask & (1 << 0) != 0 {
+            span.text = take_str(words, i, strings)?;
+        }
+        if mask & (1 << 1) != 0 {
+            span.color = Some(next_word(words, i)?);
+        }
+        if mask & (1 << 2) != 0 {
+            span.weight = Some(next_u16(words, i)?);
+        }
+        if mask & (1 << 3) != 0 {
+            span.size = Some(next_f32(words, i)?);
+        }
+        if mask & (1 << 4) != 0 {
+            span.family = Some(take_str(words, i, strings)?);
+        }
+        if mask & (1 << 8) != 0 {
+            span.background = Some(next_word(words, i)?);
+        }
+        if mask & (1 << 9) != 0 {
+            span.background_radius = next_f32(words, i)?;
+        }
+        if mask & (1 << 10) != 0 {
+            let source = take_str(words, i, strings)?;
+            let width = next_f32(words, i)?;
+            let height = next_f32(words, i)?;
+            span.image = Some(InlineImage {
+                source,
+                width,
+                height,
+            });
+        }
+        spans.push(span);
+    }
+    Ok(spans)
 }
 
 fn decode_font(words: &[u32], i: &mut usize, strings: &mut [String]) -> Result<Font, String> {
@@ -791,12 +1084,12 @@ pub(crate) fn decode_commands(
             }
             OP_SET_STYLE => {
                 let id = next_u16(words, &mut i)?;
-                let style = decode_style(words, &mut i)?;
+                let style = decode_style(words, &mut i, strings)?;
                 out.push(Op::SetStyle { id, style });
             }
             OP_SET_PAINT => {
                 let id = next_u16(words, &mut i)?;
-                let paint = decode_paint(words, &mut i)?;
+                let paint = decode_paint(words, &mut i, strings)?;
                 out.push(Op::SetPaint {
                     id,
                     paint: std::sync::Arc::new(paint),
@@ -820,12 +1113,12 @@ pub(crate) fn decode_commands(
                 let scroll = if flags & (1 << 5) != 0 { next_u16(words, &mut i)? } else { 0 };
                 let drag = if flags & (1 << 6) != 0 { next_u16(words, &mut i)? } else { 0 };
                 let style = if flags & (1 << 7) != 0 {
-                    decode_style(words, &mut i)?
+                    decode_style(words, &mut i, strings)?
                 } else {
                     Style::default()
                 };
                 let paint = if flags & (1 << 8) != 0 {
-                    std::sync::Arc::new(decode_paint(words, &mut i)?)
+                    std::sync::Arc::new(decode_paint(words, &mut i, strings)?)
                 } else {
                     std::sync::Arc::default()
                 };
@@ -869,14 +1162,19 @@ pub(crate) fn decode_commands(
                     Font::default()
                 };
                 let style = if flags & (1 << 4) != 0 {
-                    decode_style(words, &mut i)?
+                    decode_style(words, &mut i, strings)?
                 } else {
                     Style::default()
                 };
                 let paint = if flags & (1 << 5) != 0 {
-                    std::sync::Arc::new(decode_paint(words, &mut i)?)
+                    std::sync::Arc::new(decode_paint(words, &mut i, strings)?)
                 } else {
                     std::sync::Arc::default()
+                };
+                let spans = if flags & (1 << 6) != 0 {
+                    Some(decode_spans(words, &mut i, strings)?)
+                } else {
+                    None
                 };
                 out.push(Op::Create {
                     id,
@@ -889,7 +1187,7 @@ pub(crate) fn decode_commands(
                         paint,
                         lines,
                         align,
-                        spans: None,
+                        spans,
                     },
                 });
             }
@@ -899,7 +1197,7 @@ pub(crate) fn decode_commands(
                 let before = next_opt_u16(words, &mut i)?;
                 let flags = next_word(words, &mut i)?;
                 let style = if flags & 1 != 0 {
-                    decode_style(words, &mut i)?
+                    decode_style(words, &mut i, strings)?
                 } else {
                     Style::default()
                 };
@@ -952,12 +1250,12 @@ pub(crate) fn decode_commands(
                 let stroke = next_f32(words, &mut i)?;
                 let flags = next_word(words, &mut i)?;
                 let style = if flags & 1 != 0 {
-                    decode_style(words, &mut i)?
+                    decode_style(words, &mut i, strings)?
                 } else {
                     Style::default()
                 };
                 let paint = if flags & 2 != 0 {
-                    std::sync::Arc::new(decode_paint(words, &mut i)?)
+                    std::sync::Arc::new(decode_paint(words, &mut i, strings)?)
                 } else {
                     std::sync::Arc::default()
                 };
@@ -981,12 +1279,12 @@ pub(crate) fn decode_commands(
                 let source = take_str(words, &mut i, strings)?;
                 let flags = next_word(words, &mut i)?;
                 let style = if flags & 1 != 0 {
-                    decode_style(words, &mut i)?
+                    decode_style(words, &mut i, strings)?
                 } else {
                     Style::default()
                 };
                 let paint = if flags & 2 != 0 {
-                    std::sync::Arc::new(decode_paint(words, &mut i)?)
+                    std::sync::Arc::new(decode_paint(words, &mut i, strings)?)
                 } else {
                     std::sync::Arc::default()
                 };
@@ -1020,6 +1318,123 @@ pub(crate) fn decode_commands(
                     Some(std::mem::take(slot))
                 };
                 out.push(Op::CallbackGuard { callback, token });
+            }
+            OP_CREATE_INPUT => {
+                let id = next_u16(words, &mut i)?;
+                let parent = next_opt_u16(words, &mut i)?;
+                let before = next_opt_u16(words, &mut i)?;
+                let flags = next_word(words, &mut i)?;
+                let multiline = flags & (1 << 0) != 0;
+                let submit_on_enter = flags & (1 << 1) != 0;
+                let retain_on_submit = flags & (1 << 2) != 0;
+                let purpose = decode_input_purpose((flags >> 3) & 0x7)?;
+                let text = if flags & (1 << 6) != 0 {
+                    take_str(words, &mut i, strings)?
+                } else {
+                    String::new()
+                };
+                let selection = if flags & (1 << 7) != 0 {
+                    [next_word(words, &mut i)?, next_word(words, &mut i)?]
+                } else {
+                    [0, 0]
+                };
+                let submit = if flags & (1 << 8) != 0 {
+                    next_u16(words, &mut i)?
+                } else {
+                    0
+                };
+                let change = if flags & (1 << 9) != 0 {
+                    next_u16(words, &mut i)?
+                } else {
+                    0
+                };
+                let placeholder = if flags & (1 << 10) != 0 {
+                    take_str(words, &mut i, strings)?
+                } else {
+                    String::new()
+                };
+                let placeholder_color = if flags & (1 << 11) != 0 {
+                    Some(next_word(words, &mut i)?)
+                } else {
+                    None
+                };
+                let font = if flags & (1 << 12) != 0 {
+                    decode_font(words, &mut i, strings)?
+                } else {
+                    Font::default()
+                };
+                let style = if flags & (1 << 13) != 0 {
+                    decode_style(words, &mut i, strings)?
+                } else {
+                    Style::default()
+                };
+                let paint = if flags & (1 << 14) != 0 {
+                    std::sync::Arc::new(decode_paint(words, &mut i, strings)?)
+                } else {
+                    std::sync::Arc::default()
+                };
+                out.push(Op::Create {
+                    id,
+                    parent,
+                    before,
+                    node: Node::Input {
+                        text,
+                        selection,
+                        submit,
+                        change,
+                        placeholder,
+                        placeholder_color,
+                        multiline,
+                        submit_on_enter,
+                        retain_on_submit,
+                        purpose,
+                        style,
+                        font,
+                        paint,
+                    },
+                });
+            }
+            OP_CREATE_LIST => {
+                let id = next_u16(words, &mut i)?;
+                let parent = next_opt_u16(words, &mut i)?;
+                let before = next_opt_u16(words, &mut i)?;
+                let flags = next_word(words, &mut i)?;
+                let scroll = if flags & 1 != 0 {
+                    next_u16(words, &mut i)?
+                } else {
+                    0
+                };
+                let style = if flags & 2 != 0 {
+                    decode_style(words, &mut i, strings)?
+                } else {
+                    Style::default()
+                };
+                out.push(Op::Create {
+                    id,
+                    parent,
+                    before,
+                    node: Node::List {
+                        children: Vec::new(),
+                        style,
+                        scroll,
+                    },
+                });
+            }
+            OP_SET_FIELD => {
+                let id = next_u16(words, &mut i)?;
+                let text = take_str(words, &mut i, strings)?;
+                let expected = take_str(words, &mut i, strings)?;
+                out.push(Op::SetField { id, expected, text });
+            }
+            OP_SET_SPANS => {
+                let id = next_u16(words, &mut i)?;
+                let spans = decode_spans(words, &mut i, strings)?;
+                out.push(Op::SetSpans { id, spans });
+            }
+            OP_VIRTUAL_LIST => {
+                let id = next_u16(words, &mut i)?;
+                let name = take_str(words, &mut i, strings)?;
+                out.push(Op::VirtualList { id, name });
             }
             _ => return Err(format!("unknown binary opcode {op}")),
         }
