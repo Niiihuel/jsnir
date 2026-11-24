@@ -1,30 +1,79 @@
 # JSNIR · JavaScript Native In Rust
 
-JSNIR runs TypeScript and TSX desktop apps with a native Rust UI and no WebView. App logic runs in an embedded QuickJS VM on its own thread. Rust handles the window, input, text editing, layout, transitions and drawing. The native GPU backend can keep drawing while JavaScript processes an event. The app and the UI share a tree with stable node IDs, and the UI applies or rejects each versioned batch as a whole.
+**JSNIR** is a standalone native desktop UI engine written in Rust that runs TypeScript/TSX apps
+**with no WebView, no DOM, and no Chromium**.
+
+Application logic runs on a dedicated off-UI thread inside a pluggable JavaScript VM (**QuickJS-ng**
+by default for minimal footprint, or opt-in **V8** via `jsnir-v8` for TurboFan JIT workloads).
+Rust owns the window, native IME, text editing, Taffy flexbox layout, CSS-like transitions and
+keyframe animations, persistent GPU texture atlas, and `wgpu` rendering — so heavy JS work never
+freezes scrolling, typing, or 120 Hz animations.
 
 ![The React Bits Stepper in Chromium and in JSNIR](docs/images/stepper-side-by-side.png)
 
-The JSNIR port of the React Bits Stepper uses 390 nonblank lines of TSX. Across six settled states, 0.07–0.12% of its pixels differ from Chromium at the 6% comparison threshold. The GPUI port uses 1,162 nonblank lines of Rust plus a 574-line adapted text field, with 0.18–0.36% differing pixels. [Stepper comparison](comparison/stepper/README.md)
+On the same 4-step [Stepper comparison](comparison/stepper/README.md) (Ryzen + Radeon 780M, Vulkan/Wayland):
 
-The Linux preview archive ships the engine and the TSX SDK. Load an app compiled outside the repository with `jsnir-gpu run app.js`. [Install the engine and build an app](docs/releases.md)
+- **390 lines of TSX** vs **1,736 lines of Rust** in GPUI (`4.4×` less code).
+- **0.07–0.12%** pixel diff vs Chromium reference (GPUI: `0.18–0.36%`).
+- **`15.0 MB`** stripped binary and **`121 MB`** Vulkan peak RSS with QuickJS-ng (GPUI: `19.6 MB` / `109 MB`).
+- **`1.37 ms`** AOT cold start (QuickJS `.jsbc`), **`0.41 ms`** in-place hot reload (V8), and **1 draw call** GPU batching (`533 µs` steady frame on Radeon 780M).
 
-## Run the Stepper
+See the full reproducible numbers in **[docs/benchmarks.md](docs/benchmarks.md)**.
 
-Build the comparison from a Git checkout in a Linux graphical session (Wayland or X11). On Linux x86-64, fetch the pinned native compiler once to build without Node or npm.
+---
+
+## Key Architecture Highlights
+
+- **Single-process, off-UI-thread JS**: zero DOM/Blink/Node.js overhead; JS stalls never drop UI frames.
+- **100% Binary Command Protocol**: zero-JSON typed events (`jsnirDrag`, `jsnirScroll`, `jsnirContextMenu`) and a shared `Uint32Array`/`Float32Array` command buffer + string pool (`4.65×` faster than JSON batching, `JSON calls = 0` across the SDK).
+- **Pluggable `JsEngine` / `JsEngineFactory` trait**:
+  - **QuickJS-ng (default)**: `~6.4 MiB` stripped headless binary, `~9.0 MiB` RSS, `.jsbc` AOT bytecode (`0.51–1.20 ms` startup), `VmLimits` (memory ceiling + interrupt timeout).
+  - **V8 opt-in (`crates/engine-v8`)**: TurboFan JIT + shared `v8::BackingStore` + V8 Fast API (`jsnir.set` / `jsnir.commit` at `~15 ns/op`) + in-place `Isolate` recycling (`0.41 ms` hot reload), `3.5–35×` faster on heavy JS/SDK workloads with zero impact on default builds.
+- **High-throughput `wgpu` renderer**: persistent `4096×2048` shelf texture atlas, instanced draw-call batching (`1501 → 1` draw call on a dense 2D grid), `O(1)` steady-state view cache, rounded fills, gradients, inner/outer shadows, rounded clips, masks, and opacity layers.
+- **Native multiplatform IME**:
+  - **Linux Wayland**: native `zwp_text_input_v3` (v1 & v2) over an isolated `wl_event_queue` (`set_surrounding_text`, `set_text_change_cause`, semantic `content_hint`/`content_purpose`, `delete_surrounding_text`, atomic 7-step `done`).
+  - **Windows**: Win32 `HWND` subclass decoding multi-clause CJK `GCS_COMPATTR` (`PreeditSegments`), `WM_IME_REQUEST` (`IMR_DOCUMENTFEED`, `IMR_RECONVERTSTRING`, `IMR_QUERYCHARPOSITION`), `ImmNotifyIME(CPS_CANCEL)`, and TSF `SetInputScope`.
+  - **Linux X11 / macOS**: deduplicated `winit` fallback with input-to-input focus reset.
+- **Vite-style `jsnir` CLI (`crates/dev`)**: in-memory multi-file TSX/TS compilation via **Oxc** (`~2–5 ms`), signal-preserving hot reload, native in-window error overlay, background `tsc --noEmit`, TTY shortcuts, and `--bytecode` AOT builds.
+- **Single-source Rust↔TypeScript contract**: declared once in [src/contract.rs](src/contract.rs) and generated into [app/jsnir.d.ts](app/jsnir.d.ts) (`JSNIR_UPDATE=1 cargo test contract`).
+
+---
+
+## Quickstart (`jsnir` CLI)
 
 ```sh
-JSNIR_TSC=$(bash scripts/fetch-tsc.sh target/typescript)
-export JSNIR_TSC
-cargo run --release --locked --features stepper --manifest-path backends/gpu/Cargo.toml --target-dir target -- stepper
+# 1. Build the lightweight CLI (QuickJS-ng default, zero V8)
+cargo build --release --manifest-path crates/dev/Cargo.toml
+
+# 2. Scaffold and start a new TSX project with instant Oxc hot reload
+./crates/dev/target/release/jsnir init my-app
+cd my-app
+../crates/dev/target/release/jsnir dev
+
+# 3. Build a standalone JS or AOT QuickJS bytecode (`.jsbc`) production bundle
+../crates/dev/target/release/jsnir build
+../crates/dev/target/release/jsnir build --bytecode
+
+# 4. Run a compiled bundle directly
+../crates/dev/target/release/jsnir run dist/app.jsbc
 ```
 
-Reuse it in another shell with `export JSNIR_TSC="$PWD/target/typescript/lib/tsc"`. The source build also accepts the compiler installed by `npm ci` when the variable is unset.
+### Opt-in V8 JIT engine (`--features engine-v8`)
 
-Use `--step`, `--name`, `--plan` and `--focus` to open a particular state. Append `--offscreen file.ppm` with a new output path to capture that state without opening a window.
+For apps with heavy JS logic (parsers, large grids, massive dynamic lists), compile the CLI or GPU
+runtime with `--features engine-v8` and pass `--engine v8` (or set `engine = "v8"` under `[app]` in
+`jsnir.toml`):
 
-## Stepper example code
+```sh
+cargo run --release --manifest-path crates/dev/Cargo.toml --features engine-v8 -- dev my-app --engine v8
+```
 
-Components run once, and signals update the nodes that read them. This option card from the Stepper declares its visual state in `paint`. Rust runs the transitions independently of the app thread. [Stepper source](app/stepper.tsx)
+---
+
+## Example TSX Component
+
+Components run once on mount; fine-grained signals update only the nodes that read them. Transitions,
+hover, press states, and animations run natively in Rust on the UI thread ([app/stepper.tsx](app/stepper.tsx)):
 
 ```tsx
 function Option(props: { title: string; detail: string; selected: () => boolean; onSelect: () => void }): Element {
@@ -53,54 +102,68 @@ function Option(props: { title: string; detail: string; selected: () => boolean;
 }
 ```
 
-## Run the chat
+### Run the Stepper Demo
 
 ```sh
-cargo run --release --locked --features examples --manifest-path backends/gpu/Cargo.toml --target-dir target -- js
+# Fetch pinned native TypeScript compiler once (or use `npm ci`)
+JSNIR_TSC=$(bash scripts/fetch-tsc.sh target/typescript)
+export JSNIR_TSC
+
+cargo run --release --features stepper --manifest-path backends/gpu/Cargo.toml -- stepper
 ```
 
-Use `rust` in place of `js` to run the Rust reference app. Set `JSNIR_LIVE=1` in the interactive JS chat to reload edits to `app/chat.tsx` and keep the draft, selection, scroll and signal values. If an edit fails to compile, the previous version keeps running.
+Flags: `--engine quickjs|v8` (when built with `--features engine-v8`), `--step N`, `--name NAME`,
+`--plan pro|starter`, `--focus`, `--offscreen file.ppm`.
 
-## Layout
+---
+
+## Repository Layout
 
 | Path | Contents |
 | --- | --- |
-| [src/](src) | Core: node tree and batches ([tree.rs](src/tree.rs)), QuickJS bridge ([lib.rs](src/lib.rs)), Rust↔TS contract ([contract.rs](src/contract.rs)), the app host ([host.rs](src/host.rs)) with transitions ([motion.rs](src/motion.rs)), line editor, Taffy layout, text with cosmic-text, icons |
-| [app/](app) | [SDK](app/sdk.ts) with fine-grained signals, the [Stepper](app/stepper.tsx) and [chat](app/chat.tsx) examples, and the generated [jsnir.d.ts](app/jsnir.d.ts) |
-| [backends/gpu](backends/gpu) | The native backend: winit window and input, arboard clipboard, a wgpu renderer with its own shader (rounded fills, gradients, inner and outer shadows, opacity layers). No UI framework in its dependency tree |
-| [backends/egui](backends/egui) | egui measurement baseline |
-| [comparison/stepper](comparison/stepper) | The same screen in Chromium, GPUI and JSNIR, with captures, code and measurements |
-| [assets/fonts](assets/fonts) | Inter 4.1 (OFL) |
-| [scripts/](scripts) | Benchmark and capture runners |
-| [docs/](docs) | Research notebook, proposal and roadmap |
+| [src/](src) | Core engine: tree & batches ([tree.rs](src/tree.rs)), pluggable JS engine trait + QuickJS-ng ([engine/](src/engine)), binary command protocol ([cmd.rs](src/cmd.rs)), Rust↔TS contract ([contract.rs](src/contract.rs)), UI host & layout ([host.rs](src/host.rs)), transitions ([motion.rs](src/motion.rs)), line editor + IME core ([editor.rs](src/editor.rs)), `cosmic-text` engine ([text.rs](src/text.rs)), virtual list ([list.rs](src/list.rs)) |
+| [crates/engine-v8](crates/engine-v8) | Standalone opt-in V8 JIT backend (`jsnir-v8`): TurboFan, shared `BackingStore`, V8 Fast API, in-place reload, `VmLimits` watchdog, parity suite & comparative benchmark |
+| [crates/dev](crates/dev) | Vite-style `jsnir` CLI & embeddable dev watcher: Oxc multi-file TSX compiler, signal-preserving hot reload, error overlay, async `tsc`, `--bytecode` AOT, `--engine quickjs\|v8` |
+| [backends/gpu](backends/gpu) | Native `winit` + `wgpu` backend: persistent shelf atlas, 1-draw-call instanced renderer, native Wayland `zwp_text_input_v3` & Windows IMM32/TSF IME ([ime/](backends/gpu/src/ime)), `arboard` clipboard |
+| [backends/egui](backends/egui) | Historical `egui` measurement baseline |
+| [app/](app) | Fine-grained TSX [SDK](app/sdk.ts), generated [jsnir.d.ts](app/jsnir.d.ts), and example/test screens ([stepper.tsx](app/stepper.tsx), [chat.tsx](app/chat.tsx)) |
+| [examples/](examples) | Reproducible release microbenchmarks (`bridge_bench`, `frame_bench`, `sdk_bench`) |
+| [comparison/stepper](comparison/stepper) | Side-by-side Stepper port in Chromium, GPUI, and JSNIR with captures and metrics |
+| [docs/](docs) | [Benchmarks](docs/benchmarks.md), [Roadmap](docs/roadmap.md), [Releases](docs/releases.md), and [Research notebook](docs/research.md) |
 
-The Rust↔TypeScript contract is declared once in `src/contract.rs`, and `app/jsnir.d.ts` is generated from it. Apps are type-checked against that file, so using something Rust does not offer fails to compile. Regenerate it with `JSNIR_UPDATE=1 cargo test contract`. The VM is QuickJS-ng 0.16.2, bundled and statically linked through the `rquickjs` crate.
+---
 
-Keyframe animations (`paint.animations`) run on the UI thread next to the transitions, and a loop stops drawing the window once it leaves the screen. Reduced motion stops the infinite ones (`Host::set_reduced_motion`, `Pusher::reduced_motion`). The GPU backend does not read the OS preference yet, so the program has to pass it in.
-
-## Tests
+## Tests & Benchmarks
 
 ```sh
-cargo test --release --locked --features examples,stepper                   # core and TSX checks, including the comparison
-cargo test --release --locked --features examples,stepper --manifest-path backends/gpu/Cargo.toml --target-dir target --all-targets
-cargo test --release --locked --manifest-path backends/egui/Cargo.toml --target-dir target
+# Core engine (zero-engine check + full QuickJS/contract/host tests)
+cargo check --no-default-features
+cargo test --features "examples stepper" -- --test-threads=4
+
+# Native GPU renderer + Wayland/Windows IME protocol tests
+cargo test --manifest-path backends/gpu/Cargo.toml --features "examples stepper"
+
+# Vite-style CLI (default QuickJS + opt-in V8)
+cargo test --manifest-path crates/dev/Cargo.toml
+cargo test --manifest-path crates/dev/Cargo.toml --features engine-v8
+
+# Opt-in V8 JIT parity, Fast API, in-place reload & VmLimits suite
+cargo test --manifest-path crates/engine-v8/Cargo.toml
+
+# TypeScript contract check
+npm run typecheck
 ```
 
-The core tests cover batch validation, the replica on the JS thread, transitions against the CSS curves, and an end-to-end run of the Stepper through the host: clicks, typing, timers and removed panes, with JS answering from its own thread.
+---
 
-## Results and research
+## Documentation
 
-- [Stepper: React Bits in Chromium, GPUI and JSNIR](comparison/stepper/README.md)
-- [Measurement and decision notebook](docs/research.md)
-- [Roadmap: what is missing](docs/roadmap.md)
-- [Runtime proposal and work plan](docs/runtime-proposal.md)
-- [Background: NSH and live UI in Rust](docs/background.md)
-- [Chat test 02: editing during a delayed send](docs/chat-test-02.md)
-- [Run the egui benchmarks](docs/research.md#run-the-egui-benchmarks)
-- [Historical backend setup on CachyOS](docs/setup-cachyos.md)
-
-The project was called Jurui until 19 November 2026.
+- **[Performance & Benchmarks (Electron vs GPUI vs JSNIR · QuickJS vs V8)](docs/benchmarks.md)**
+- **[Stepper Comparison: Chromium vs GPUI vs JSNIR](comparison/stepper/README.md)**
+- **[Roadmap](docs/roadmap.md)**
+- **[Research Notebook](docs/research.md)**
+- **[External App & Release Guide](docs/releases.md)**
 
 ## License
 
-JSNIR is under [MIT](LICENSE). Inter uses the [SIL Open Font License](assets/fonts/Inter-LICENSE.txt), and the Hugeicons Free icons use [MIT](assets/icons/Hugeicons-LICENSE.txt). The Chromium reference build downloads the pinned React Bits component. [Reference build](comparison/stepper/react/README.md)
+JSNIR is licensed under [MIT](LICENSE). Inter uses the [SIL Open Font License](assets/fonts/Inter-LICENSE.txt), and Hugeicons Free uses [MIT](assets/icons/Hugeicons-LICENSE.txt).

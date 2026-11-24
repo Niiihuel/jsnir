@@ -95,9 +95,9 @@ fn print_row(name: &str, stats: &Stats, json_calls: u64, bin_calls: u64) {
 fn main() {
     println!("JSNIR End-to-End SDK Microbenchmark Suite (release build, real app/sdk.ts)\n");
 
-    // 1. Realistic Discord-like channel swap via `For` (200 interactive rows using Row/Column,
+    // 1. Realistic 2-pane feed swap via `For` (100 interactive rows using Row/Column,
     //    transitions, shadows, hover, scrollbar, TextInput).
-    let discord_app = with_sdk(
+    let feed_app = with_sdk(
         r#"
         var rows = signal([]);
         var statsText = signal("STATS:0:0");
@@ -147,7 +147,7 @@ fn main() {
         "#,
     );
 
-    let mut host = Host::new(discord_app, "{}".into(), TextEngine::default());
+    let mut host = Host::new(feed_app, "{}".into(), TextEngine::default());
     host.set_wait_budget(Duration::from_millis(20));
     settle(&mut host);
 

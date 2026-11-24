@@ -1,5 +1,5 @@
 // Test app for `scrollbar`: three 120 by 100 scroll boxes of ten 30 px rows (content 300). The thumb is the dark
-// theme's thin thumb from Discord's reference, on an 8 px bar with 4 px corners and no track. The minimum thumb,
+// theme's thin overlay thumb on an 8 px bar with 4 px corners and no track. The minimum thumb,
 // the inset and auto-hide are choices of this app: the reference gives none.
 function Rows(): Element {
     return (

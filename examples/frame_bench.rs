@@ -47,12 +47,12 @@ fn wait_reply(host: &mut Host) {
     }
 }
 
-/// Builds a realistic Discord-like 2-pane app with:
+/// Builds a realistic 2-pane desktop feed app with:
 /// - Resizable sidebar (id 2) + drag handle (id 3) + main column (id 4)
 /// - Status bar text (id 5) + click trigger button (id 6)
 /// - Scrollable message feed (id 7) containing `rows` message rows (each = 1 group Box + avatar Box + 2 Texts = 4 nodes)
 /// Total nodes ≈ 8 + rows * 4 (for rows = 200 → 808 nodes!).
-fn discord_like_script(rows: usize, long_wrapped: bool) -> String {
+fn two_pane_feed_script(rows: usize, long_wrapped: bool) -> String {
     let body_expr = if long_wrapped {
         "'Message payload ' + i + ' with an intentionally long multi-line paragraph that wraps across several lines inside the flexible chat column whenever the user drags the sidebar divider horizontally at 120 Hz. Testing zero-HarfBuzz Buffer re-wrapping!'"
     } else {
@@ -195,11 +195,11 @@ fn print_row(name: &str, stats: &Stats, items: usize) {
 fn main() {
     println!("JSNIR Frame Pipeline Microbenchmark Suite (release build)\n");
 
-    let mut host = Host::new(discord_like_script(200, false), "{}".into(), TextEngine::default());
+    let mut host = Host::new(two_pane_feed_script(200, false), "{}".into(), TextEngine::default());
     host.set_wait_budget(Duration::from_millis(5));
     settle(&mut host);
     let node_count = host.tree.nodes.iter().count();
-    println!("=== A. Discord-like 2-Pane Feed ({node_count} nodes, 200 chat rows in scroll box) ===");
+    println!("=== A. 2-Pane Feed ({node_count} nodes, 200 rows in scroll box) ===");
 
     // 1. Steady-state frame (nothing changed)
     let warmup = 50;
@@ -289,7 +289,7 @@ fn main() {
 
     // 5b. Live sidebar drag-resize with 200 LONG WRAPPED multi-line paragraphs!
     let mut wrapped_host = Host::new(
-        discord_like_script(200, true),
+        two_pane_feed_script(200, true),
         "{}".into(),
         TextEngine::default(),
     );

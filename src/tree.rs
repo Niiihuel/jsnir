@@ -635,7 +635,7 @@ contract_enum! {
         SetPaint { id: u16, paint: Arc<Paint> },
         SetStyle { id: u16, style: Style },
         SetDisabled { id: u16, disabled: bool },
-        /// Moves keyboard focus to a text field, as Discord's `autofocus`.
+        /// Moves keyboard focus to this text field when mounted (autofocus).
         Focus { id: u16 },
         /// Removes the node and all its descendants. The node must exist before the batch.
         Remove { id: u16 },

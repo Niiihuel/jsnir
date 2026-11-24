@@ -1,68 +1,59 @@
-# JSNIR roadmap
+# JSNIR Roadmap
 
-The first priorities are keeping the UI responsive when the app VM fails, preserving input, and moving the chat and counter onto the shared host. The measurement milestones follow the original runtime proposal. [Decision criteria](runtime-proposal.md#decision-criteria) · [Research notebook](research.md)
+JSNIR aims to be a general-purpose, embeddable native desktop UI engine in Rust for TypeScript/TSX
+applications — delivering native GPU efficiency comparable to GPUI/Iced/egui with the iteration speed
+of TSX and sub-millisecond hot reload.
 
-## Now: make what exists dependable
+See **[docs/benchmarks.md](benchmarks.md)** for verified release measurements and
+**[docs/research.md](research.md)** for the historical design notebook.
 
-1. **A failing app must not take the UI down.** A panic on the app thread (a script that fails to load, a broken
-   replica invariant) disconnects the bridge and the UI thread panics with it. The UI already owns the editor,
-   layout and drawing, so it can keep running, show the error, and restart the VM the way live reload swaps it.
-   *Done when* a test kills the VM mid-session and the window keeps answering input.
-2. **No user input is lost.** The chat clears the draft before the app accepts it; if the callback throws, the
-   message disappears. Events need an answer (accepted or rejected) so the UI can give the text back.
-   *Done when* a throwing submit handler leaves the draft intact.
-3. **One host for every app.** The chat still has its own scene and window; the counter has its own runtime.
-   Move both onto `host.rs` (which needs list virtualization) and delete the duplicates.
-   *Done when* `backends/gpu` has one window type and the chat captures are unchanged.
-4. **Develop external apps.** The engine opens an external bundle with `jsnir-gpu run path/to/app.js`.
-   Add live reload for the generic host and support for compiling larger TSX projects. [External app setup](releases.md#run-an-external-app)
-5. **Bounded queues.** The UI→app log grows until the next event; coalesce repeated `setinput` and `setrect`
-   for the same node.
+---
 
-## Next: cover what real screens use
+## Completed Milestones
 
-6. **SDK structure:** keyed lists with insert, remove and reorder; conditional subtrees; component cleanup hooks.
-   The SDK `List` still only grows, and `Dynamic` remounts its whole child. The generic Rust `Host` can now
-   opt a mounted List into keyed demand with `replace_virtual_list`, `set_list_viewport`, `mutate_list`, and
-   `take_list_demand`. The consumer supplies a logical viewport and gets only entering, edited, and evicted
-   keys (no overscan or repeat snapshot). Same-height content edits do not reselect the window; geometry
-   edits can reconcile the visible window. The handle is valid on the issuing Host only, until input
-   replacement or node removal. The embedder can `bind_virtual_row` an existing direct child subtree to
-   a key and `unbind_virtual_row` it without removing it from the app tree. Only bound rows in the
-   intersection of the supplied viewport and the list box are laid out and drawn, using their indexed
-   heights and offsets. Paint and pointer hits are clipped to that viewport; fixed descendants stay
-   inside it rather than becoming window overlays. Legacy lists are unchanged.
-   `replace_auto_virtual_list` instead takes the List box's logical height from the completed Host frame.
-   `set_list_offset` queues a pixel or tail position without supplying an extent. Wheel input scrolls
-   under the pointer and pins at the end; a pixel request or upward wheel movement unpins it. The
-   automatic mode moves directly even for line wheels; legacy scroll glides are unchanged. Demand
-   starts after the first layout; unchanged visible keys produce no repeat demand.
-   Next: bridge the demand and row bindings to QuickJS and mount only demanded rows in the SDK.
-7. **Layout:** percentages, min/max sizes, wrapping, grid, z-order. **Text:** ellipsis, alignment, rich spans,
-   font loading from the app, system font fallback. **Images.**
-8. **Rendering:** rounded clipping, rotation, backdrop blur, a glyph atlas instead of one texture per text,
-   and redrawing only what changed.
-9. **Input:** Tab focus navigation with focus rings, scroll containers for any box, drag, multi-line text,
-   and the input-method surrounding-text protocol (winit 0.30 lacks it; Wayland text-input v3 has it).
-10. **Accessibility:** expose the node tree through AccessKit. This is the largest gap against egui and GPUI.
+- **Pluggable JS VM architecture & safety (`src/engine/`, `crates/engine-v8/`)**
+  - Engine-agnostic `JsEngine` / `JsEngineFactory` traits; core `jsnir` compiles with `--no-default-features` (zero JS VM linked).
+  - Lightweight default **QuickJS-ng** backend with `.jsbc` AOT bytecode (`0.51–1.20 ms` cold start) and `VmLimits` (memory ceiling + interrupt deadline).
+  - Opt-in **V8** backend (`jsnir-v8`) with shared `v8::BackingStore`, V8 Fast API (`jsnir.set`/`commit`), in-place `Isolate` recycling on hot reload (`0.41 ms`), and watchdog termination.
+- **High-throughput zero-JSON JS↔Rust bridge (`src/cmd.rs`, `src/host.rs`, `app/sdk.ts`)**
+  - 100% binary command buffer (`Uint32Array`/`Float32Array` + string pool) across the entire TSX SDK (`JSON calls = 0`).
+  - Zero-JSON typed event entry points (`jsnirDrag`, `jsnirScroll`, `jsnirContextMenu`), bounded `Host::poll()` wait (`100%` same-frame landing at `5.84 µs`), UI→app log coalescing, and `Arc<Batch>`/`Arc<Paint>` zero-clone sharing.
+- **CPU frame & GPU rendering optimizations (`src/host.rs`, `backends/gpu/src/`)**
+  - Text measurement cache, dirty layout short-circuiting, zero-clone tree walker, `Motion` fast path, and safe clip culling (`7.40 µs` steady frame on 1,007 nodes).
+  - Persistent `4096×2048` shelf texture atlas, instanced draw-call batching (`1501 → 1` draw call), tight styled-text rasterization, and `O(1)` steady-state view cache (`533 µs` GPU frame on Radeon 780M).
+- **Vite-style development tooling (`crates/dev/`)**
+  - `jsnir` CLI (`init`, `dev`, `build [--bytecode]`, `run`, `check`, `capture`) with in-memory Oxc multi-file TSX transpilation, signal-preserving hot reload, native in-window error overlay, background `tsc --noEmit`, TTY shortcuts, and `--engine quickjs|v8` / `jsnir.toml` selection.
+- **Native multiplatform IME (`src/editor.rs`, `src/host.rs`, `backends/gpu/src/ime/`)**
+  - `SurroundingText` (UTF-8 & UTF-16), multi-clause `PreeditSegments`, `DeleteSurroundingBytes`, `InputPurpose` (`Normal`, `Password`, `Search`, `Email`, `Number`), and `ImeChangeCause`.
+  - Native Linux Wayland `zwp_text_input_v3` (v1 & v2) client on an isolated `wl_event_queue`.
+  - Native Windows `HWND` subclass (`GCS_COMPATTR`, `WM_IME_REQUEST` `IMR_DOCUMENTFEED`/`IMR_RECONVERTSTRING`/`IMR_QUERYCHARPOSITION`, `ImmNotifyIME(CPS_CANCEL)`, TSF `SetInputScope`).
+  - Upgraded X11/macOS `winit` fallback with input-to-input focus switch reset.
+- **Virtual lists, rich text, overlays & animations**
+  - Rust-owned virtual list indexing with keyed demand bridged to JS/SDK, rich `spans`, anchored `Popover` placement callbacks, `For`/`Dynamic` cleanup hooks, keyframe animations with reduced motion, and multi-line wrapped `TextInput`.
 
-**Anchored overlays:** `Popover` can opt in to `onPlacement({ side, anchorOffset })` to position a pointer after
-flip and clamp. `side` is the resolved side of the anchor; `anchorOffset` is the anchor center measured in logical
-pixels from the placed panel's left edge (top/bottom) or top edge (left/right), before panel paint transforms.
-The offset is not clipped to the panel. Use the panel's own dimensions if its corners require clearance.
-The callback fires on first placement and when either value changes, not on every frame.
+---
 
-## Measure: the proposal's decision criteria
+## Next Priorities
 
-11. **Input → presented frame** on the GPU host with `wp_presentation`, using the egui results as a baseline. [egui presentation measurements](../metrics/presentation-02)
-12. **Startup to first frame, idle CPU, and memory**, with a breakdown of the 121 MB peak (GPUI: 109 MB).
-13. **Binary size** against the +5 MB threshold over a Rust-only build of the same screen.
-14. **Animations frame by frame** against Chromium: record the Stepper's transitions in all three versions.
-15. **Scale:** 10,000-node trees in the host, long lists, and batch cost per operation now that `Paint` is boxed.
+### 1. Native Accessibility via AccessKit (Highest Priority)
+Expose JSNIR's live node tree (`Tree` + layout geometry + focus + `LineEditor` text runs/selection)
+through **AccessKit** (`accesskit` + `accesskit_winit`) so screen readers (Orca on Linux AT-SPI,
+NVDA/Narrator on Windows UIA, VoiceOver on macOS NSAccessibility) and automated UI tests can inspect
+and drive every JSNIR app natively. This is the largest remaining feature gap against GPUI and egui.
 
-## Later: make it usable by others
+### 2. Resilience & Fault Recovery
+- Catch panics / fatal VM failures on the app thread cleanly so the UI thread stays alive, displays
+  the native error overlay, and allows restarting or hot-reloading the VM without crashing the window.
+- Preserve unsent field drafts if a JS `onSubmit` handler throws.
 
-16. An npm package for the SDK and its types, with component documentation.
-17. Developer tools: a tree inspector, a batch trace viewer, an error overlay in the window.
-18. macOS and Windows runs, fractional scale factors, several windows.
-19. Continuous integration running the tests and the Stepper captures on every push.
+### 3. Unified Host & Keyboard Navigation
+- Migrate the remaining standalone chat/counter measurement demos onto the generic `Host` window and
+  remove duplicate window code.
+- Full `Tab` / `Shift+Tab` focus traversal across focusable nodes (`Input`, pressable `Box`, `Button`)
+  with configurable focus rings and ARIA/AccessKit roles.
+
+### 4. Multi-Window, Platform Polish & Packaging
+- Multiple native windows sharing one or more `Host` instances, native OS menu bars / tray hooks,
+  and OS reduced-motion / dark-mode preference reading.
+- Verified CI matrix for Linux (Wayland/X11), Windows (Vulkan/DX12 + IMM32/TSF), and macOS (Metal).
+- Publishable `jsnir` crate + `@jsnir/sdk` npm types package and built-in visual tree/batch inspector.

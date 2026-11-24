@@ -806,7 +806,7 @@ mod tests {
     use super::*;
     #[cfg(feature = "engine-quickjs")]
     use crate::engine::JsEngine;
-    #[cfg(feature = "engine-quickjs")]
+    #[cfg(all(feature = "engine-quickjs", feature = "examples"))]
     use rquickjs::CatchResultExt;
     #[cfg(feature = "examples")]
     #[test]

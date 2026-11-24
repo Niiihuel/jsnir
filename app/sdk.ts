@@ -1956,7 +1956,7 @@ type TextInputProps = {
     onSubmit?: (submit: TextSubmit) => void;
     /** Receives the text after each edit, as a DOM `input` event. */
     onChange?: (text: string) => void;
-    /** Takes the focus when it mounts, as Discord's search fields do. */
+    /** Moves keyboard focus to this input when it mounts. */
     autoFocus?: boolean;
     ref?: (field: Field) => void;
 };
