@@ -1,51 +1,124 @@
-//! Turns the host's drawing items into GPU draws, caching text and icon bitmaps between frames.
-use crate::renderer::{Draw, Image, Renderer};
+//! Turns the host's drawing items into GPU draws, packing text and icon bitmaps into the
+//! renderer's persistent texture atlas and caching them between frames without O(N²) eviction.
+use crate::renderer::{AtlasAlloc, Draw, Image, Renderer};
 use jsnir::{
     editor::EditorBitmapKey,
     host::{Host, ImageData, Item, Rect},
     icons,
-    text::{TextStyle, node_spans},
-    tree::TextAlign,
+    text::{TextBitmap, TextStyle, node_spans},
+    tree::{Icon, Span, TextAlign},
 };
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    hash::{Hash, Hasher},
+};
+
+// Exact value key for rich-text spans comparing floats by their bits, avoiding `format!("{spans:?}")`.
+#[derive(Clone)]
+struct SpanList(Vec<Span>);
+
+impl PartialEq for SpanList {
+    fn eq(&self, other: &Self) -> bool {
+        if self.0.len() != other.0.len() {
+            return false;
+        }
+        self.0.iter().zip(&other.0).all(|(a, b)| {
+            a.text == b.text
+                && a.color == b.color
+                && a.weight == b.weight
+                && a.size.map(f32::to_bits) == b.size.map(f32::to_bits)
+                && a.family == b.family
+                && a.underline == b.underline
+                && a.italic == b.italic
+                && a.strike == b.strike
+                && a.background == b.background
+                && a.background_radius.to_bits() == b.background_radius.to_bits()
+                && match (&a.image, &b.image) {
+                    (None, None) => true,
+                    (Some(x), Some(y)) => {
+                        x.source == y.source
+                            && x.width.to_bits() == y.width.to_bits()
+                            && x.height.to_bits() == y.height.to_bits()
+                    }
+                    _ => false,
+                }
+        })
+    }
+}
+
+impl Eq for SpanList {}
+
+impl Hash for SpanList {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.len().hash(state);
+        for s in &self.0 {
+            s.text.hash(state);
+            s.color.hash(state);
+            s.weight.hash(state);
+            s.size.map(f32::to_bits).hash(state);
+            s.family.hash(state);
+            s.underline.hash(state);
+            s.italic.hash(state);
+            s.strike.hash(state);
+            s.background.hash(state);
+            s.background_radius.to_bits().hash(state);
+            if let Some(img) = &s.image {
+                true.hash(state);
+                img.source.hash(state);
+                img.width.to_bits().hash(state);
+                img.height.to_bits().hash(state);
+            } else {
+                false.hash(state);
+            }
+        }
+    }
+}
 
 // Bitmaps depend on everything that changes their pixels; floats are compared by their bits.
-#[derive(Clone, PartialEq, Eq, Hash)]
-enum Key {
-    Text {
-        text: String,
-        // The runs of a rich text, as their Debug text: the bitmap depends on each of them.
-        spans: Option<String>,
-        size: [u32; 2],
-        scale: u32,
-        wrap: bool,
-        style: [u32; 4],
-        color: [u8; 4],
-        family: Option<String>,
-        align: TextAlign,
-    },
-    Icon {
-        icon: jsnir::tree::Icon,
-        size: u32,
-        scale: u32,
-        stroke: u32,
-        draw: u32,
-        color: [u8; 4],
-    },
-    // Pixels are replaced by a new generation, so this key is never stale.
-    Image {
-        generation: u64,
-    },
+#[derive(PartialEq, Eq, Hash)]
+struct TextKey {
+    text: String,
+    spans: Option<SpanList>,
+    size: [u32; 2],
+    scale: u32,
+    wrap: bool,
+    style: [u32; 4],
+    color: [u8; 4],
+    family: Option<String>,
+    align: TextAlign,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct IconKey {
+    icon: Icon,
+    size: u32,
+    scale: u32,
+    stroke: u32,
+    draw: u32,
+    color: [u8; 4],
+}
+
+struct CacheEntry {
+    image: Image,
+    last_used: u64,
+    // `Some(epoch)` while packed in the renderer's texture atlas; `None` for standalone GPU textures.
+    atlas_epoch: Option<u64>,
 }
 
 #[derive(Default)]
 pub struct View {
-    images: HashMap<Key, Image>,
-    used: Vec<Key>,
+    texts: HashMap<TextKey, CacheEntry>,
+    icons: HashMap<IconKey, CacheEntry>,
+    // App images and masks keyed directly by their generation (`(image, last_used_frame)`).
+    images: HashMap<u64, (Image, u64)>,
     // The focused field's text bitmap and the key it was made for; no image while the field is empty.
     editor: Option<(EditorBitmapKey, Option<Image>)>,
     // The host's font epoch when the bitmaps were made.
     font_epoch: u64,
+    atlas_epoch: u64,
+    atlas_needs_clear: bool,
+    standalone_count: usize,
+    frame_id: u64,
 }
 
 fn style_bits(style: &TextStyle) -> [u32; 4] {
@@ -58,52 +131,99 @@ fn style_bits(style: &TextStyle) -> [u32; 4] {
 }
 
 impl View {
-    /// Forgets every image, for a new GPU device.
+    /// Forgets every cached image, for a new GPU device.
     pub fn reset(&mut self) {
+        self.texts.clear();
+        self.icons.clear();
         self.images.clear();
         self.editor = None;
+        self.atlas_epoch = 0;
+        self.atlas_needs_clear = false;
+        self.standalone_count = 0;
     }
 
     // The GPU image of an app image, uploaded the first time a frame uses its generation.
-    fn image(&mut self, renderer: &Renderer, image: &ImageData, used: &mut Vec<Key>) -> Image {
-        let key = Key::Image {
-            generation: image.generation,
-        };
-        if !self.images.contains_key(&key) {
-            let size = image.size.map(|side| side as usize);
-            let uploaded = renderer.rgba_image(&image.rgba, size);
-            self.images.insert(key.clone(), uploaded);
+    fn image(&mut self, renderer: &Renderer, image: &ImageData) -> Image {
+        let frame_id = self.frame_id;
+        if let Some((cached, last_used)) = self.images.get_mut(&image.generation) {
+            *last_used = frame_id;
+            return cached.clone();
         }
-        let shown = self.images[&key].clone();
-        used.push(key);
-        shown
+        let size = image.size.map(|side| side as usize);
+        let uploaded = renderer.rgba_image(&image.rgba, size);
+        self.images
+            .insert(image.generation, (uploaded.clone(), frame_id));
+        uploaded
     }
 
-    fn mask(
-        &mut self,
-        renderer: &Renderer,
-        mask: Option<(ImageData, Rect)>,
-        used: &mut Vec<Key>,
-    ) -> Option<(Image, Rect)> {
-        mask.map(|(image, rect)| (self.image(renderer, &image, used), rect))
+    fn mask(&mut self, renderer: &Renderer, mask: Option<(ImageData, Rect)>) -> Option<(Image, Rect)> {
+        mask.map(|(image, rect)| (self.image(renderer, &image), rect))
+    }
+
+    fn upload_tile(&mut self, renderer: &mut Renderer, bitmap: TextBitmap) -> CacheEntry {
+        match renderer.atlas_image(&bitmap) {
+            AtlasAlloc::Packed(image) => CacheEntry {
+                image,
+                last_used: self.frame_id,
+                atlas_epoch: Some(renderer.atlas_epoch()),
+            },
+            AtlasAlloc::Full => {
+                // Keep previously emitted draws in this frame intact; reset the atlas at the start of the next frame.
+                self.atlas_needs_clear = true;
+                self.standalone_count += 1;
+                CacheEntry {
+                    image: renderer.image(bitmap),
+                    last_used: self.frame_id,
+                    atlas_epoch: None,
+                }
+            }
+            AtlasAlloc::Oversized => {
+                self.standalone_count += 1;
+                CacheEntry {
+                    image: renderer.image(bitmap),
+                    last_used: self.frame_id,
+                    atlas_epoch: None,
+                }
+            }
+        }
     }
 
     pub fn draws(
         &mut self,
         host: &mut Host,
-        renderer: &Renderer,
+        renderer: &mut Renderer,
         items: Vec<Item>,
         scale: f32,
     ) -> Vec<Draw> {
         let max_side = renderer.device.limits().max_texture_dimension_2d as usize;
+        self.frame_id = self.frame_id.wrapping_add(1).max(1);
+        let frame_id = self.frame_id;
+
         if self.font_epoch != host.font_epoch() {
             // The fonts changed: every bitmap of text, and the focused field's, was made with the old ones.
-            self.images.clear();
+            self.texts.clear();
+            self.icons.clear();
             self.editor = None;
+            renderer.clear_atlas();
+            self.atlas_epoch = renderer.atlas_epoch();
+            self.atlas_needs_clear = false;
+            self.standalone_count = 0;
             self.font_epoch = host.font_epoch();
+        } else if self.atlas_needs_clear {
+            renderer.clear_atlas();
+            self.texts.retain(|_, e| e.atlas_epoch.is_none());
+            self.icons.retain(|_, e| e.atlas_epoch.is_none());
+            self.atlas_epoch = renderer.atlas_epoch();
+            self.atlas_needs_clear = false;
+        } else if self.atlas_epoch != renderer.atlas_epoch() {
+            let epoch = renderer.atlas_epoch();
+            self.texts
+                .retain(|_, e| e.atlas_epoch.is_none_or(|ep| ep == epoch));
+            self.icons
+                .retain(|_, e| e.atlas_epoch.is_none_or(|ep| ep == epoch));
+            self.atlas_epoch = epoch;
         }
-        let mut used = std::mem::take(&mut self.used);
-        used.clear();
+
         let mut draws = Vec::with_capacity(items.len());
         for item in items {
             match item {
@@ -138,7 +258,7 @@ impl View {
                     round_clip,
                     mask,
                 } => {
-                    let mask = self.mask(renderer, mask, &mut used);
+                    let mask = self.mask(renderer, mask);
                     draws.push(
                         Draw::gradient(rect, clip, radius, top, bottom)
                             .rounded_clip(round_clip)
@@ -155,7 +275,7 @@ impl View {
                     round_clip,
                     mask,
                 } => {
-                    let mask = self.mask(renderer, mask, &mut used);
+                    let mask = self.mask(renderer, mask);
                     draws.push(
                         Draw::inset(rect, clip, radius, spread, offset, color)
                             .rounded_clip(round_clip)
@@ -166,7 +286,7 @@ impl View {
                     rect,
                     text,
                     spans,
-                    style,
+                    mut style,
                     wrap,
                     zoom,
                     clip,
@@ -175,40 +295,41 @@ impl View {
                     // Rasterized at its logical size and the zoomed scale, so it stays sharp while scaled.
                     let size = [rect[2] / zoom, rect[3] / zoom];
                     let pixels = scale * zoom;
-                    let key = Key::Text {
+                    let key = TextKey {
                         text,
-                        spans: spans.as_ref().map(|spans| format!("{spans:?}")),
+                        spans: spans.map(SpanList),
                         size: size.map(f32::to_bits),
                         scale: pixels.to_bits(),
                         wrap,
                         style: style_bits(&style),
                         color: style.color,
-                        family: style.family.clone(),
+                        family: style.family.take(),
                         align: style.align,
                     };
-                    if !self.images.contains_key(&key) {
-                        let Key::Text { text, .. } = &key else {
-                            unreachable!()
+                    if let Some(entry) = self.texts.get_mut(&key) {
+                        entry.last_used = frame_id;
+                        draws.push(
+                            Draw::image(&entry.image, snap([rect[0], rect[1]], scale), scale, clip)
+                                .rounded_clip(round_clip),
+                        );
+                    } else {
+                        style.family = key.family.clone();
+                        let runs = node_spans(
+                            &key.text,
+                            key.spans.as_ref().map(|spans| spans.0.as_slice()),
+                        );
+                        let Some(bitmap) =
+                            host.raster_text(&runs, size, pixels, wrap, max_side, style)
+                        else {
+                            continue;
                         };
-                        let runs = node_spans(text, spans.as_deref());
-                        match host.raster_text(&runs, size, pixels, wrap, max_side, style) {
-                            Some(bitmap) => {
-                                let image = renderer.image(bitmap);
-                                self.images.insert(key.clone(), image);
-                            }
-                            None => continue,
-                        }
+                        let entry = self.upload_tile(renderer, bitmap);
+                        draws.push(
+                            Draw::image(&entry.image, snap([rect[0], rect[1]], scale), scale, clip)
+                                .rounded_clip(round_clip),
+                        );
+                        self.texts.insert(key, entry);
                     }
-                    draws.push(
-                        Draw::image(
-                            &self.images[&key],
-                            snap([rect[0], rect[1]], scale),
-                            scale,
-                            clip,
-                        )
-                        .rounded_clip(round_clip),
-                    );
-                    used.push(key);
                 }
                 Item::Icon {
                     rect,
@@ -220,7 +341,7 @@ impl View {
                     clip,
                     round_clip,
                 } => {
-                    let key = Key::Icon {
+                    let key = IconKey {
                         icon,
                         size: rect[2].to_bits(),
                         scale: scale.to_bits(),
@@ -228,25 +349,24 @@ impl View {
                         draw: draw.to_bits(),
                         color,
                     };
-                    if !self.images.contains_key(&key) {
-                        match icons::rasterize(icon, rect[2], stroke, draw, color, scale) {
-                            Some(bitmap) => {
-                                let image = renderer.image(bitmap);
-                                self.images.insert(key.clone(), image);
-                            }
-                            None => continue,
-                        }
+                    if let Some(entry) = self.icons.get_mut(&key) {
+                        entry.last_used = frame_id;
+                        draws.push(
+                            Draw::image(&entry.image, snap([rect[0], rect[1]], scale), scale, clip)
+                                .rounded_clip(round_clip),
+                        );
+                    } else {
+                        let Some(bitmap) = icons::rasterize(icon, rect[2], stroke, draw, color, scale)
+                        else {
+                            continue;
+                        };
+                        let entry = self.upload_tile(renderer, bitmap);
+                        draws.push(
+                            Draw::image(&entry.image, snap([rect[0], rect[1]], scale), scale, clip)
+                                .rounded_clip(round_clip),
+                        );
+                        self.icons.insert(key, entry);
                     }
-                    draws.push(
-                        Draw::image(
-                            &self.images[&key],
-                            snap([rect[0], rect[1]], scale),
-                            scale,
-                            clip,
-                        )
-                        .rounded_clip(round_clip),
-                    );
-                    used.push(key);
                 }
                 Item::Image {
                     rect,
@@ -257,7 +377,7 @@ impl View {
                     round_clip,
                     mask,
                 } => {
-                    let texture = self.image(renderer, &image, &mut used);
+                    let texture = self.image(renderer, &image);
                     // The mask is snapped with the image, so it keeps the same pixels as the image it masks.
                     let fitted = one_to_one(rect, image.size, scale);
                     let mask = mask.map(|(pixels, mask_rect)| {
@@ -268,7 +388,7 @@ impl View {
                         };
                         (pixels, mask_rect)
                     });
-                    let mask = self.mask(renderer, mask, &mut used);
+                    let mask = self.mask(renderer, mask);
                     draws.push(
                         Draw::image_in(&texture, fitted.unwrap_or(rect), radius, clip, tint)
                             .rounded_clip(round_clip)
@@ -316,9 +436,30 @@ impl View {
                 }
             }
         }
-        // Keep only what this frame used: animations would otherwise pile up one bitmap per step.
-        self.images.retain(|key, _| used.contains(key));
-        self.used = used;
+
+        // O(1) steady-state cleanup: atlas tiles stay cached inside the bounded persistent atlas
+        // (avoiding re-rasterization on scroll-back); standalone textures are reclaimed immediately.
+        if !self.images.is_empty() {
+            self.images.retain(|_, (_, last)| *last == frame_id);
+        }
+        if self.standalone_count > 0 {
+            let mut standalone = 0usize;
+            self.texts.retain(|_, e| {
+                let keep = e.atlas_epoch.is_some() || e.last_used == frame_id;
+                if keep && e.atlas_epoch.is_none() {
+                    standalone += 1;
+                }
+                keep
+            });
+            self.icons.retain(|_, e| {
+                let keep = e.atlas_epoch.is_some() || e.last_used == frame_id;
+                if keep && e.atlas_epoch.is_none() {
+                    standalone += 1;
+                }
+                keep
+            });
+            self.standalone_count = standalone;
+        }
         draws
     }
 }

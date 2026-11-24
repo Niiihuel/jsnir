@@ -757,11 +757,38 @@ impl TextEngine {
     pub fn rasterize_styled(
         &mut self,
         spans: &[Span],
+        size: [f32; 2],
+        scale: f32,
+        wrap: bool,
+        max_side: usize,
+        style: &TextStyle,
+    ) -> Option<TextBitmap> {
+        self.rasterize_styled_impl(spans, size, scale, wrap, max_side, style, false)
+    }
+
+    /// Like [`Self::rasterize_styled`], trimming unused transparent space to the right of the
+    /// rightmost glyph even when `wrap` is true (preserving left/center/end glyph x-offsets).
+    pub fn rasterize_styled_tight(
+        &mut self,
+        spans: &[Span],
+        size: [f32; 2],
+        scale: f32,
+        wrap: bool,
+        max_side: usize,
+        style: &TextStyle,
+    ) -> Option<TextBitmap> {
+        self.rasterize_styled_impl(spans, size, scale, wrap, max_side, style, true)
+    }
+
+    fn rasterize_styled_impl(
+        &mut self,
+        spans: &[Span],
         [width, height]: [f32; 2],
         scale: f32,
         wrap: bool,
         max_side: usize,
         style: &TextStyle,
+        trim_wrapped_right: bool,
     ) -> Option<TextBitmap> {
         if blank(spans)
             || !width.is_finite()
@@ -780,7 +807,32 @@ impl TextEngine {
             self.shape_styled(spans, None, Wrap::None, style)
         };
         let width = if wrap {
-            width
+            if trim_wrapped_right {
+                let max_right = buffer
+                    .layout_runs()
+                    .take_while(|run| run.line_top < height)
+                    .map(|run| {
+                        let glyph_right = run
+                            .glyphs
+                            .iter()
+                            .map(|g| g.x + g.w + g.font_size)
+                            .fold(0.0_f32, f32::max);
+                        // For Start alignment `line_w` is already from x=0; for Center/End
+                        // `glyph.x` carries the alignment offset so `glyph_right` bounds the ink.
+                        if style.align == TextAlign::Start {
+                            glyph_right.max(run.line_w + style.size)
+                        } else {
+                            glyph_right
+                        }
+                    })
+                    .fold(0.0_f32, f32::max);
+                if max_right <= 0. {
+                    return None;
+                }
+                width.min(max_right)
+            } else {
+                width
+            }
         } else {
             let line = buffer.layout_runs().next()?;
             // Leave room for glyphs that overhang the advance of the last letter.

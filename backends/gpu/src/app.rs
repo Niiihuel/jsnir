@@ -183,7 +183,7 @@ impl AppWindow {
         let scene = self.host.frame(width, height, scale, max_side);
         let draws = self
             .view
-            .draws(&mut self.host, &surface.renderer, scene.items, scale);
+            .draws(&mut self.host, &mut surface.renderer, scene.items, scale);
         self.ime
             .sync(&surface.window, self.window_focused, self.host.ime_state());
         self.ime.update_area(&surface.window, scene.ime_area);
@@ -689,7 +689,7 @@ pub fn capture_at(
         std::thread::sleep(Duration::from_millis(16));
     }
     let frame = host.frame(width, height, scale, max_side as usize);
-    let draws = View::default().draws(&mut host, &renderer, frame.items, scale);
+    let draws = View::default().draws(&mut host, &mut renderer, frame.items, scale);
     renderer.capture(pixels, scale, &draws, path)
 }
 

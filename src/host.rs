@@ -2856,7 +2856,7 @@ impl Host {
         style: TextStyle,
     ) -> Option<TextBitmap> {
         self.text
-            .rasterize_styled(spans, size, scale, wrap, max_side, &style)
+            .rasterize_styled_tight(spans, size, scale, wrap, max_side, &style)
     }
 
     /// Forget uploaded images (the backend lost its surface).

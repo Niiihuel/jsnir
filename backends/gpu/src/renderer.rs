@@ -3,16 +3,38 @@
 //! semi-transparent colors look the same as in CSS.
 use bytemuck::{Pod, Zeroable};
 use jsnir::{host::Corners, text::TextBitmap};
-use std::{io::Write, path::Path, sync::mpsc};
+use std::{
+    io::Write,
+    ops::Range,
+    path::Path,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
+};
 
 pub type Rect = [f32; 4];
 pub type Color = [u8; 4];
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 const WHITE: Color = [255; 4];
+const WHITE_TEX_ID: u64 = 1;
+const ATLAS_TEX_ID: u64 = 2;
+const FIRST_DYNAMIC_TEX_ID: u64 = 3;
+
+/// Per-frame GPU rendering telemetry recorded by [`Renderer::draw`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RenderStats {
+    pub quads: usize,
+    pub draw_calls: usize,
+    pub bind_group_switches: usize,
+    pub scissor_switches: usize,
+}
 
 #[derive(Clone)]
 pub struct Image {
     pub size: [usize; 2],
+    uv: [f32; 4],
+    texture_id: u64,
     bindings: wgpu::BindGroup,
 }
 
@@ -117,7 +139,7 @@ impl Draw {
             round_clip: None,
             color: tint,
             end_color: tint,
-            uv: [0., 0., 1., 1.],
+            uv: image.uv,
             radius,
             image: Some(image.clone()),
             mask: None,
@@ -207,9 +229,224 @@ struct Quad {
 
 // Offscreen texture for one nesting level of layers.
 struct Layer {
+    _texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    bindings: wgpu::BindGroup,
+    texture_id: u64,
+    size: [u32; 2],
+}
+
+struct Shelf {
+    y: u32,
+    height: u32,
+    x: u32,
+}
+
+// Persistent single-texture shelf atlas for text and icon bitmaps.
+// Reserves `(0..4, 0..4)` permanently for an opaque white block so fills, shadows, insets,
+// icons, and text share a single Group-0 bind group and coalesce into one instanced draw call.
+struct Atlas {
     texture: wgpu::Texture,
     bindings: wgpu::BindGroup,
-    size: [u32; 2],
+    width: u32,
+    height: u32,
+    white_uv: [f32; 4],
+    shelves: Vec<Shelf>,
+    next_y: u32,
+    epoch: u64,
+    staging: Vec<u8>,
+}
+
+/// Result of trying to pack a bitmap into [`Renderer`]'s persistent texture atlas.
+pub enum AtlasAlloc {
+    /// Packed into the atlas; shares the atlas bind group with fills, icons, and other text.
+    Packed(Image),
+    /// The atlas has no free shelf space left; caller should fall back to standalone for this frame
+    /// and call [`Renderer::clear_atlas`] before emitting draws on the next frame.
+    Full,
+    /// The bitmap is larger than the atlas tile threshold; use a standalone texture without clearing.
+    Oversized,
+}
+
+impl Atlas {
+    fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        layout: &wgpu::BindGroupLayout,
+        sampler: &wgpu::Sampler,
+    ) -> Self {
+        let limit = device.limits().max_texture_dimension_2d;
+        // Wide aspect (up to 4096x2048 = 32 MB) accommodates full-width HiDPI lines while staying
+        // within downlevel 2048x2048 limits where needed.
+        let width = limit.min(4096);
+        let height = limit.min(2048);
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("JSNIR atlas"),
+            size: extent([width, height]),
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        // Upload a 4x4 opaque white block at `(0..4, 0..4)` sampled at its interior center `(1.5, 1.5)`.
+        let white_block = [255u8; 4 * 4 * 4];
+        queue.write_texture(
+            texture.as_image_copy(),
+            &white_block,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * 4),
+                rows_per_image: None,
+            },
+            extent([4, 4]),
+        );
+        let bindings = Renderer::bind(
+            device,
+            layout,
+            sampler,
+            &texture.create_view(&Default::default()),
+        );
+        let cx = 1.5 / width as f32;
+        let cy = 1.5 / height as f32;
+        Self {
+            texture,
+            bindings,
+            width,
+            height,
+            white_uv: [cx, cy, cx, cy],
+            shelves: Vec::new(),
+            next_y: 4,
+            epoch: 1,
+            staging: Vec::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.shelves.clear();
+        self.next_y = 4;
+        self.epoch = self.epoch.wrapping_add(1).max(1);
+    }
+
+    fn allocate(&mut self, queue: &wgpu::Queue, bitmap: &TextBitmap) -> AtlasAlloc {
+        let Ok(w) = u32::try_from(bitmap.size[0]) else {
+            return AtlasAlloc::Oversized;
+        };
+        let Ok(h) = u32::try_from(bitmap.size[1]) else {
+            return AtlasAlloc::Oversized;
+        };
+        if w == 0 || h == 0 {
+            return AtlasAlloc::Oversized;
+        }
+        // 1px transparent gutter on all four sides prevents bleed across adjacent or recycled tiles.
+        let pw = w + 2;
+        let ph = h + 2;
+        let max_area = (u64::from(self.width) * u64::from(self.height)) / 4;
+        if pw > self.width || ph > self.height / 2 || u64::from(pw) * u64::from(ph) > max_area {
+            return AtlasAlloc::Oversized;
+        }
+        let mut best: Option<(usize, u32)> = None;
+        for (idx, shelf) in self.shelves.iter().enumerate() {
+            if shelf.height >= ph
+                && shelf.height <= ph + (ph / 2).max(16)
+                && shelf.x + pw <= self.width
+            {
+                let waste = shelf.height - ph;
+                if best.is_none_or(|(_, best_waste)| waste < best_waste) {
+                    best = Some((idx, waste));
+                }
+            }
+        }
+        let (slot_x, slot_y) = if let Some((idx, _)) = best {
+            let shelf = &mut self.shelves[idx];
+            let pos = (shelf.x, shelf.y);
+            shelf.x += pw;
+            pos
+        } else {
+            let shelf_h = ph.max(16);
+            if self.next_y + shelf_h > self.height {
+                return AtlasAlloc::Full;
+            }
+            let y = self.next_y;
+            self.next_y += shelf_h;
+            self.shelves.push(Shelf {
+                y,
+                height: shelf_h,
+                x: pw,
+            });
+            (0, y)
+        };
+
+        let row_bytes = (pw * 4) as usize;
+        let total_bytes = row_bytes * ph as usize;
+        if self.staging.len() < total_bytes {
+            self.staging.resize(total_bytes, 0);
+        }
+        self.staging[..row_bytes].fill(0);
+        self.staging[(ph as usize - 1) * row_bytes..total_bytes].fill(0);
+        let src_row_bytes = (w * 4) as usize;
+        for y in 0..h as usize {
+            let dst_start = (y + 1) * row_bytes;
+            let dst = &mut self.staging[dst_start..dst_start + row_bytes];
+            dst[0..4].fill(0);
+            dst[4..4 + src_row_bytes]
+                .copy_from_slice(&bitmap.rgba[y * src_row_bytes..(y + 1) * src_row_bytes]);
+            dst[4 + src_row_bytes..row_bytes].fill(0);
+        }
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: slot_x,
+                    y: slot_y,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &self.staging[..total_bytes],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(pw * 4),
+                rows_per_image: None,
+            },
+            extent([pw, ph]),
+        );
+
+        let inv_w = 1.0 / self.width as f32;
+        let inv_h = 1.0 / self.height as f32;
+        let ox = (slot_x + 1) as f32;
+        let oy = (slot_y + 1) as f32;
+        AtlasAlloc::Packed(Image {
+            size: bitmap.size,
+            uv: [
+                ox * inv_w,
+                oy * inv_h,
+                (ox + w as f32) * inv_w,
+                (oy + h as f32) * inv_h,
+            ],
+            texture_id: ATLAS_TEX_ID,
+            bindings: self.bindings.clone(),
+        })
+    }
+}
+
+enum BatchCmd {
+    Draw {
+        instances: Range<u32>,
+        scissor: [u32; 4],
+        image_id: u64,
+        // `u32::MAX` => `&self.atlas.bindings`; otherwise index into `draws` whose shape holds `image`.
+        image_draw: u32,
+        mask_id: u64,
+        // `u32::MAX` => `&self.white.bindings`; otherwise index into `draws` whose shape holds `mask`.
+        mask_draw: u32,
+    },
+    Push,
+    Pop {
+        instance: u32,
+    },
 }
 
 pub struct Renderer {
@@ -221,8 +458,15 @@ pub struct Renderer {
     sampler: wgpu::Sampler,
     format: wgpu::TextureFormat,
     white: Image,
+    atlas: Atlas,
+    next_texture_id: AtomicU64,
     instances: wgpu::Buffer,
     layers: Vec<Layer>,
+    // Reusable per-frame scratch buffers to avoid heap allocations during `draw`.
+    quads: Vec<Quad>,
+    batches: Vec<BatchCmd>,
+    opacities: Vec<f32>,
+    last_stats: RenderStats,
 }
 
 impl Renderer {
@@ -304,7 +548,16 @@ impl Renderer {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
-        let white = Self::upload(&device, &queue, &layout, &sampler, [1, 1], &WHITE);
+        let white = Self::upload(
+            &device,
+            &queue,
+            &layout,
+            &sampler,
+            [1, 1],
+            &WHITE,
+            WHITE_TEX_ID,
+        );
+        let atlas = Atlas::new(&device, &queue, &layout, &sampler);
         let instances = Self::buffer(&device, 64);
         Ok(Self {
             device,
@@ -314,9 +567,33 @@ impl Renderer {
             sampler,
             format,
             white,
+            atlas,
+            next_texture_id: AtomicU64::new(FIRST_DYNAMIC_TEX_ID),
             instances,
             layers: Vec::new(),
+            quads: Vec::new(),
+            batches: Vec::new(),
+            opacities: Vec::new(),
+            last_stats: RenderStats::default(),
         })
+    }
+
+    pub fn last_stats(&self) -> RenderStats {
+        self.last_stats
+    }
+
+    pub fn atlas_epoch(&self) -> u64 {
+        self.atlas.epoch
+    }
+
+    /// Resets the shelf allocator in the persistent texture atlas without reallocating GPU memory.
+    pub fn clear_atlas(&mut self) {
+        self.atlas.clear();
+    }
+
+    /// Packs a bitmap into the persistent texture atlas so it batches with fills, icons, and other text.
+    pub fn atlas_image(&mut self, bitmap: &TextBitmap) -> AtlasAlloc {
+        self.atlas.allocate(&self.queue, bitmap)
     }
 
     fn buffer(device: &wgpu::Device, count: usize) -> wgpu::Buffer {
@@ -329,6 +606,7 @@ impl Renderer {
     }
 
     pub fn image(&self, bitmap: TextBitmap) -> Image {
+        let id = self.next_texture_id.fetch_add(1, Ordering::Relaxed);
         Self::upload(
             &self.device,
             &self.queue,
@@ -336,20 +614,19 @@ impl Renderer {
             &self.sampler,
             bitmap.size,
             &bitmap.rgba,
+            id,
         )
     }
 
     /// An image from straight RGBA8 pixels. The texture is premultiplied, as the blend expects.
     pub fn rgba_image(&self, rgba: &[u8], size: [usize; 2]) -> Image {
-        let mut premultiplied = Vec::with_capacity(rgba.len());
-        for pixel in rgba.as_chunks::<4>().0 {
-            let a = u32::from(pixel[3]);
-            premultiplied.extend(
-                pixel[..3]
-                    .iter()
-                    .map(|&c| ((u32::from(c) * a + 127) / 255) as u8),
-            );
-            premultiplied.push(pixel[3]);
+        let mut premultiplied = vec![0u8; rgba.len()];
+        for (dst, src) in premultiplied.chunks_exact_mut(4).zip(rgba.chunks_exact(4)) {
+            let a = u32::from(src[3]);
+            dst[0] = ((u32::from(src[0]) * a + 127) / 255) as u8;
+            dst[1] = ((u32::from(src[1]) * a + 127) / 255) as u8;
+            dst[2] = ((u32::from(src[2]) * a + 127) / 255) as u8;
+            dst[3] = src[3];
         }
         self.image(TextBitmap {
             size,
@@ -386,6 +663,7 @@ impl Renderer {
         sampler: &wgpu::Sampler,
         size: [usize; 2],
         rgba: &[u8],
+        texture_id: u64,
     ) -> Image {
         let pixels = extent(size.map(|side| side as u32));
         let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -414,7 +692,12 @@ impl Renderer {
             sampler,
             &texture.create_view(&Default::default()),
         );
-        Image { size, bindings }
+        Image {
+            size,
+            uv: [0., 0., 1., 1.],
+            texture_id,
+            bindings,
+        }
     }
 
     // The layer texture for nesting `depth`, recreated when the target size changes.
@@ -436,15 +719,14 @@ impl Renderer {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
-        let bindings = Self::bind(
-            &self.device,
-            &self.layout,
-            &self.sampler,
-            &texture.create_view(&Default::default()),
-        );
+        let view = texture.create_view(&Default::default());
+        let bindings = Self::bind(&self.device, &self.layout, &self.sampler, &view);
+        let texture_id = self.next_texture_id.fetch_add(1, Ordering::Relaxed);
         let layer = Layer {
-            texture,
+            _texture: texture,
+            view,
             bindings,
+            texture_id,
             size,
         };
         if depth < self.layers.len() {
@@ -457,16 +739,18 @@ impl Renderer {
     /// Draws into `target`, viewed in the renderer's format.
     pub fn draw(&mut self, target: &wgpu::Texture, size: [u32; 2], scale: f32, draws: &[Draw]) {
         let [px, py] = size.map(|side| side as f32 / scale);
-        let quad = |shape: &Shape| -> Quad {
+        let inv_px = 2. / px;
+        let inv_py = 2. / py;
+        let white_uv = self.atlas.white_uv;
+        let build_quad = |shape: &Shape, uv: [f32; 4]| -> Quad {
             let [x, y, w, h] = shape.rect;
-            let x_edge = |at| at * 2. / px - 1.;
-            let y_edge = |at| 1. - at * 2. / py;
             let premultiply = |rgba: Color| {
-                let a = f32::from(rgba[3]) / 255.;
+                let a = f32::from(rgba[3]) * (1. / 255.);
+                let s = a * (1. / 255.);
                 [
-                    f32::from(rgba[0]) / 255. * a,
-                    f32::from(rgba[1]) / 255. * a,
-                    f32::from(rgba[2]) / 255. * a,
+                    f32::from(rgba[0]) * s,
+                    f32::from(rgba[1]) * s,
+                    f32::from(rgba[2]) * s,
                     a,
                 ]
             };
@@ -487,7 +771,7 @@ impl Renderer {
                     2.,
                     element.map(|v| v * scale),
                     [
-                        blur / 2. * scale,
+                        blur * 0.5 * scale,
                         spread * scale,
                         y * scale,
                         element_radius * scale,
@@ -502,10 +786,15 @@ impl Renderer {
                 None => [0., 0., w * scale, h * scale],
             };
             Quad {
-                edges: [x_edge(x), y_edge(y), x_edge(x + w), y_edge(y + h)],
+                edges: [
+                    x * inv_px - 1.,
+                    1. - y * inv_py,
+                    (x + w) * inv_px - 1.,
+                    1. - (y + h) * inv_py,
+                ],
                 color: premultiply(shape.color),
                 end_color: premultiply(shape.end_color),
-                uv: shape.uv,
+                uv,
                 shape: [w * scale, h * scale, 0., mode],
                 params,
                 params2,
@@ -519,67 +808,92 @@ impl Renderer {
                 radii: shape.radius.map(|r| r * scale),
             }
         };
-        // Commands in order; each shape keeps its instance index and scissor.
-        enum Step<'a> {
-            Shape(usize, [u32; 4], Option<&'a Image>, Option<&'a Image>),
-            Push,
-            Pop(usize),
-        }
+
         let full = [0., 0., px, py];
-        let mut quads = Vec::new();
-        let mut steps = Vec::new();
-        let mut opacities = Vec::new();
-        for draw in draws {
+        self.quads.clear();
+        self.batches.clear();
+        self.opacities.clear();
+        let mut depth = 0usize;
+        let mut max_depth = 0usize;
+
+        for (draw_idx, draw) in draws.iter().enumerate() {
             match draw {
                 Draw::Shape(shape) => {
                     if shape.rect[2] <= 0. || shape.rect[3] <= 0. {
                         continue;
                     }
                     if let Some(scissor) = scissor(shape.clip, size, scale) {
-                        let mask = shape.mask.as_ref().map(|(image, _)| image);
-                        steps.push(Step::Shape(
-                            quads.len(),
-                            scissor,
-                            shape.image.as_ref(),
-                            mask,
-                        ));
-                        quads.push(quad(shape));
+                        let quad_idx = self.quads.len() as u32;
+                        let (image_id, image_draw, uv) = match &shape.image {
+                            Some(img) => (img.texture_id, draw_idx as u32, shape.uv),
+                            None => (ATLAS_TEX_ID, u32::MAX, white_uv),
+                        };
+                        let (mask_id, mask_draw) = match &shape.mask {
+                            Some((img, _)) => (img.texture_id, draw_idx as u32),
+                            None => (WHITE_TEX_ID, u32::MAX),
+                        };
+                        self.quads.push(build_quad(shape, uv));
+                        if let Some(BatchCmd::Draw {
+                            instances,
+                            scissor: prev_scissor,
+                            image_id: prev_img,
+                            mask_id: prev_mask,
+                            ..
+                        }) = self.batches.last_mut()
+                            && *prev_scissor == scissor
+                            && *prev_img == image_id
+                            && *prev_mask == mask_id
+                            && instances.end == quad_idx
+                        {
+                            instances.end = quad_idx + 1;
+                        } else {
+                            self.batches.push(BatchCmd::Draw {
+                                instances: quad_idx..quad_idx + 1,
+                                scissor,
+                                image_id,
+                                image_draw,
+                                mask_id,
+                                mask_draw,
+                            });
+                        }
                     }
                 }
                 Draw::PushLayer { opacity } => {
-                    opacities.push(*opacity);
-                    steps.push(Step::Push);
+                    self.opacities.push(*opacity);
+                    depth += 1;
+                    max_depth = max_depth.max(depth);
+                    self.batches.push(BatchCmd::Push);
                 }
                 Draw::PopLayer => {
-                    let opacity = opacities.pop().unwrap_or(1.).clamp(0., 1.);
+                    let opacity = self.opacities.pop().unwrap_or(1.).clamp(0., 1.);
                     let tint = [255, 255, 255, (opacity * 255.).round() as u8];
-                    steps.push(Step::Pop(quads.len()));
-                    quads.push(quad(&Shape {
-                        rect: full,
-                        clip: full,
-                        round_clip: None,
-                        color: tint,
-                        end_color: tint,
-                        uv: [0., 0., 1., 1.],
-                        radius: [0.; 4],
-                        image: None,
-                        mask: None,
-                        mode: Mode::Fill,
-                    }));
+                    depth = depth.saturating_sub(1);
+                    let instance = self.quads.len() as u32;
+                    self.batches.push(BatchCmd::Pop { instance });
+                    self.quads.push(build_quad(
+                        &Shape {
+                            rect: full,
+                            clip: full,
+                            round_clip: None,
+                            color: tint,
+                            end_color: tint,
+                            uv: [0., 0., 1., 1.],
+                            radius: [0.; 4],
+                            image: None,
+                            mask: None,
+                            mode: Mode::Fill,
+                        },
+                        [0., 0., 1., 1.],
+                    ));
                 }
             }
         }
-        let depth = steps.iter().fold((0, 0), |(depth, max), step| match step {
-            Step::Push => (depth + 1, max.max(depth + 1)),
-            Step::Pop(_) => (depth - 1, max),
-            Step::Shape(..) => (depth, max),
-        });
-        for level in 0..depth.1 {
+        for level in 0..max_depth {
             self.layer(level, size);
         }
-        let bytes = bytemuck::cast_slice(&quads);
+        let bytes = bytemuck::cast_slice(&self.quads);
         if bytes.len() as u64 > self.instances.size() {
-            self.instances = Self::buffer(&self.device, quads.len().next_power_of_two());
+            self.instances = Self::buffer(&self.device, self.quads.len().next_power_of_two());
         }
         if !bytes.is_empty() {
             self.queue.write_buffer(&self.instances, 0, bytes);
@@ -588,12 +902,6 @@ impl Renderer {
             format: Some(self.format),
             ..Default::default()
         });
-        let layer_views: Vec<wgpu::TextureView> = self
-            .layers
-            .iter()
-            .take(depth.1)
-            .map(|layer| layer.texture.create_view(&Default::default()))
-            .collect();
         let mut encoder = self.device.create_command_encoder(&Default::default());
         // Each layer level renders in its own pass; popping a layer composites it into the level below.
         let begin = |encoder: &mut wgpu::CommandEncoder,
@@ -615,48 +923,109 @@ impl Renderer {
                 })
                 .forget_lifetime()
         };
-        let mut level = 0;
+        let mut level = 0usize;
+        let layers = &self.layers;
         let view_at = |level: usize| {
             if level == 0 {
                 &target_view
             } else {
-                &layer_views[level - 1]
+                &layers[level - 1].view
             }
         };
         let mut pass = begin(&mut encoder, &target_view, Some(wgpu::Color::BLACK));
         pass.set_pipeline(&self.pipeline);
         let stride = size_of::<Quad>() as u64;
-        for step in steps {
-            match step {
-                Step::Shape(index, [x, y, w, h], image, mask) => {
-                    let offset = index as u64 * stride;
-                    pass.set_vertex_buffer(0, self.instances.slice(offset..offset + stride));
-                    pass.set_scissor_rect(x, y, w, h);
-                    pass.set_bind_group(0, &image.unwrap_or(&self.white).bindings, &[]);
-                    pass.set_bind_group(1, &mask.unwrap_or(&self.white).bindings, &[]);
-                    pass.draw(0..4, 0..1);
+        let mut cur_scissor: Option<[u32; 4]> = None;
+        let mut cur_img: Option<u64> = None;
+        let mut cur_mask: Option<u64> = None;
+        let mut stats = RenderStats {
+            quads: self.quads.len(),
+            ..Default::default()
+        };
+        for cmd in &self.batches {
+            match cmd {
+                BatchCmd::Draw {
+                    instances,
+                    scissor: rect,
+                    image_id,
+                    image_draw,
+                    mask_id,
+                    mask_draw,
+                } => {
+                    let start = u64::from(instances.start) * stride;
+                    let end = u64::from(instances.end) * stride;
+                    let count = instances.end - instances.start;
+                    pass.set_vertex_buffer(0, self.instances.slice(start..end));
+                    if cur_scissor != Some(*rect) {
+                        pass.set_scissor_rect(rect[0], rect[1], rect[2], rect[3]);
+                        cur_scissor = Some(*rect);
+                        stats.scissor_switches += 1;
+                    }
+                    if cur_img != Some(*image_id) {
+                        let bg = if *image_draw == u32::MAX {
+                            &self.atlas.bindings
+                        } else {
+                            let Draw::Shape(shape) = &draws[*image_draw as usize] else {
+                                unreachable!()
+                            };
+                            &shape.image.as_ref().unwrap().bindings
+                        };
+                        pass.set_bind_group(0, bg, &[]);
+                        cur_img = Some(*image_id);
+                        stats.bind_group_switches += 1;
+                    }
+                    if cur_mask != Some(*mask_id) {
+                        let bg = if *mask_draw == u32::MAX {
+                            &self.white.bindings
+                        } else {
+                            let Draw::Shape(shape) = &draws[*mask_draw as usize] else {
+                                unreachable!()
+                            };
+                            &shape.mask.as_ref().unwrap().0.bindings
+                        };
+                        pass.set_bind_group(1, bg, &[]);
+                        cur_mask = Some(*mask_id);
+                        stats.bind_group_switches += 1;
+                    }
+                    pass.draw(0..4, 0..count);
+                    stats.draw_calls += 1;
                 }
-                Step::Push => {
+                BatchCmd::Push => {
                     drop(pass);
                     level += 1;
-                    pass = begin(&mut encoder, view_at(level), Some(wgpu::Color::TRANSPARENT));
+                    pass = begin(
+                        &mut encoder,
+                        view_at(level),
+                        Some(wgpu::Color::TRANSPARENT),
+                    );
                     pass.set_pipeline(&self.pipeline);
+                    cur_scissor = None;
+                    cur_img = None;
+                    cur_mask = None;
                 }
-                Step::Pop(index) => {
+                BatchCmd::Pop { instance } => {
                     drop(pass);
                     level -= 1;
                     pass = begin(&mut encoder, view_at(level), None);
                     pass.set_pipeline(&self.pipeline);
-                    let offset = index as u64 * stride;
+                    let offset = u64::from(*instance) * stride;
                     pass.set_vertex_buffer(0, self.instances.slice(offset..offset + stride));
+                    let full_scissor = [0, 0, size[0], size[1]];
                     pass.set_scissor_rect(0, 0, size[0], size[1]);
                     pass.set_bind_group(0, &self.layers[level].bindings, &[]);
                     pass.set_bind_group(1, &self.white.bindings, &[]);
                     pass.draw(0..4, 0..1);
+                    cur_scissor = Some(full_scissor);
+                    cur_img = Some(self.layers[level].texture_id);
+                    cur_mask = Some(WHITE_TEX_ID);
+                    stats.draw_calls += 1;
+                    stats.scissor_switches += 1;
+                    stats.bind_group_switches += 2;
                 }
             }
         }
         drop(pass);
+        self.last_stats = stats;
         self.queue.submit([encoder.finish()]);
     }
 
@@ -854,5 +1223,99 @@ mod tests {
         let frame = renderer.read([60, 60], 1., &draws).unwrap();
         assert_close(pixel(&frame, 21, 21), RED);
         assert_close(pixel(&frame, 1, 1), BLACK);
+    }
+
+    #[test]
+    fn atlas_tiles_and_fills_batch_into_a_single_draw_call_with_exact_pixels() {
+        let mut renderer = renderer();
+        let green = [0, 255, 0, 255];
+        let blue = [0, 0, 255, 255];
+        let AtlasAlloc::Packed(tile_a) = renderer.atlas_image(&TextBitmap {
+            size: [10, 10],
+            rgba: green.repeat(10 * 10),
+        }) else {
+            panic!("expected tile_a in atlas");
+        };
+        let AtlasAlloc::Packed(tile_b) = renderer.atlas_image(&TextBitmap {
+            size: [10, 10],
+            rgba: blue.repeat(10 * 10),
+        }) else {
+            panic!("expected tile_b in atlas");
+        };
+        let screen = [0., 0., 60., 40.];
+        let draws = [
+            Draw::fill(screen, screen, RED),
+            Draw::image(&tile_a, [5., 5.], 1., screen),
+            Draw::fill([20., 5., 10., 10.], screen, WHITE),
+            Draw::image(&tile_b, [35., 5.], 1., screen),
+        ];
+        let frame = renderer.read([60, 40], 1., &draws).unwrap();
+        let stats = renderer.last_stats();
+        assert_eq!(stats.quads, 4);
+        assert_eq!(
+            stats.draw_calls, 1,
+            "fills and atlas tiles with matching scissor must coalesce into 1 draw call"
+        );
+        assert_eq!(stats.bind_group_switches, 2);
+        assert_eq!(stats.scissor_switches, 1);
+
+        assert_close(pixel(&frame, 1, 1), RED);
+        assert_close(pixel(&frame, 10, 10), green);
+        assert_close(pixel(&frame, 25, 10), WHITE);
+        assert_close(pixel(&frame, 40, 10), blue);
+    }
+
+    #[test]
+    fn clearing_the_atlas_reuses_slots_without_bleeding_previous_epoch_pixels() {
+        let mut renderer = renderer();
+        let green = [0, 255, 0, 255];
+        let epoch_before = renderer.atlas_epoch();
+        let AtlasAlloc::Packed(_) = renderer.atlas_image(&TextBitmap {
+            size: [16, 16],
+            rgba: RED.repeat(16 * 16),
+        }) else {
+            panic!("expected initial atlas tile");
+        };
+
+        renderer.clear_atlas();
+        assert_ne!(renderer.atlas_epoch(), epoch_before);
+        let AtlasAlloc::Packed(small_green) = renderer.atlas_image(&TextBitmap {
+            size: [8, 8],
+            rgba: green.repeat(8 * 8),
+        }) else {
+            panic!("expected reused atlas tile");
+        };
+
+        let screen = [0., 0., 32., 32.];
+        let draws = [Draw::image(&small_green, [8., 8.], 1., screen)];
+        let frame = renderer.read([32, 32], 1., &draws).unwrap();
+        // Edges of the 8x8 tile must be pure green with zero red bleed from the old 16x16 epoch.
+        assert_close(pixel(&frame, 8, 8), green);
+        assert_close(pixel(&frame, 15, 15), green);
+        assert_close(pixel(&frame, 7, 8), BLACK);
+        assert_close(pixel(&frame, 16, 15), BLACK);
+    }
+
+    #[test]
+    fn batches_split_cleanly_across_standalone_images_scissors_and_layers() {
+        let mut renderer = renderer();
+        let green = [0, 255, 0, 255];
+        let blue = [0, 0, 255, 255];
+        let standalone = renderer.rgba_image(&blue.repeat(10 * 10), [10, 10]);
+        let screen = [0., 0., 60., 40.];
+        let draws = [
+            Draw::fill([0., 0., 20., 20.], screen, RED),
+            Draw::image(&standalone, [22., 0.], 1., screen),
+            Draw::PushLayer { opacity: 0.5 },
+            Draw::fill([40., 0., 20., 20.], screen, green),
+            Draw::PopLayer,
+        ];
+        let frame = renderer.read([60, 40], 1., &draws).unwrap();
+        let stats = renderer.last_stats();
+        // 1 (RED fill) + 1 (standalone blue) + 1 (layer green) + 1 (PopLayer composite) = 4
+        assert_eq!(stats.draw_calls, 4);
+        assert_close(pixel(&frame, 5, 5), RED);
+        assert_close(pixel(&frame, 26, 5), blue);
+        assert_close(pixel(&frame, 45, 5), [0, 128, 0, 255]);
     }
 }
