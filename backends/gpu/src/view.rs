@@ -225,10 +225,56 @@ impl View {
         }
 
         let mut draws = Vec::with_capacity(items.len());
+        let mut skip_surface_depth = 0usize;
         for item in items {
+            if skip_surface_depth > 0 {
+                match item {
+                    Item::PushSurface { .. } => skip_surface_depth += 1,
+                    Item::PopSurface => {
+                        skip_surface_depth -= 1;
+                        if skip_surface_depth == 0 {
+                            draws.push(Draw::PopSurface);
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
             match item {
                 Item::PushLayer { opacity } => draws.push(Draw::PushLayer { opacity }),
                 Item::PopLayer => draws.push(Draw::PopLayer),
+                Item::PushSurface {
+                    source,
+                    dest,
+                    radius,
+                    opacity,
+                    clip,
+                    round_clip,
+                    additive,
+                    cache_key,
+                } => {
+                    let cached = cache_key.is_some_and(|key| {
+                        let surf_px = [
+                            (source[2] * scale).ceil().max(1.) as u32,
+                            (source[3] * scale).ceil().max(1.) as u32,
+                        ];
+                        renderer.has_cached_surface(key, surf_px)
+                    });
+                    draws.push(Draw::PushSurface {
+                        source,
+                        dest,
+                        radius,
+                        opacity,
+                        clip,
+                        round_clip,
+                        additive,
+                        cache_key,
+                    });
+                    if cached {
+                        skip_surface_depth = 1;
+                    }
+                }
+                Item::PopSurface => draws.push(Draw::PopSurface),
                 Item::Shadow {
                     rect,
                     radius,
@@ -289,11 +335,17 @@ impl View {
                     mut style,
                     wrap,
                     zoom,
+                    stretch,
                     clip,
                     round_clip,
                 } => {
-                    // Rasterized at its logical size and the zoomed scale, so it stays sharp while scaled.
-                    let size = [rect[2] / zoom, rect[3] / zoom];
+                    // Rasterized at its logical size and `zoom = min(kx, ky)`; stretched on GPU when `kx != ky`.
+                    let stretched =
+                        (stretch[0] - 1.).abs() > 1e-4 || (stretch[1] - 1.).abs() > 1e-4;
+                    let size = [
+                        rect[2] / (zoom * stretch[0]),
+                        rect[3] / (zoom * stretch[1]),
+                    ];
                     let pixels = scale * zoom;
                     let key = TextKey {
                         text,
@@ -306,12 +358,28 @@ impl View {
                         family: style.family.take(),
                         align: style.align,
                     };
+                    let push_text = |draws: &mut Vec<Draw>, img: &Image| {
+                        if stretched {
+                            let dst = [
+                                rect[0],
+                                rect[1],
+                                (img.size[0] as f32 / scale) * stretch[0],
+                                (img.size[1] as f32 / scale) * stretch[1],
+                            ];
+                            draws.push(
+                                Draw::image_in(img, dst, [0.; 4], clip, [255; 4])
+                                    .rounded_clip(round_clip),
+                            );
+                        } else {
+                            draws.push(
+                                Draw::image(img, snap([rect[0], rect[1]], scale), scale, clip)
+                                    .rounded_clip(round_clip),
+                            );
+                        }
+                    };
                     if let Some(entry) = self.texts.get_mut(&key) {
                         entry.last_used = frame_id;
-                        draws.push(
-                            Draw::image(&entry.image, snap([rect[0], rect[1]], scale), scale, clip)
-                                .rounded_clip(round_clip),
-                        );
+                        push_text(&mut draws, &entry.image);
                     } else {
                         style.family = key.family.clone();
                         let runs = node_spans(
@@ -324,10 +392,7 @@ impl View {
                             continue;
                         };
                         let entry = self.upload_tile(renderer, bitmap);
-                        draws.push(
-                            Draw::image(&entry.image, snap([rect[0], rect[1]], scale), scale, clip)
-                                .rounded_clip(round_clip),
-                        );
+                        push_text(&mut draws, &entry.image);
                         self.texts.insert(key, entry);
                     }
                 }
@@ -338,33 +403,49 @@ impl View {
                     draw,
                     color,
                     zoom: _,
+                    stretch,
                     clip,
                     round_clip,
                 } => {
+                    let stretched =
+                        (stretch[0] - 1.).abs() > 1e-4 || (stretch[1] - 1.).abs() > 1e-4;
+                    let base_size = if stretch[0] > 1e-4 {
+                        rect[2] / stretch[0]
+                    } else {
+                        rect[2]
+                    };
                     let key = IconKey {
                         icon,
-                        size: rect[2].to_bits(),
+                        size: base_size.to_bits(),
                         scale: scale.to_bits(),
                         stroke: stroke.to_bits(),
                         draw: draw.to_bits(),
                         color,
                     };
+                    let push_icon = |draws: &mut Vec<Draw>, img: &Image| {
+                        if stretched {
+                            draws.push(
+                                Draw::image_in(img, rect, [0.; 4], clip, [255; 4])
+                                    .rounded_clip(round_clip),
+                            );
+                        } else {
+                            draws.push(
+                                Draw::image(img, snap([rect[0], rect[1]], scale), scale, clip)
+                                    .rounded_clip(round_clip),
+                            );
+                        }
+                    };
                     if let Some(entry) = self.icons.get_mut(&key) {
                         entry.last_used = frame_id;
-                        draws.push(
-                            Draw::image(&entry.image, snap([rect[0], rect[1]], scale), scale, clip)
-                                .rounded_clip(round_clip),
-                        );
+                        push_icon(&mut draws, &entry.image);
                     } else {
-                        let Some(bitmap) = icons::rasterize(icon, rect[2], stroke, draw, color, scale)
+                        let Some(bitmap) =
+                            icons::rasterize(icon, base_size, stroke, draw, color, scale)
                         else {
                             continue;
                         };
                         let entry = self.upload_tile(renderer, bitmap);
-                        draws.push(
-                            Draw::image(&entry.image, snap([rect[0], rect[1]], scale), scale, clip)
-                                .rounded_clip(round_clip),
-                        );
+                        push_icon(&mut draws, &entry.image);
                         self.icons.insert(key, entry);
                     }
                 }
@@ -401,13 +482,25 @@ impl View {
                     caret,
                     selection,
                     caret_color,
+                    stretch,
                     clip,
                     round_clip,
                 } => {
+                    let stretched =
+                        (stretch[0] - 1.).abs() > 1e-4 || (stretch[1] - 1.).abs() > 1e-4;
                     for [x, y, w, h] in &frame.selection {
                         draws.push(
-                            Draw::fill([rect[0] + x, rect[1] + y, *w, *h], clip, selection)
-                                .rounded_clip(round_clip),
+                            Draw::fill(
+                                [
+                                    rect[0] + x * stretch[0],
+                                    rect[1] + y * stretch[1],
+                                    *w * stretch[0],
+                                    *h * stretch[1],
+                                ],
+                                clip,
+                                selection,
+                            )
+                            .rounded_clip(round_clip),
                         );
                     }
                     let key = frame.bitmap_key;
@@ -419,15 +512,37 @@ impl View {
                         None => {}
                     }
                     if let Some((_, Some(image))) = &self.editor {
-                        draws.push(
-                            Draw::image(image, snap([rect[0], rect[1]], scale), scale, clip)
-                                .rounded_clip(round_clip),
-                        );
+                        if stretched {
+                            let dst = [
+                                rect[0],
+                                rect[1],
+                                (image.size[0] as f32 / scale) * stretch[0],
+                                (image.size[1] as f32 / scale) * stretch[1],
+                            ];
+                            draws.push(
+                                Draw::image_in(image, dst, [0.; 4], clip, [255; 4])
+                                    .rounded_clip(round_clip),
+                            );
+                        } else {
+                            draws.push(
+                                Draw::image(image, snap([rect[0], rect[1]], scale), scale, clip)
+                                    .rounded_clip(round_clip),
+                            );
+                        }
                     }
                     for [x, y, w, h] in &frame.composition {
                         draws.push(
-                            Draw::fill([rect[0] + x, rect[1] + y, *w, *h], clip, caret_color)
-                                .rounded_clip(round_clip),
+                            Draw::fill(
+                                [
+                                    rect[0] + x * stretch[0],
+                                    rect[1] + y * stretch[1],
+                                    *w * stretch[0],
+                                    *h * stretch[1],
+                                ],
+                                clip,
+                                caret_color,
+                            )
+                            .rounded_clip(round_clip),
                         );
                     }
                     if let Some(caret) = caret {

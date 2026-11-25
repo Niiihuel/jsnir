@@ -15,7 +15,8 @@ use crate::{
     text::{Mark, TextBitmap, TextEngine, TextStyle, WRAP_SLACK, node_spans, plain_text},
     tree::{
         Anchor, AnchorAlign, Batch, Easing, Icon, InputPurpose, Node, Op, Paint,
-        PlacementSubscription, Position, Property, Replica, ScrollAnchor, ScrollEdge, Scrollbar, Shadow, Side, Span, Transition, Tree, Variant,
+        PlacementSubscription, Position, Property, Replica, Resize, ScrollAnchor, ScrollEdge,
+        Scrollbar, Shadow, Side, Span, Transition, Tree, Variant,
     },
 };
 use std::{
@@ -37,14 +38,25 @@ pub type Rgba = [u8; 4];
 /// Corner radii of a rectangle in logical pixels: top-left, top-right, bottom-right, bottom-left (CSS order).
 pub type Corners = [f32; 4];
 
-/// `rect`, which is in a text's logical pixels, placed at `origin` in device pixels scaled by `zoom`.
-fn scaled(origin: Rect, rect: Rect, zoom: f32) -> Rect {
+/// `rect`, which is in a text's logical pixels, placed at `origin` scaled by `k` (`[kx, ky]`).
+fn scaled(origin: Rect, rect: Rect, k: [f32; 2]) -> Rect {
     [
-        origin[0] + rect[0] * zoom,
-        origin[1] + rect[1] * zoom,
-        rect[2] * zoom,
-        rect[3] * zoom,
+        origin[0] + rect[0] * k[0],
+        origin[1] + rect[1] * k[1],
+        rect[2] * k[0],
+        rect[3] * k[1],
     ]
+}
+
+/// Computes `(zoom, stretch)` from a 2D scale `[kx, ky]`.
+/// Text and icons rasterize at `zoom = min(kx, ky)` and stretch by `[kx / zoom, ky / zoom]`.
+fn scale_zoom_stretch(k: [f32; 2]) -> (f32, [f32; 2]) {
+    let zoom = k[0].min(k[1]);
+    if zoom > 1e-4 {
+        (zoom, [k[0] / zoom, k[1] / zoom])
+    } else {
+        (zoom, [1., 1.])
+    }
 }
 
 /// What to draw, in painting order. Rectangles are already transformed and clipped by `clip`, which is
@@ -57,6 +69,24 @@ pub enum Item {
         opacity: f32,
     },
     PopLayer,
+    /// Captures everything until the matching `PopSurface` into an offscreen surface covering `source`
+    /// (logical window coordinates), then composites that surface stretched to `dest` with `radius`,
+    /// `opacity`, `clip`, and `round_clip`.
+    /// When `additive` is true, composites with additive blending (`src + dst`) so two surfaces with
+    /// opacities `1 - p` and `p` inside an isolated `PushLayer` produce exact `mix(prev, next, p)`.
+    /// When `cache_key` is `Some((id, generation))`, the backend caches the offscreen texture and skips
+    /// re-rendering the inner items on subsequent frames with the same key; unused keys are freed.
+    PushSurface {
+        source: Rect,
+        dest: Rect,
+        radius: Corners,
+        opacity: f32,
+        clip: Rect,
+        round_clip: Option<(Rect, Corners)>,
+        additive: bool,
+        cache_key: Option<(u64, u64)>,
+    },
+    PopSurface,
     /// Outer shadow of a rounded rectangle; it is not drawn under the rectangle itself. Not masked. Its blur uses
     /// the largest corner radius: a shadow of unequal corners is approximated.
     Shadow {
@@ -89,8 +119,9 @@ pub enum Item {
         round_clip: Option<(Rect, Corners)>,
         mask: Option<(ImageData, Rect)>,
     },
-    /// Text laid out in `rect` at `zoom` times the device scale. `spans` are the rich text's runs, already
-    /// cut to the node's line limit; `text` is their plain text.
+    /// Text laid out in `rect` at `zoom` times the device scale, then stretched by `stretch` (`[1, 1]`
+    /// under uniform scale; `[kx / zoom, ky / zoom]` when `kx != ky`). `spans` are the rich text's runs,
+    /// already cut to the node's line limit; `text` is their plain text.
     Text {
         rect: Rect,
         text: String,
@@ -98,6 +129,7 @@ pub enum Item {
         style: TextStyle,
         wrap: bool,
         zoom: f32,
+        stretch: [f32; 2],
         clip: Rect,
         round_clip: Option<(Rect, Corners)>,
     },
@@ -108,6 +140,7 @@ pub enum Item {
         draw: f32,
         color: Rgba,
         zoom: f32,
+        stretch: [f32; 2],
         clip: Rect,
         round_clip: Option<(Rect, Corners)>,
     },
@@ -128,6 +161,7 @@ pub enum Item {
         caret: Option<Rect>,
         selection: Rgba,
         caret_color: Rgba,
+        stretch: [f32; 2],
         clip: Rect,
         round_clip: Option<(Rect, Corners)>,
     },
@@ -650,11 +684,32 @@ struct ExitSnapshot {
     x: f32,
     y: f32,
     scale: f32,
-    ctx_k: f32,
+    scale_x: f32,
+    scale_y: f32,
+    ctx_k: [f32; 2],
     center: [f32; 2],
     parent_clip: Rect,
     parent_round_clip: Option<(Rect, Corners)>,
     layer: i32,
+}
+
+/// Snapshot of a node's rendered subtree from the previous frame, captured only for nodes
+/// with `paint.resize == Resize::Crossfade` and a `width` or `height` transition.
+struct ResizeSnapshot {
+    items: Vec<Item>,
+    source: Rect,
+    depth: u8,
+}
+
+/// Active `resize: "crossfade"` transition for a live node.
+struct ResizeCrossfade {
+    prev_items: Vec<Item>,
+    prev_source: Rect,
+    cache_key: (u64, u64),
+    target_size: [f32; 2],
+    depth: u8,
+    track_w: bool,
+    track_h: bool,
 }
 
 struct LeavingChannel {
@@ -689,6 +744,8 @@ struct Leaving {
     x: Option<LeavingChannel>,
     y: Option<LeavingChannel>,
     scale: Option<LeavingChannel>,
+    scale_x: Option<LeavingChannel>,
+    scale_y: Option<LeavingChannel>,
 }
 
 struct LeavingPlan {
@@ -697,6 +754,8 @@ struct LeavingPlan {
     x: Option<(f32, Transition)>,
     y: Option<(f32, Transition)>,
     scale: Option<(f32, Transition)>,
+    scale_x: Option<(f32, Transition)>,
+    scale_y: Option<(f32, Transition)>,
 }
 
 fn plan_leaving(id: u16, paint: &Paint) -> Option<LeavingPlan> {
@@ -713,7 +772,15 @@ fn plan_leaving(id: u16, paint: &Paint) -> Option<LeavingPlan> {
     let x = pick(Property::X, exiting.x);
     let y = pick(Property::Y, exiting.y);
     let scale = pick(Property::Scale, exiting.scale);
-    if opacity.is_none() && x.is_none() && y.is_none() && scale.is_none() {
+    let scale_x = pick(Property::ScaleX, exiting.scale_x);
+    let scale_y = pick(Property::ScaleY, exiting.scale_y);
+    if opacity.is_none()
+        && x.is_none()
+        && y.is_none()
+        && scale.is_none()
+        && scale_x.is_none()
+        && scale_y.is_none()
+    {
         return None;
     }
     Some(LeavingPlan {
@@ -722,15 +789,17 @@ fn plan_leaving(id: u16, paint: &Paint) -> Option<LeavingPlan> {
         x,
         y,
         scale,
+        scale_x,
+        scale_y,
     })
 }
 
-fn xform_rect(r: Rect, center: [f32; 2], delta: [f32; 2], scale: f32) -> Rect {
+fn xform_rect(r: Rect, center: [f32; 2], delta: [f32; 2], scale: [f32; 2]) -> Rect {
     [
-        center[0] + (r[0] - center[0]) * scale + delta[0],
-        center[1] + (r[1] - center[1]) * scale + delta[1],
-        r[2] * scale,
-        r[3] * scale,
+        center[0] + (r[0] - center[0]) * scale[0] + delta[0],
+        center[1] + (r[1] - center[1]) * scale[1] + delta[1],
+        r[2] * scale[0],
+        r[3] * scale[1],
     ]
 }
 
@@ -740,7 +809,7 @@ fn xform_clip(
     child_owned: bool,
     center: [f32; 2],
     delta: [f32; 2],
-    scale: f32,
+    scale: [f32; 2],
 ) -> Rect {
     if !child_owned && clip == parent_clip {
         parent_clip
@@ -755,15 +824,16 @@ fn xform_round_clip(
     child_owned: bool,
     center: [f32; 2],
     delta: [f32; 2],
-    scale: f32,
+    scale: [f32; 2],
 ) -> Option<(Rect, Corners)> {
     let (r, corners) = round_clip?;
     if !child_owned && round_clip == parent_round_clip {
         parent_round_clip
     } else {
+        let s_min = scale[0].min(scale[1]);
         Some((
             xform_rect(r, center, delta, scale),
-            corners.map(|c| c * scale),
+            corners.map(|c| c * s_min),
         ))
     }
 }
@@ -773,15 +843,43 @@ fn transform_leaving_item(
     item: &Item,
     center: [f32; 2],
     delta: [f32; 2],
-    scale: f32,
+    scale: [f32; 2],
     parent_clip: Rect,
     parent_round_clip: Option<(Rect, Corners)>,
     child_owned_clip: bool,
     child_owned_round: bool,
 ) -> Item {
+    let s_min = scale[0].min(scale[1]);
     match item {
         Item::PushLayer { opacity } => Item::PushLayer { opacity: *opacity },
         Item::PopLayer => Item::PopLayer,
+        Item::PushSurface {
+            source,
+            dest,
+            radius,
+            opacity,
+            clip,
+            round_clip,
+            additive,
+            cache_key,
+        } => Item::PushSurface {
+            source: *source,
+            dest: xform_rect(*dest, center, delta, scale),
+            radius: radius.map(|r| r * s_min),
+            opacity: *opacity,
+            clip: xform_clip(*clip, parent_clip, child_owned_clip, center, delta, scale),
+            round_clip: xform_round_clip(
+                *round_clip,
+                parent_round_clip,
+                child_owned_round,
+                center,
+                delta,
+                scale,
+            ),
+            additive: *additive,
+            cache_key: *cache_key,
+        },
+        Item::PopSurface => Item::PopSurface,
         Item::Shadow {
             rect,
             radius,
@@ -790,11 +888,11 @@ fn transform_leaving_item(
             round_clip,
         } => Item::Shadow {
             rect: xform_rect(*rect, center, delta, scale),
-            radius: radius * scale,
+            radius: radius * s_min,
             shadow: ShadowSpec {
-                y: shadow.y * scale,
-                blur: shadow.blur * scale,
-                spread: shadow.spread * scale,
+                y: shadow.y * scale[1],
+                blur: shadow.blur * s_min,
+                spread: shadow.spread * s_min,
                 color: shadow.color,
             },
             clip: xform_clip(*clip, parent_clip, child_owned_clip, center, delta, scale),
@@ -817,7 +915,7 @@ fn transform_leaving_item(
             mask,
         } => Item::Fill {
             rect: xform_rect(*rect, center, delta, scale),
-            radius: radius.map(|r| r * scale),
+            radius: radius.map(|r| r * s_min),
             top: *top,
             bottom: *bottom,
             clip: xform_clip(*clip, parent_clip, child_owned_clip, center, delta, scale),
@@ -844,9 +942,9 @@ fn transform_leaving_item(
             mask,
         } => Item::Inset {
             rect: xform_rect(*rect, center, delta, scale),
-            radius: radius.map(|r| r * scale),
-            spread: spread * scale,
-            offset: [offset[0] * scale, offset[1] * scale],
+            radius: radius.map(|r| r * s_min),
+            spread: spread * s_min,
+            offset: [offset[0] * scale[0], offset[1] * scale[1]],
             color: *color,
             clip: xform_clip(*clip, parent_clip, child_owned_clip, center, delta, scale),
             round_clip: xform_round_clip(
@@ -868,25 +966,31 @@ fn transform_leaving_item(
             style,
             wrap,
             zoom,
+            stretch,
             clip,
             round_clip,
-        } => Item::Text {
-            rect: xform_rect(*rect, center, delta, scale),
-            text: text.clone(),
-            spans: spans.clone(),
-            style: style.clone(),
-            wrap: *wrap,
-            zoom: zoom * scale,
-            clip: xform_clip(*clip, parent_clip, child_owned_clip, center, delta, scale),
-            round_clip: xform_round_clip(
-                *round_clip,
-                parent_round_clip,
-                child_owned_round,
-                center,
-                delta,
-                scale,
-            ),
-        },
+        } => {
+            let k = [zoom * stretch[0] * scale[0], zoom * stretch[1] * scale[1]];
+            let (new_zoom, new_stretch) = scale_zoom_stretch(k);
+            Item::Text {
+                rect: xform_rect(*rect, center, delta, scale),
+                text: text.clone(),
+                spans: spans.clone(),
+                style: style.clone(),
+                wrap: *wrap,
+                zoom: new_zoom,
+                stretch: new_stretch,
+                clip: xform_clip(*clip, parent_clip, child_owned_clip, center, delta, scale),
+                round_clip: xform_round_clip(
+                    *round_clip,
+                    parent_round_clip,
+                    child_owned_round,
+                    center,
+                    delta,
+                    scale,
+                ),
+            }
+        }
         Item::Icon {
             rect,
             icon,
@@ -894,25 +998,31 @@ fn transform_leaving_item(
             draw,
             color,
             zoom,
+            stretch,
             clip,
             round_clip,
-        } => Item::Icon {
-            rect: xform_rect(*rect, center, delta, scale),
-            icon: *icon,
-            stroke: stroke * scale,
-            draw: *draw,
-            color: *color,
-            zoom: zoom * scale,
-            clip: xform_clip(*clip, parent_clip, child_owned_clip, center, delta, scale),
-            round_clip: xform_round_clip(
-                *round_clip,
-                parent_round_clip,
-                child_owned_round,
-                center,
-                delta,
-                scale,
-            ),
-        },
+        } => {
+            let k = [zoom * stretch[0] * scale[0], zoom * stretch[1] * scale[1]];
+            let (new_zoom, new_stretch) = scale_zoom_stretch(k);
+            Item::Icon {
+                rect: xform_rect(*rect, center, delta, scale),
+                icon: *icon,
+                stroke: stroke * s_min,
+                draw: *draw,
+                color: *color,
+                zoom: new_zoom,
+                stretch: new_stretch,
+                clip: xform_clip(*clip, parent_clip, child_owned_clip, center, delta, scale),
+                round_clip: xform_round_clip(
+                    *round_clip,
+                    parent_round_clip,
+                    child_owned_round,
+                    center,
+                    delta,
+                    scale,
+                ),
+            }
+        }
         Item::Image {
             rect,
             radius,
@@ -923,7 +1033,7 @@ fn transform_leaving_item(
             mask,
         } => Item::Image {
             rect: xform_rect(*rect, center, delta, scale),
-            radius: radius.map(|r| r * scale),
+            radius: radius.map(|r| r * s_min),
             image: image.clone(),
             tint: *tint,
             clip: xform_clip(*clip, parent_clip, child_owned_clip, center, delta, scale),
@@ -945,24 +1055,33 @@ fn transform_leaving_item(
             caret,
             selection,
             caret_color,
+            stretch,
             clip,
             round_clip,
-        } => Item::Editor {
-            rect: xform_rect(*rect, center, delta, scale),
-            frame: frame.clone(),
-            caret: *caret,
-            selection: *selection,
-            caret_color: *caret_color,
-            clip: xform_clip(*clip, parent_clip, child_owned_clip, center, delta, scale),
-            round_clip: xform_round_clip(
-                *round_clip,
-                parent_round_clip,
-                child_owned_round,
-                center,
-                delta,
-                scale,
-            ),
-        },
+        } => {
+            let new_stretch = if s_min > 1e-4 {
+                [stretch[0] * scale[0] / s_min, stretch[1] * scale[1] / s_min]
+            } else {
+                *stretch
+            };
+            Item::Editor {
+                rect: xform_rect(*rect, center, delta, scale),
+                frame: frame.clone(),
+                caret: *caret,
+                selection: *selection,
+                caret_color: *caret_color,
+                stretch: new_stretch,
+                clip: xform_clip(*clip, parent_clip, child_owned_clip, center, delta, scale),
+                round_clip: xform_round_clip(
+                    *round_clip,
+                    parent_round_clip,
+                    child_owned_round,
+                    center,
+                    delta,
+                    scale,
+                ),
+            }
+        }
     }
 }
 
@@ -988,20 +1107,38 @@ fn emit_leaving(leaving: &Leaving, now: f64, items: &mut Vec<Item>) {
         .scale
         .as_ref()
         .map_or(snap.scale, |ch| ch.at(leaving.start, now));
-    let rel_scale = if snap.scale.abs() > 1e-4 {
-        (cur_scale / snap.scale).max(0.)
+    let cur_scale_x = leaving
+        .scale_x
+        .as_ref()
+        .map_or(snap.scale_x, |ch| ch.at(leaving.start, now));
+    let cur_scale_y = leaving
+        .scale_y
+        .as_ref()
+        .map_or(snap.scale_y, |ch| ch.at(leaving.start, now));
+    let snap_sx = snap.scale * snap.scale_x;
+    let snap_sy = snap.scale * snap.scale_y;
+    let rel_sx = if snap_sx.abs() > 1e-4 {
+        (cur_scale * cur_scale_x / snap_sx).max(0.)
     } else {
         1.
     };
-    if rel_scale <= 0.001 {
+    let rel_sy = if snap_sy.abs() > 1e-4 {
+        (cur_scale * cur_scale_y / snap_sy).max(0.)
+    } else {
+        1.
+    };
+    if rel_sx <= 0.001 || rel_sy <= 0.001 {
         return;
     }
+    let rel_scale = [rel_sx, rel_sy];
     let delta = [
-        (cur_x - snap.x) * snap.ctx_k,
-        (cur_y - snap.y) * snap.ctx_k,
+        (cur_x - snap.x) * snap.ctx_k[0],
+        (cur_y - snap.y) * snap.ctx_k[1],
     ];
-    let needs_xform =
-        delta[0].abs() > 1e-4 || delta[1].abs() > 1e-4 || (rel_scale - 1.).abs() > 1e-4;
+    let needs_xform = delta[0].abs() > 1e-4
+        || delta[1].abs() > 1e-4
+        || (rel_sx - 1.).abs() > 1e-4
+        || (rel_sy - 1.).abs() > 1e-4;
     let layer = eff_opacity < 0.999;
     if layer {
         items.push(Item::PushLayer {
@@ -1011,7 +1148,20 @@ fn emit_leaving(leaving: &Leaving, now: f64, items: &mut Vec<Item>) {
     if !needs_xform {
         items.extend(snap.items.iter().cloned());
     } else {
+        let mut surface_depth = 0usize;
         for (idx, item) in snap.items.iter().enumerate() {
+            if surface_depth > 0 {
+                match item {
+                    Item::PushSurface { .. } => surface_depth += 1,
+                    Item::PopSurface => surface_depth -= 1,
+                    _ => {}
+                }
+                items.push(item.clone());
+                continue;
+            }
+            if matches!(item, Item::PushSurface { .. }) {
+                surface_depth += 1;
+            }
             let child_owned_clip = idx >= snap.children_start && snap.self_clips;
             let child_owned_round = idx >= snap.children_start && snap.self_has_round_clip;
             items.push(transform_leaving_item(
@@ -1096,6 +1246,12 @@ pub struct Host {
     exit_snapshots: HashMap<u16, ExitSnapshot>,
     // Removed nodes currently playing their `paint.exiting` transitions on frozen snapshots.
     leaving: Vec<Leaving>,
+    // Last-frame subtree snapshots for nodes with `paint.resize == Resize::Crossfade`.
+    resize_snapshots: HashMap<u16, ResizeSnapshot>,
+    // Live nodes currently crossfading between their previous and final layouts.
+    resize_crossfades: HashMap<u16, ResizeCrossfade>,
+    // Monotonic generation counter for offscreen `PushSurface` cache keys.
+    resize_generation: u64,
     clock: Instant,
     // Timers from `after` operations: deadline in ms on `clock`, and the callback.
     timers: Vec<(f64, QueuedEvent)>,
@@ -1354,6 +1510,9 @@ impl Host {
             motion: Motion::default(),
             exit_snapshots: HashMap::new(),
             leaving: Vec::new(),
+            resize_snapshots: HashMap::new(),
+            resize_crossfades: HashMap::new(),
+            resize_generation: 0,
             clock: Instant::now(),
             timers: Vec::new(),
             backlog: Vec::new(),
@@ -2207,6 +2366,8 @@ impl Host {
             self.reported_viewport = None;
             self.timers.retain(|(_, event)| event.guard.is_none());
             self.exit_snapshots.clear();
+            self.resize_snapshots.clear();
+            self.resize_crossfades.clear();
         } else if self.dev_overlay_enabled
             && let Err(error) = &outcome
         {
@@ -2256,6 +2417,8 @@ impl Host {
                 self.pending_drag_move = None;
                 self.focused = None;
                 self.leaving.clear();
+                self.resize_snapshots.clear();
+                self.resize_crossfades.clear();
                 self.ime_revision += 1;
                 self.ime_change_cause = ImeChangeCause::Other;
             }
@@ -2492,7 +2655,9 @@ impl Host {
                     let x = make(snap.x, plan.x);
                     let y = make(snap.y, plan.y);
                     let scale = make(snap.scale, plan.scale);
-                    let max_ms = [&opacity, &x, &y, &scale]
+                    let scale_x = make(snap.scale_x, plan.scale_x);
+                    let scale_y = make(snap.scale_y, plan.scale_y);
+                    let max_ms = [&opacity, &x, &y, &scale, &scale_x, &scale_y]
                         .into_iter()
                         .flatten()
                         .map(LeavingChannel::end_offset_ms)
@@ -2505,6 +2670,8 @@ impl Host {
                         x,
                         y,
                         scale,
+                        scale_x,
+                        scale_y,
                     });
                 }
             }
@@ -2556,6 +2723,8 @@ impl Host {
             self.placements.remove(id);
             self.sized_nodes.remove(id);
             self.exit_snapshots.remove(id);
+            self.resize_snapshots.remove(id);
+            self.resize_crossfades.remove(id);
         }
         self.motion.forget(&removed);
         if self.focused.is_some_and(|f| removed.contains(&f)) {
@@ -4249,6 +4418,7 @@ impl Host {
         self.screen.clear();
         self.screen.resize(self.tree.nodes.end(), None);
         self.exit_snapshots.clear();
+        let mut prev_resize_snapshots = std::mem::take(&mut self.resize_snapshots);
         if !self.leaving.is_empty() {
             self.leaving.retain(|l| now < l.end);
         }
@@ -4258,13 +4428,14 @@ impl Host {
             }
             let window = [0., 0., width, height];
             let base = Context {
-                k: 1.,
+                k: [1., 1.],
                 offset: [0., 0.],
                 opacity: 1.,
                 brightness: 1.,
                 clip: window,
                 round_clip: None,
                 in_row: false,
+                in_crossfade: false,
                 group_hover: false,
                 group_active: false,
             };
@@ -4291,6 +4462,10 @@ impl Host {
                 motion: &mut self.motion,
                 exit_snapshots: &mut self.exit_snapshots,
                 leaving: &self.leaving,
+                prev_resize_snapshots: &mut prev_resize_snapshots,
+                resize_snapshots: &mut self.resize_snapshots,
+                resize_crossfades: &mut self.resize_crossfades,
+                resize_generation: &mut self.resize_generation,
                 text: &mut self.text,
                 editor: &mut self.editor,
                 editor_key: &mut self.editor_key,
@@ -4495,6 +4670,7 @@ impl Host {
             style: title_style,
             wrap: true,
             zoom: 1.,
+            stretch: [1., 1.],
             clip: card_clip,
             round_clip: Some((card, card_radius)),
         });
@@ -4508,6 +4684,7 @@ impl Host {
                 style: loc_style,
                 wrap: true,
                 zoom: 1.,
+                stretch: [1., 1.],
                 clip: card_clip,
                 round_clip: Some((card, card_radius)),
             });
@@ -4521,6 +4698,7 @@ impl Host {
             style: body_style,
             wrap: true,
             zoom: 1.,
+            stretch: [1., 1.],
             clip: card_clip,
             round_clip: Some((card, card_radius)),
         });
@@ -4549,6 +4727,7 @@ impl Host {
                 style: frame_style,
                 wrap: true,
                 zoom: 1.,
+                stretch: [1., 1.],
                 clip: intersect(well, card_clip),
                 round_clip: Some((well, [6.; 4])),
             });
@@ -4562,6 +4741,7 @@ impl Host {
             style: hint_style,
             wrap: true,
             zoom: 1.,
+            stretch: [1., 1.],
             clip: card_clip,
             round_clip: Some((card, card_radius)),
         });
@@ -4939,6 +5119,8 @@ fn resolve_variant(
                 gradient: v.gradient.or(out.gradient),
                 brightness: v.brightness.or(out.brightness),
                 scale: v.scale.or(out.scale),
+                scale_x: v.scale_x.or(out.scale_x),
+                scale_y: v.scale_y.or(out.scale_y),
                 opacity: v.opacity.or(out.opacity),
                 x: v.x.or(out.x),
                 y: v.y.or(out.y),
@@ -4958,9 +5140,12 @@ fn seed_motion_from_paint(motion: &mut Motion, id: u16, paint: &Paint, v: &Varia
     let opacity = v.opacity.or(paint.opacity).unwrap_or(1.);
     let (x, y) = (v.x.unwrap_or(paint.x), v.y.unwrap_or(paint.y));
     let scale = v.scale.or(paint.scale).unwrap_or(1.);
+    let scale_x = v.scale_x.or(paint.scale_x).unwrap_or(1.);
+    let scale_y = v.scale_y.or(paint.scale_y).unwrap_or(1.);
     let brightness = v.brightness.or(paint.brightness).unwrap_or(1.);
     let draw = paint.draw.unwrap_or(1.);
     let width = v.width.unwrap_or(rect[2]);
+    let height = v.height.unwrap_or(rect[3]);
     let background = v
         .background
         .or(paint.background)
@@ -4977,10 +5162,13 @@ fn seed_motion_from_paint(motion: &mut Motion, id: u16, paint: &Paint, v: &Varia
     motion.seed(id, Property::X, Value::Number(x));
     motion.seed(id, Property::Y, Value::Number(y));
     motion.seed(id, Property::Scale, Value::Number(scale));
+    motion.seed(id, Property::ScaleX, Value::Number(scale_x));
+    motion.seed(id, Property::ScaleY, Value::Number(scale_y));
     motion.seed(id, Property::Brightness, Value::Number(brightness));
     motion.seed(id, Property::Draw, Value::Number(draw));
     motion.seed(id, Property::Left, Value::Number(rect[0]));
     motion.seed(id, Property::Width, Value::Number(width));
+    motion.seed(id, Property::Height, Value::Number(height));
     motion.seed(id, Property::Background, background);
     motion.seed(id, Property::Edge, edge);
     motion.seed(id, Property::Color, color);
@@ -4995,6 +5183,8 @@ fn variant_affects_geometry(paint: &Paint) -> bool {
             v.x.is_some()
                 || v.y.is_some()
                 || v.scale.is_some()
+                || v.scale_x.is_some()
+                || v.scale_y.is_some()
                 || v.width.is_some()
                 || v.height.is_some()
         })
@@ -5016,6 +5206,9 @@ fn node_is_cull_special(node: &Node, has_active_motion: bool) -> bool {
         && (p.x != 0.
             || p.y != 0.
             || p.scale.is_some_and(|s| s != 1.)
+            || p.scale_x.is_some_and(|s| s != 1.)
+            || p.scale_y.is_some_and(|s| s != 1.)
+            || p.resize == Resize::Crossfade
             || !p.shadows.is_empty()
             || !p.transitions.is_empty()
             || p.animations.as_ref().is_some_and(|a| !a.is_empty())
@@ -5074,6 +5267,10 @@ fn is_height_animated(node: &Node) -> bool {
     let Some(paint) = node.paint() else {
         return false;
     };
+    // Crossfade boxes keep their final layout in Taffy and animate their drawn height without relayout.
+    if paint.resize == Resize::Crossfade {
+        return false;
+    }
     transition(paint, HEIGHT_TRANSITION).is_some()
         || [&paint.hover, &paint.active, &paint.focus]
             .into_iter()
@@ -5107,21 +5304,22 @@ fn ease_out(property: Property) -> Transition {
 fn scrollbar_rects(
     bar: &Scrollbar,
     screen: Rect,
-    k: f32,
+    k: [f32; 2],
     view: f32,
     content: f32,
     offset: f32,
     max: f32,
 ) -> (Rect, Rect) {
     let [x, y, w, h] = screen;
-    let inset = bar.inset * k;
+    let inset_x = bar.inset * k[0];
+    let inset_y = bar.inset * k[1];
     let track = [
-        x + w - inset - bar.width * k,
-        y + inset,
-        bar.width * k,
-        (h - 2. * inset).max(0.),
+        x + w - inset_x - bar.width * k[0],
+        y + inset_y,
+        bar.width * k[0],
+        (h - 2. * inset_y).max(0.),
     ];
-    let length = ((view * view / content).max(bar.min_thumb) * k).min(track[3]);
+    let length = ((view * view / content).max(bar.min_thumb) * k[1]).min(track[3]);
     let top = track[1] + (track[3] - length) * (offset / max);
     (track, [track[0], top, track[2], length])
 }
@@ -5201,11 +5399,12 @@ struct Placement {
     anchor_offset: f32,
 }
 
-// What a node inherits from its ancestors: a uniform scale `k` and offset, group opacity, brightness, clip,
+// What a node inherits from its ancestors: a 2D scale `k = [kx, ky]` and offset, group opacity, brightness, clip,
 // and the nearest ancestor `group`'s hover/active state (propagated in O(1) instead of walking parents).
+// Under non-uniform scale (`kx != ky`), corner radii approximate ellipticity with `min(kx, ky)`.
 #[derive(Clone, Copy)]
 struct Context {
-    k: f32,
+    k: [f32; 2],
     offset: [f32; 2],
     opacity: f32,
     brightness: f32,
@@ -5213,16 +5412,21 @@ struct Context {
     // Rounded rectangle and corner radius of the innermost rounded clip; None for none.
     round_clip: Option<(Rect, Corners)>,
     in_row: bool,
+    in_crossfade: bool,
     group_hover: bool,
     group_active: bool,
 }
 impl Context {
+    #[inline]
+    fn k_min(&self) -> f32 {
+        self.k[0].min(self.k[1])
+    }
     fn rect(&self, [x, y, w, h]: Rect) -> Rect {
         [
-            x * self.k + self.offset[0],
-            y * self.k + self.offset[1],
-            w * self.k,
-            h * self.k,
+            x * self.k[0] + self.offset[0],
+            y * self.k[1] + self.offset[1],
+            w * self.k[0],
+            h * self.k[1],
         ]
     }
     fn color(&self, rgba: [f32; 4]) -> Rgba {
@@ -5260,6 +5464,10 @@ struct Walker<'a> {
     motion: &'a mut Motion,
     exit_snapshots: &'a mut HashMap<u16, ExitSnapshot>,
     leaving: &'a [Leaving],
+    prev_resize_snapshots: &'a mut HashMap<u16, ResizeSnapshot>,
+    resize_snapshots: &'a mut HashMap<u16, ResizeSnapshot>,
+    resize_crossfades: &'a mut HashMap<u16, ResizeCrossfade>,
+    resize_generation: &'a mut u64,
     text: &'a mut TextEngine,
     editor: &'a mut LineEditor,
     editor_key: &'a mut Option<EditorBitmapKey>,
@@ -5305,6 +5513,8 @@ struct Shown {
     x: f32,
     y: f32,
     scale: f32,
+    scale_x: f32,
+    scale_y: f32,
     brightness: f32,
     background: Option<[f32; 4]>,
     gradient: Option<[u32; 2]>,
@@ -5313,6 +5523,8 @@ struct Shown {
     draw: f32,
     left: f32,
     width: f32,
+    height: f32,
+    target_size: [f32; 2],
     radius: [f32; 4],
     underline: bool,
     looping: bool,
@@ -5498,12 +5710,20 @@ impl<'a> Walker<'a> {
         let background = v.background.or(paint.background);
         let brightness = v.brightness.or(paint.brightness).unwrap_or(1.);
         let scale = v.scale.or(paint.scale).unwrap_or(1.);
+        let scale_x = v.scale_x.or(paint.scale_x).unwrap_or(1.);
+        let scale_y = v.scale_y.or(paint.scale_y).unwrap_or(1.);
         let edge = v.edge.or(paint.edge);
         let opacity = v.opacity.or(paint.opacity).unwrap_or(1.);
         let (x, y) = (v.x.unwrap_or(paint.x), v.y.unwrap_or(paint.y));
         let text_color = v.color.or(paint.color);
         let draw_base = paint.draw.unwrap_or(1.);
         let width_base = v.width.unwrap_or(rect[2]);
+        let is_crossfade = paint.resize == Resize::Crossfade;
+        let height_base = if is_crossfade {
+            v.height.unwrap_or(rect[3])
+        } else {
+            rect[3]
+        };
 
         let has_transitions = !paint.transitions.is_empty();
         let has_animations = paint.animations.as_ref().is_some_and(|a| !a.is_empty());
@@ -5511,13 +5731,15 @@ impl<'a> Walker<'a> {
         let has_active = self.motion.has_active(id);
 
         // Fast path: static node with no transitions, animations, starting state, or active motion.
-        // Skips all 11 Motion HashMap operations completely.
+        // Skips all Motion HashMap operations completely.
         if !has_transitions && !has_animations && !has_starting && !has_active {
             return Shown {
                 opacity,
                 x,
                 y,
                 scale,
+                scale_x,
+                scale_y,
                 brightness,
                 background: background.map(|c| Value::color(c).rgba()),
                 gradient: v.gradient.or(paint.gradient),
@@ -5526,6 +5748,8 @@ impl<'a> Walker<'a> {
                 draw: draw_base,
                 left: rect[0],
                 width: width_base,
+                height: height_base,
+                target_size: [width_base, height_base],
                 radius: paint.radius.corners().map(|r| r.max(0.)),
                 underline: v.underline.unwrap_or(false),
                 looping: false,
@@ -5544,6 +5768,8 @@ impl<'a> Walker<'a> {
                 (Property::X, starting.x, x),
                 (Property::Y, starting.y, y),
                 (Property::Scale, starting.scale, scale),
+                (Property::ScaleX, starting.scale_x, scale_x),
+                (Property::ScaleY, starting.scale_y, scale_y),
                 (Property::Draw, starting.draw, draw_base),
             ];
             for (property, start, target) in from {
@@ -5578,9 +5804,10 @@ impl<'a> Walker<'a> {
                 .find(|(p, _)| *p == property)
                 .map(|(_, v)| *v)
         };
-        let mut number = |property, value: f32| {
-            let tr = transition(paint, property);
+        let mut number = |property, value: f32, snap: bool| {
+            let tr = (!snap).then(|| transition(paint, property)).flatten();
             let shown = if tr.is_some()
+                || snap
                 || has_active
                 || (has_starting && property == Property::Opacity)
             {
@@ -5592,14 +5819,25 @@ impl<'a> Walker<'a> {
             };
             overridden(property).map_or(shown, Value::number)
         };
-        let opacity = number(Property::Opacity, opacity);
-        let x = number(Property::X, x);
-        let y = number(Property::Y, y);
-        let scale = number(Property::Scale, scale);
-        let brightness = number(Property::Brightness, brightness);
-        let draw = number(Property::Draw, draw_base);
-        let left = number(Property::Left, rect[0]);
-        let width = number(Property::Width, width_base);
+        let opacity = number(Property::Opacity, opacity, false);
+        let x = number(Property::X, x, false);
+        let y = number(Property::Y, y, false);
+        let scale = number(Property::Scale, scale, false);
+        let scale_x = number(Property::ScaleX, scale_x, false);
+        let scale_y = number(Property::ScaleY, scale_y, false);
+        let brightness = number(Property::Brightness, brightness, false);
+        let draw = number(Property::Draw, draw_base, false);
+        let left = number(Property::Left, rect[0], false);
+        // For `resize: "crossfade"`, reduced motion or an active ancestor crossfade snaps size
+        // targets immediately so there is no crossfade under reduced motion and no double-resize
+        // inside an ancestor's `next` capture.
+        let snap_size = is_crossfade && (reduced || ctx.in_crossfade);
+        let width = number(Property::Width, width_base, snap_size);
+        let height = if is_crossfade {
+            number(Property::Height, height_base, snap_size)
+        } else {
+            rect[3]
+        };
         let radius_base = paint.radius.corners();
         let radius = {
             let tr = transition(paint, Property::Radius);
@@ -5642,6 +5880,8 @@ impl<'a> Walker<'a> {
             x,
             y,
             scale,
+            scale_x,
+            scale_y,
             brightness,
             background: color(Property::Background, background),
             gradient: v.gradient.or(paint.gradient),
@@ -5650,6 +5890,8 @@ impl<'a> Walker<'a> {
             draw,
             left,
             width,
+            height,
+            target_size: [width_base, height_base],
             radius,
             underline: v.underline.unwrap_or(false),
         }
@@ -5757,13 +5999,14 @@ impl<'a> Walker<'a> {
         let (group_hover, group_active) =
             nearest_group_of(self.tree, id).map_or((false, false), |g| self.group_state(g));
         Some(Context {
-            k: 1.,
+            k: [1., 1.],
             offset: [x, y],
             opacity: 1.,
             brightness: 1.,
             clip: self.window,
             round_clip: None,
             in_row: false,
+            in_crossfade: false,
             group_hover,
             group_active,
         })
@@ -5781,20 +6024,22 @@ impl<'a> Walker<'a> {
         let default_paint = Paint::default();
         let paint = node.paint().unwrap_or(&default_paint);
         let shown = self.shown(id, paint, layout_rect, disabled, &ctx, is_group);
-        // On-screen rectangle: layout transitions of `left` and `width`, then the node's own transform.
-        let rect = [shown.left, layout_rect[1], shown.width, layout_rect[3]];
+        // On-screen rectangle: layout transitions of `left`, `width`, and (for crossfade) `height`,
+        // then the node's own 2D scale/offset transform around the box center.
+        let rect = [shown.left, layout_rect[1], shown.width, shown.height];
         let mut inner = ctx;
         let center = [rect[0] + rect[2] / 2., rect[1] + rect[3] / 2.];
-        let s = shown.scale;
+        let sx = shown.scale * shown.scale_x;
+        let sy = shown.scale * shown.scale_y;
         let local = [
-            center[0] - s * center[0] + shown.x,
-            center[1] - s * center[1] + shown.y,
+            center[0] - sx * center[0] + shown.x,
+            center[1] - sy * center[1] + shown.y,
         ];
         inner.offset = [
-            ctx.k * local[0] + ctx.offset[0],
-            ctx.k * local[1] + ctx.offset[1],
+            ctx.k[0] * local[0] + ctx.offset[0],
+            ctx.k[1] * local[1] + ctx.offset[1],
         ];
-        inner.k = ctx.k * s;
+        inner.k = [ctx.k[0] * sx, ctx.k[1] * sy];
         inner.brightness = ctx.brightness * shown.brightness;
         let screen = inner.rect(rect);
         self.screen[id as usize] = Some(screen);
@@ -5829,176 +6074,329 @@ impl<'a> Walker<'a> {
                 layer: self.layer,
             });
         }
-        let radius = shown.radius.map(|r| r.max(0.) * inner.k);
+        // Under non-uniform scale (`kx != ky`), corner radii approximate ellipticity with `min(kx, ky)`.
+        let k_min = inner.k_min();
+        let radius = shown.radius.map(|r| r.max(0.) * k_min);
         let shadow_radius = radius.into_iter().fold(0., f32::max);
         // A mask names an image: while that image is missing, the node draws none of its own paint.
-        let mask = paint
+        let mask_entry = paint
             .mask
             .as_ref()
             .map(|source| self.images.get(source).cloned());
-        let hidden = matches!(mask, Some(None));
-        let mask = mask.flatten().map(|image| (image, screen));
-        if !hidden {
-            if !paint.shadows.is_empty() {
-                for shadow in &paint.shadows {
-                    let Shadow {
-                        y,
-                        blur,
-                        spread,
-                        color,
-                    } = *shadow;
-                    let sy = y * inner.k;
-                    let sblur = blur * inner.k;
-                    let sspread = spread * inner.k;
-                    let reach = sblur + sspread.max(0.);
-                    let shadow_box = [
-                        screen[0] - reach,
-                        screen[1] + sy - reach,
-                        screen[2] + 2. * reach,
-                        screen[3] + 2. * reach,
-                    ];
-                    let shadow_vis = intersect(shadow_box, clip);
-                    if shadow_vis[2] <= 0. || shadow_vis[3] <= 0. {
-                        continue;
+        let hidden = matches!(mask_entry, Some(None));
+        let mask_img = mask_entry.flatten();
+        if !hidden && !paint.shadows.is_empty() {
+            for shadow in &paint.shadows {
+                let Shadow {
+                    y,
+                    blur,
+                    spread,
+                    color,
+                } = *shadow;
+                let sy = y * inner.k[1];
+                let sblur = blur * k_min;
+                let sspread = spread * k_min;
+                let reach = sblur + sspread.max(0.);
+                let shadow_box = [
+                    screen[0] - reach,
+                    screen[1] + sy - reach,
+                    screen[2] + 2. * reach,
+                    screen[3] + 2. * reach,
+                ];
+                let shadow_vis = intersect(shadow_box, clip);
+                if shadow_vis[2] <= 0. || shadow_vis[3] <= 0. {
+                    continue;
+                }
+                let shadow = ShadowSpec {
+                    y: sy,
+                    blur: sblur,
+                    spread: sspread,
+                    color: inner.color(Value::color(color).rgba()),
+                };
+                self.items.push(Item::Shadow {
+                    rect: screen,
+                    radius: shadow_radius,
+                    shadow,
+                    clip,
+                    round_clip,
+                });
+            }
+        }
+
+        // Crossfade size transitions (`paint.resize == Resize::Crossfade`): capture last frame as
+        // `prev` when `width`/`height` transitions start (or restart mid-flight), render the live
+        // final layout into `next`, and blend `mix(prev, next, p)` into the animated `screen` rect.
+        let has_size_transition = transition(paint, Property::Width)
+            .is_some_and(|t| t.duration > 0.)
+            || transition(paint, Property::Height).is_some_and(|t| t.duration > 0.);
+        let wants_crossfade = paint.resize == Resize::Crossfade
+            && !self.reduced_motion
+            && !ctx.in_crossfade
+            && has_size_transition;
+        let prev_resize_snap = if wants_crossfade {
+            self.prev_resize_snapshots.remove(&id)
+        } else {
+            self.resize_crossfades.remove(&id);
+            None
+        };
+        let next_source = [
+            screen[0],
+            screen[1],
+            shown.target_size[0] * inner.k[0],
+            shown.target_size[1] * inner.k[1],
+        ];
+        let active_crossfade = if wants_crossfade {
+            let w_prog = self.motion.progress(id, Property::Width, self.now);
+            let h_prog = self.motion.progress(id, Property::Height, self.now);
+            if w_prog.is_none() && h_prog.is_none() {
+                self.resize_crossfades.remove(&id);
+                None
+            } else {
+                let target_size = shown.target_size;
+                let need_new = match self.resize_crossfades.get(&id) {
+                    None => true,
+                    Some(existing) => {
+                        (existing.target_size[0] - target_size[0]).abs() > 0.01
+                            || (existing.target_size[1] - target_size[1]).abs() > 0.01
                     }
-                    let shadow = ShadowSpec {
-                        y: sy,
-                        blur: sblur,
-                        spread: sspread,
-                        color: inner.color(Value::color(color).rgba()),
+                };
+                if need_new {
+                    if let Some(snap) = prev_resize_snap {
+                        *self.resize_generation += 1;
+                        let cache_key = (u64::from(id), *self.resize_generation);
+                        self.resize_crossfades.insert(
+                            id,
+                            ResizeCrossfade {
+                                prev_items: snap.items,
+                                prev_source: snap.source,
+                                cache_key,
+                                target_size,
+                                depth: snap.depth,
+                                track_w: w_prog.is_some(),
+                                track_h: h_prog.is_some(),
+                            },
+                        );
+                    } else {
+                        self.resize_crossfades.remove(&id);
+                    }
+                }
+                let active = self.resize_crossfades.get(&id).and_then(|cf| {
+                    let p = match (
+                        cf.track_w.then_some(w_prog).flatten(),
+                        cf.track_h.then_some(h_prog).flatten(),
+                    ) {
+                        (Some(wp), Some(hp)) => wp.min(hp),
+                        (Some(wp), None) => wp,
+                        (None, Some(hp)) => hp,
+                        (None, None) => return None,
                     };
-                    self.items.push(Item::Shadow {
-                        rect: screen,
-                        radius: shadow_radius,
-                        shadow,
-                        clip,
-                        round_clip,
+                    Some((cf.prev_source, cf.cache_key, cf.depth, p.clamp(0., 1.)))
+                });
+                if active.is_none() {
+                    self.resize_crossfades.remove(&id);
+                }
+                let fits_tex = |r: Rect| {
+                    let pw = (r[2] * scale).ceil();
+                    let ph = (r[3] * scale).ceil();
+                    pw >= 1. && ph >= 1. && pw <= max_side as f32 && ph <= max_side as f32
+                };
+                // Fall back to `"clip"` for this transition if any offscreen texture exceeds `max_side`.
+                active.filter(|(prev_source, _, _, _)| {
+                    fits_tex(*prev_source) && fits_tex(next_source) && fits_tex(screen)
+                })
+            }
+        } else {
+            None
+        };
+
+        let crossfade_bookkeeping = if let Some((prev_source, cache_key, depth, p)) = active_crossfade
+        {
+            let snap_start = self.items.len();
+            self.items.push(Item::PushLayer { opacity: 1. });
+            let prev_surf_idx = self.items.len();
+            self.items.push(Item::PushSurface {
+                source: prev_source,
+                dest: screen,
+                radius,
+                opacity: (1. - p).clamp(0., 1.),
+                clip,
+                round_clip,
+                additive: false,
+                cache_key: Some(cache_key),
+            });
+            if let Some(cf) = self.resize_crossfades.get(&id) {
+                self.items.extend(cf.prev_items.iter().cloned());
+            }
+            self.items.push(Item::PopSurface);
+            let next_surf_idx = self.items.len();
+            self.items.push(Item::PushSurface {
+                source: next_source,
+                dest: screen,
+                radius,
+                opacity: p.clamp(0., 1.),
+                clip,
+                round_clip,
+                additive: true,
+                cache_key: None,
+            });
+            let next_body_start = self.items.len();
+            Some((snap_start, prev_surf_idx, next_surf_idx, next_body_start, depth, p))
+        } else {
+            None
+        };
+
+        let direct_start = (wants_crossfade && crossfade_bookkeeping.is_none())
+            .then_some(self.items.len());
+
+        let (body_inner, body_screen, body_clip, body_round_clip, body_visible, body_on_screen) =
+            if crossfade_bookkeeping.is_some() {
+                let mut next_inner = inner;
+                next_inner.offset = [
+                    next_source[0] - layout_rect[0] * inner.k[0],
+                    next_source[1] - layout_rect[1] * inner.k[1],
+                ];
+                next_inner.clip = next_source;
+                next_inner.round_clip = None;
+                next_inner.in_crossfade = true;
+                (
+                    next_inner,
+                    next_source,
+                    next_source,
+                    None,
+                    next_source[2] > 0. && next_source[3] > 0.,
+                    intersect(next_source, clip),
+                )
+            } else {
+                (inner, screen, clip, round_clip, visible, on_screen)
+            };
+
+        let mask = mask_img.map(|image| (image, body_screen));
+        let (text_zoom, text_stretch) = scale_zoom_stretch(body_inner.k);
+        if !hidden && body_visible {
+            if let Some([top, bottom]) = shown.gradient {
+                let [top, bottom] =
+                    [top, bottom].map(|c| body_inner.color(Value::color(c).rgba()));
+                self.items.push(Item::Fill {
+                    rect: body_screen,
+                    radius,
+                    top,
+                    bottom,
+                    clip: body_clip,
+                    round_clip: body_round_clip,
+                    mask: mask.clone(),
+                });
+            } else if let Some(background) = shown.background {
+                let color = body_inner.color(background);
+                self.items.push(Item::Fill {
+                    rect: body_screen,
+                    radius,
+                    top: color,
+                    bottom: color,
+                    clip: body_clip,
+                    round_clip: body_round_clip,
+                    mask: mask.clone(),
+                });
+            }
+            if let Some(edge) = shown.edge {
+                let color = body_inner.color(edge);
+                if let Some(sides) = paint.edge_sides {
+                    // Each side is a band inside the rectangle. The bands do not overlap, so a translucent edge
+                    // does not darken where two meet. Without a radius, a band is a plain rectangle. With one, each
+                    // piece is the rounded ring clipped to it: the straight strips, and each corner square (radius
+                    // by radius) drawn once, by the top or bottom side if it has a width, else by the left or right.
+                    // So a corner keeps its arc even when only one of its sides has an edge.
+                    let top = sides[0] * body_inner.k[1];
+                    let right = sides[1] * body_inner.k[0];
+                    let bottom = sides[2] * body_inner.k[1];
+                    let left = sides[3] * body_inner.k[0];
+                    let [x, y, w, h] = body_screen;
+                    let pieces: Vec<(f32, Rect)> = if radius.iter().any(|&r| r > 0.) {
+                        let [tl, tr, br, bl] = radius;
+                        let corner = |r: f32, across: f32, along: f32| {
+                            [r.max(across).min(w / 2.), r.max(along).min(h / 2.)]
+                        };
+                        let [tl_w, tl_h] = corner(tl, left, top);
+                        let [tr_w, tr_h] = corner(tr, right, top);
+                        let [br_w, br_h] = corner(br, right, bottom);
+                        let [bl_w, bl_h] = corner(bl, left, bottom);
+                        let owner = |vertical: f32, horizontal: f32| {
+                            if vertical > 0. { vertical } else { horizontal }
+                        };
+                        vec![
+                            (top, [x + tl_w, y, w - tl_w - tr_w, top]),
+                            (bottom, [x + bl_w, y + h - bottom, w - bl_w - br_w, bottom]),
+                            (left, [x, y + tl_h, left, h - tl_h - bl_h]),
+                            (right, [x + w - right, y + tr_h, right, h - tr_h - br_h]),
+                            (owner(top, left), [x, y, tl_w, tl_h]),
+                            (owner(top, right), [x + w - tr_w, y, tr_w, tr_h]),
+                            (
+                                owner(bottom, right),
+                                [x + w - br_w, y + h - br_h, br_w, br_h],
+                            ),
+                            (owner(bottom, left), [x, y + h - bl_h, bl_w, bl_h]),
+                        ]
+                    } else {
+                        let middle = (h - top - bottom).max(0.);
+                        vec![
+                            (top, [x, y, w, top]),
+                            (bottom, [x, y + h - bottom, w, bottom]),
+                            (left, [x, y + top, left, middle]),
+                            (right, [x + w - right, y + top, right, middle]),
+                        ]
+                    };
+                    for (width, strip) in pieces {
+                        if width <= 0. || strip[2] <= 0. || strip[3] <= 0. {
+                            continue;
+                        }
+                        if radius.iter().any(|&r| r > 0.) {
+                            self.items.push(Item::Inset {
+                                rect: body_screen,
+                                radius,
+                                spread: width,
+                                offset: [0., 0.],
+                                color,
+                                clip: intersect(strip, body_clip),
+                                round_clip: body_round_clip,
+                                mask: mask.clone(),
+                            });
+                        } else {
+                            self.items.push(Item::Fill {
+                                rect: strip,
+                                radius: [0.; 4],
+                                top: color,
+                                bottom: color,
+                                clip: body_clip,
+                                round_clip: body_round_clip,
+                                mask: mask.clone(),
+                            });
+                        }
+                    }
+                } else {
+                    let spread = paint.edge_width.unwrap_or(1.) * k_min;
+                    self.items.push(Item::Inset {
+                        rect: body_screen,
+                        radius,
+                        spread,
+                        offset: [0., 0.],
+                        color,
+                        clip: body_clip,
+                        round_clip: body_round_clip,
+                        mask: mask.clone(),
                     });
                 }
             }
-            if visible {
-                if let Some([top, bottom]) = shown.gradient {
-                    let [top, bottom] =
-                        [top, bottom].map(|c| inner.color(Value::color(c).rgba()));
-                    self.items.push(Item::Fill {
-                        rect: screen,
-                        radius,
-                        top,
-                        bottom,
-                        clip,
-                        round_clip,
-                        mask: mask.clone(),
-                    });
-                } else if let Some(background) = shown.background {
-                    let color = inner.color(background);
-                    self.items.push(Item::Fill {
-                        rect: screen,
-                        radius,
-                        top: color,
-                        bottom: color,
-                        clip,
-                        round_clip,
-                        mask: mask.clone(),
-                    });
-                }
-                if let Some(edge) = shown.edge {
-                    let color = inner.color(edge);
-                    if let Some(sides) = paint.edge_sides {
-                        // Each side is a band inside the rectangle. The bands do not overlap, so a translucent edge
-                        // does not darken where two meet. Without a radius, a band is a plain rectangle. With one, each
-                        // piece is the rounded ring clipped to it: the straight strips, and each corner square (radius
-                        // by radius) drawn once, by the top or bottom side if it has a width, else by the left or right.
-                        // So a corner keeps its arc even when only one of its sides has an edge.
-                        let [top, right, bottom, left] = sides.map(|w| w * inner.k);
-                        let [x, y, w, h] = screen;
-                        let pieces: Vec<(f32, Rect)> = if radius.iter().any(|&r| r > 0.) {
-                            let [tl, tr, br, bl] = radius;
-                            let corner = |r: f32, across: f32, along: f32| {
-                                [r.max(across).min(w / 2.), r.max(along).min(h / 2.)]
-                            };
-                            let [tl_w, tl_h] = corner(tl, left, top);
-                            let [tr_w, tr_h] = corner(tr, right, top);
-                            let [br_w, br_h] = corner(br, right, bottom);
-                            let [bl_w, bl_h] = corner(bl, left, bottom);
-                            let owner = |vertical: f32, horizontal: f32| {
-                                if vertical > 0. { vertical } else { horizontal }
-                            };
-                            vec![
-                                (top, [x + tl_w, y, w - tl_w - tr_w, top]),
-                                (bottom, [x + bl_w, y + h - bottom, w - bl_w - br_w, bottom]),
-                                (left, [x, y + tl_h, left, h - tl_h - bl_h]),
-                                (right, [x + w - right, y + tr_h, right, h - tr_h - br_h]),
-                                (owner(top, left), [x, y, tl_w, tl_h]),
-                                (owner(top, right), [x + w - tr_w, y, tr_w, tr_h]),
-                                (
-                                    owner(bottom, right),
-                                    [x + w - br_w, y + h - br_h, br_w, br_h],
-                                ),
-                                (owner(bottom, left), [x, y + h - bl_h, bl_w, bl_h]),
-                            ]
-                        } else {
-                            let middle = (h - top - bottom).max(0.);
-                            vec![
-                                (top, [x, y, w, top]),
-                                (bottom, [x, y + h - bottom, w, bottom]),
-                                (left, [x, y + top, left, middle]),
-                                (right, [x + w - right, y + top, right, middle]),
-                            ]
-                        };
-                        for (width, strip) in pieces {
-                            if width <= 0. || strip[2] <= 0. || strip[3] <= 0. {
-                                continue;
-                            }
-                            if radius.iter().any(|&r| r > 0.) {
-                                self.items.push(Item::Inset {
-                                    rect: screen,
-                                    radius,
-                                    spread: width,
-                                    offset: [0., 0.],
-                                    color,
-                                    clip: intersect(strip, clip),
-                                    round_clip,
-                                    mask: mask.clone(),
-                                });
-                            } else {
-                                self.items.push(Item::Fill {
-                                    rect: strip,
-                                    radius: [0.; 4],
-                                    top: color,
-                                    bottom: color,
-                                    clip,
-                                    round_clip,
-                                    mask: mask.clone(),
-                                });
-                            }
-                        }
-                    } else {
-                        let spread = paint.edge_width.unwrap_or(1.) * inner.k;
-                        self.items.push(Item::Inset {
-                            rect: screen,
-                            radius,
-                            spread,
-                            offset: [0., 0.],
-                            color,
-                            clip,
-                            round_clip,
-                            mask: mask.clone(),
-                        });
-                    }
-                }
-                if let Some(highlight) = paint.highlight {
-                    let color = inner.color(Value::color(highlight).rgba());
-                    self.items.push(Item::Inset {
-                        rect: screen,
-                        radius,
-                        spread: 0.,
-                        offset: [0., inner.k],
-                        color,
-                        clip,
-                        round_clip,
-                        mask: mask.clone(),
-                    });
-                }
+            if let Some(highlight) = paint.highlight {
+                let color = body_inner.color(Value::color(highlight).rgba());
+                self.items.push(Item::Inset {
+                    rect: body_screen,
+                    radius,
+                    spread: 0.,
+                    offset: [0., body_inner.k[1]],
+                    color,
+                    clip: body_clip,
+                    round_clip: body_round_clip,
+                    mask: mask.clone(),
+                });
             }
         }
         let color = shown.color.unwrap_or([244., 244., 245., 255.]);
@@ -6010,23 +6408,24 @@ impl<'a> Walker<'a> {
                 align,
                 spans,
                 ..
-            } if visible && !text.is_empty() => {
+            } if body_visible && !text.is_empty() => {
                 let style = TextStyle {
                     align: *align,
-                    ..TextStyle::of(font, inner.color(color))
+                    ..TextStyle::of(font, body_inner.color(color))
                 };
                 let rich = spans.as_ref().is_some_and(|spans| !spans.is_empty());
                 if !rich && !shown.underline && lines.is_none() {
                     // Fast path: plain, non-underlined, unclamped text skips `node_spans` and `plain_text`.
                     self.items.push(Item::Text {
-                        rect: screen,
+                        rect: body_screen,
                         text: text.clone(),
                         spans: None,
                         style,
                         wrap: true,
-                        zoom: inner.k,
-                        clip,
-                        round_clip,
+                        zoom: text_zoom,
+                        stretch: text_stretch,
+                        clip: body_clip,
+                        round_clip: body_round_clip,
                     });
                 } else {
                     // Draws the text cut to its line limit at the width the layout measured.
@@ -6060,7 +6459,6 @@ impl<'a> Walker<'a> {
                         };
                         (runs, Vec::new())
                     };
-                    let zoom = inner.k;
                     for mark in marks {
                         match mark {
                             Mark::Image { span, rect } => {
@@ -6073,12 +6471,12 @@ impl<'a> Walker<'a> {
                                     continue;
                                 };
                                 self.items.push(Item::Image {
-                                    rect: scaled(screen, rect, zoom),
+                                    rect: scaled(body_screen, rect, body_inner.k),
                                     radius: [0.; 4],
                                     image: image.clone(),
                                     tint: [255; 4],
-                                    clip,
-                                    round_clip,
+                                    clip: body_clip,
+                                    round_clip: body_round_clip,
                                     mask: None,
                                 });
                             }
@@ -6086,14 +6484,14 @@ impl<'a> Walker<'a> {
                                 let color = runs[span]
                                     .color
                                     .map_or(color, |c| c.to_be_bytes().map(f32::from));
-                                let color = inner.color(color);
+                                let color = body_inner.color(color);
                                 self.items.push(Item::Fill {
-                                    rect: scaled(screen, rect, zoom),
+                                    rect: scaled(body_screen, rect, body_inner.k),
                                     radius: [0.; 4],
                                     top: color,
                                     bottom: color,
-                                    clip,
-                                    round_clip,
+                                    clip: body_clip,
+                                    round_clip: body_round_clip,
                                     mask: None,
                                 });
                             }
@@ -6101,53 +6499,55 @@ impl<'a> Walker<'a> {
                                 let Some(background) = runs[span].background else {
                                     continue;
                                 };
-                                let color = inner.color(background.to_be_bytes().map(f32::from));
+                                let color = body_inner.color(background.to_be_bytes().map(f32::from));
                                 self.items.push(Item::Fill {
-                                    rect: scaled(screen, rect, zoom),
-                                    radius: [runs[span].background_radius * zoom; 4],
+                                    rect: scaled(body_screen, rect, body_inner.k),
+                                    radius: [runs[span].background_radius * text_zoom; 4],
                                     top: color,
                                     bottom: color,
-                                    clip,
-                                    round_clip,
+                                    clip: body_clip,
+                                    round_clip: body_round_clip,
                                     mask: None,
                                 });
                             }
                         }
                     }
                     self.items.push(Item::Text {
-                        rect: screen,
+                        rect: body_screen,
                         text: plain_text(&runs),
                         spans: rich.then_some(runs),
                         style,
                         wrap: true,
-                        zoom,
-                        clip,
-                        round_clip,
+                        zoom: text_zoom,
+                        stretch: text_stretch,
+                        clip: body_clip,
+                        round_clip: body_round_clip,
                     });
                 }
             }
-            Node::Icon { icon, stroke, .. } if visible => {
+            Node::Icon { icon, stroke, .. } if body_visible => {
                 self.items.push(Item::Icon {
-                    rect: screen,
+                    rect: body_screen,
                     icon: *icon,
                     stroke: *stroke,
                     draw: shown.draw,
-                    color: inner.color(color),
-                    zoom: inner.k,
-                    clip,
-                    round_clip,
+                    color: body_inner.color(color),
+                    zoom: text_zoom,
+                    stretch: text_stretch,
+                    clip: body_clip,
+                    round_clip: body_round_clip,
                 });
             }
-            Node::Image { source, .. } if visible => {
+            Node::Image { source, .. } if body_visible => {
                 if let Some(image) = self.images.get(source).filter(|_| !hidden) {
                     let tint = shown.color.unwrap_or([255., 255., 255., 255.]);
                     self.items.push(Item::Image {
-                        rect: screen,
+                        rect: body_screen,
                         radius,
                         image: image.clone(),
-                        tint: inner.color(tint),
-                        clip,
-                        round_clip,
+                        tint: body_inner.color(tint),
+                        clip: body_clip,
+                        round_clip: body_round_clip,
                         mask: mask.clone(),
                     });
                 }
@@ -6160,34 +6560,34 @@ impl<'a> Walker<'a> {
                 multiline,
                 purpose,
                 ..
-            } if visible || self.focused == Some(id) => {
-                if visible {
+            } if body_visible || self.focused == Some(id) => {
+                if body_visible {
                     self.hits.push(Hit {
-                        rect: on_screen,
+                        rect: body_on_screen,
                         id,
                         layer: self.layer,
                     });
                 }
-                let content = inner.rect(input_content_of(tree, id));
-                let style = TextStyle::of(font, inner.color(color));
+                let content = body_inner.rect(input_content_of(tree, id));
+                let style = TextStyle::of(font, body_inner.color(color));
                 // A line sits in the middle of a single-line field, and at the top of a multi-line one.
                 let line = [
                     content[0],
                     if *multiline {
                         content[1]
                     } else {
-                        content[1] + (content[3] - style.line_height * inner.k) / 2.
+                        content[1] + (content[3] - style.line_height * body_inner.k[1]) / 2.
                     },
                     content[2],
-                    style.line_height * inner.k,
+                    style.line_height * body_inner.k[1],
                 ];
                 // The visible text's height, in logical pixels: a multi-line field scrolls when its text is taller.
                 let view = if *multiline {
-                    content[3] / inner.k
+                    content[3] / body_inner.k[1]
                 } else {
-                    line[3] / inner.k
+                    line[3] / body_inner.k[1]
                 };
-                let width = content[2] / inner.k;
+                let width = content[2] / body_inner.k[0];
                 if self.focused == Some(id) {
                     let requested = if *multiline {
                         self.scroll_offset(id, f32::MAX, self.now)
@@ -6199,7 +6599,7 @@ impl<'a> Walker<'a> {
                         self.text,
                         &style,
                         [width, view],
-                        scale * inner.k,
+                        scale * text_zoom,
                         max_side,
                         *self.editor_key,
                     );
@@ -6212,8 +6612,8 @@ impl<'a> Walker<'a> {
                         self.scrolls.push(Scroll {
                             id,
                             layer: self.layer,
-                            rect: intersect(content, clip),
-                            k: inner.k,
+                            rect: intersect(content, body_clip),
+                            k: body_inner.k[1],
                             top: frame.scroll_y,
                             max: (frame.content_height - view).max(0.),
                             view,
@@ -6226,19 +6626,19 @@ impl<'a> Walker<'a> {
                             placeholder,
                             *placeholder_color,
                             font,
-                            &inner,
+                            &body_inner,
                             line,
-                            (clip, round_clip),
+                            (body_clip, body_round_clip),
                         );
                     }
                     let caret = [
-                        line[0] + frame.caret_x * inner.k,
-                        line[1] + frame.caret_y * inner.k,
-                        inner.k,
+                        line[0] + frame.caret_x * body_inner.k[0],
+                        line[1] + frame.caret_y * body_inner.k[1],
+                        body_inner.k[0],
                         line[3],
                     ];
                     if *purpose != InputPurpose::Password {
-                        let visible_box = intersect(content, clip);
+                        let visible_box = intersect(content, body_clip);
                         let area = if visible_box[2] > 0. && visible_box[3] > 0. {
                             let max_x = (visible_box[0] + visible_box[2] - caret[2]).max(visible_box[0]);
                             let max_y = (visible_box[1] + visible_box[3] - caret[3]).max(visible_box[1]);
@@ -6259,18 +6659,19 @@ impl<'a> Walker<'a> {
                         frame: Box::new(frame),
                         caret,
                         selection: [70, 120, 220, 110],
-                        caret_color: inner.color(color),
-                        clip: intersect(content, clip),
-                        round_clip,
+                        caret_color: body_inner.color(color),
+                        stretch: text_stretch,
+                        clip: intersect(content, body_clip),
+                        round_clip: body_round_clip,
                     });
                 } else if text.is_empty() {
                     self.placeholder(
                         placeholder,
                         *placeholder_color,
                         font,
-                        &inner,
+                        &body_inner,
                         line,
-                        (clip, round_clip),
+                        (body_clip, body_round_clip),
                     );
                 } else if *multiline {
                     let display = if *purpose == InputPurpose::Password {
@@ -6288,8 +6689,8 @@ impl<'a> Walker<'a> {
                     self.scrolls.push(Scroll {
                         id,
                         layer: self.layer,
-                        rect: intersect(content, clip),
-                        k: inner.k,
+                        rect: intersect(content, body_clip),
+                        k: body_inner.k[1],
                         top: offset,
                         max,
                         view,
@@ -6299,17 +6700,18 @@ impl<'a> Walker<'a> {
                     self.items.push(Item::Text {
                         rect: [
                             content[0],
-                            content[1] - offset * inner.k,
+                            content[1] - offset * body_inner.k[1],
                             content[2],
-                            height * inner.k,
+                            height * body_inner.k[1],
                         ],
                         text: display,
                         spans: None,
                         style,
                         wrap: true,
-                        zoom: inner.k,
-                        clip: intersect(content, clip),
-                        round_clip,
+                        zoom: text_zoom,
+                        stretch: text_stretch,
+                        clip: intersect(content, body_clip),
+                        round_clip: body_round_clip,
                     });
                 } else {
                     let display = if *purpose == InputPurpose::Password {
@@ -6323,32 +6725,33 @@ impl<'a> Walker<'a> {
                         spans: None,
                         style,
                         wrap: false,
-                        zoom: inner.k,
-                        clip: intersect(content, clip),
-                        round_clip,
+                        zoom: text_zoom,
+                        stretch: text_stretch,
+                        clip: intersect(content, body_clip),
+                        round_clip: body_round_clip,
                     });
                 }
             }
             _ => {}
         }
-        if visible {
+        if body_visible {
             if matches!(node, Node::Box { press, contextmenu, drag, .. } if *press != 0 || *contextmenu != 0 || *drag != 0)
             {
                 self.hits.push(Hit {
-                    rect: on_screen,
+                    rect: body_on_screen,
                     id,
                     layer: self.layer,
                 });
             }
             if is_group && !disabled {
-                self.groups.push((id, on_screen, self.layer));
+                self.groups.push((id, body_on_screen, self.layer));
             }
             if let Node::Box { hover, dismiss, .. } = node {
                 if *hover != 0 {
-                    self.hovers.push((id, on_screen, self.layer));
+                    self.hovers.push((id, body_on_screen, self.layer));
                 }
                 if *dismiss != 0 {
-                    self.dismissers.push((id, on_screen, self.layer));
+                    self.dismissers.push((id, body_on_screen, self.layer));
                 }
             }
             let has_cursor = paint.cursor.is_some()
@@ -6358,14 +6761,14 @@ impl<'a> Walker<'a> {
                     .any(|v| v.cursor.is_some());
             if has_cursor {
                 self.cursors.push(CursorHit {
-                    rect: on_screen,
+                    rect: body_on_screen,
                     id,
                     layer: self.layer,
                     after_hits: self.hits.len(),
                 });
             }
         }
-        let mut child = inner;
+        let mut child = body_inner;
         if is_group {
             let (gh, ga) = self.group_state(id);
             child.group_hover = gh;
@@ -6374,10 +6777,14 @@ impl<'a> Walker<'a> {
         let clips_style = node.style().is_some_and(|s| s.clip || s.scroll);
         let self_has_round_clip = clips_style && radius.iter().any(|&r| r > 0.);
         if clips_style {
-            child.clip = on_screen;
+            child.clip = if crossfade_bookkeeping.is_some() {
+                body_screen
+            } else {
+                body_on_screen
+            };
             // shortcut: a rounded clip inside another rounded clip replaces it, so the outer corners are lost.
             if self_has_round_clip {
-                child.round_clip = Some((screen, radius));
+                child.round_clip = Some((body_screen, radius));
             }
         }
         let virtual_list = self.virtual_lists.get(&id).map(|&(generation, ref list)| {
@@ -6386,8 +6793,8 @@ impl<'a> Walker<'a> {
                 self.scrolls.push(Scroll {
                     id,
                     layer: self.layer,
-                    rect: on_screen,
-                    k: inner.k,
+                    rect: body_on_screen,
+                    k: body_inner.k[1],
                     top: offset as f32,
                     max: list.max_offset(extent) as f32,
                     view: extent as f32,
@@ -6409,7 +6816,7 @@ impl<'a> Walker<'a> {
                 .style()
                 .is_some_and(|s| s.scroll_anchor == ScrollAnchor::End);
             let offset = self.frame_offset(id, max, self.now, end);
-            child.offset[1] -= offset * inner.k;
+            child.offset[1] -= offset * body_inner.k[1];
             let rects = paint
                 .scrollbar
                 .as_ref()
@@ -6417,8 +6824,8 @@ impl<'a> Walker<'a> {
                 .map(|scrollbar| {
                     let rects = scrollbar_rects(
                         scrollbar,
-                        screen,
-                        inner.k,
+                        body_screen,
+                        body_inner.k,
                         layout_rect[3],
                         content,
                         offset,
@@ -6428,7 +6835,7 @@ impl<'a> Walker<'a> {
                     let alpha = if scrollbar.auto_hide {
                         let over = self
                             .pointer
-                            .is_some_and(|p| contains(on_screen, p));
+                            .is_some_and(|p| contains(body_on_screen, p));
                         let dragged = self.drag.is_some_and(|(drag, _)| drag == id);
                         let shown = Value::Number(f32::from(u8::from(over || dragged)));
                         self.motion
@@ -6449,8 +6856,8 @@ impl<'a> Walker<'a> {
             self.scrolls.push(Scroll {
                 id,
                 layer: self.layer,
-                rect: on_screen,
-                k: inner.k,
+                rect: body_on_screen,
+                k: body_inner.k[1],
                 top: offset,
                 max,
                 view: layout_rect[3],
@@ -6460,10 +6867,10 @@ impl<'a> Walker<'a> {
         }
         if let Some(extent) = virtual_list {
             let view = [
-                screen[0],
-                screen[1],
-                screen[2],
-                screen[3].min(extent as f32 * inner.k),
+                body_screen[0],
+                body_screen[1],
+                body_screen[2],
+                body_screen[3].min(extent as f32 * body_inner.k[1]),
             ];
             child.clip = intersect(child.clip, view);
             child.in_row = true;
@@ -6477,17 +6884,17 @@ impl<'a> Walker<'a> {
                 self.node(c, child, scale, max_side);
             }
         }
-        if visible
+        if body_visible
             && let Some((scrollbar, track, thumb, alpha)) =
                 bar.filter(|(_, _, _, alpha)| *alpha > 0.)
         {
             // The bar is clipped like the node's content, and shaded by its auto-hide opacity.
             let shade = |rgba: u32| {
-                let mut color = inner.color(Value::color(rgba).rgba());
+                let mut color = body_inner.color(Value::color(rgba).rgba());
                 color[3] = (f32::from(color[3]) * alpha).round() as u8;
                 color
             };
-            let radius = [scrollbar.radius * inner.k; 4];
+            let radius = [scrollbar.radius * k_min; 4];
             if let Some(track_color) = scrollbar.track {
                 let color = shade(track_color);
                 self.items.push(Item::Fill {
@@ -6511,6 +6918,86 @@ impl<'a> Walker<'a> {
                 mask: None,
             });
         }
+        if let Some((snap_start, prev_surf_idx, next_surf_idx, next_body_start, depth, p)) =
+            crossfade_bookkeeping
+        {
+            let next_body_end = self.items.len();
+            self.items.push(Item::PopSurface);
+            self.items.push(Item::PopLayer);
+            let snap_end = self.items.len();
+            // Capture the current blended frame so a mid-flight resize starts from it without jumping.
+            let next_snap = if depth < 2 {
+                let mut snap_items = self.items[snap_start..snap_end].to_vec();
+                for surf_idx in [prev_surf_idx - snap_start, next_surf_idx - snap_start] {
+                    if let Some(Item::PushSurface {
+                        clip: c,
+                        round_clip: rc,
+                        ..
+                    }) = snap_items.get_mut(surf_idx)
+                    {
+                        *c = screen;
+                        *rc = None;
+                    }
+                }
+                for item in &mut snap_items {
+                    if let Item::Editor { caret, frame, .. } = item {
+                        *caret = None;
+                        frame.selection.clear();
+                    }
+                }
+                ResizeSnapshot {
+                    items: snap_items,
+                    source: screen,
+                    depth: depth + 1,
+                }
+            } else if p >= 0.5 {
+                let mut snap_items = self.items[next_body_start..next_body_end].to_vec();
+                for item in &mut snap_items {
+                    if let Item::Editor { caret, frame, .. } = item {
+                        *caret = None;
+                        frame.selection.clear();
+                    }
+                }
+                ResizeSnapshot {
+                    items: snap_items,
+                    source: next_source,
+                    depth: 0,
+                }
+            } else if let Some(cf) = self.resize_crossfades.get(&id) {
+                ResizeSnapshot {
+                    items: cf.prev_items.clone(),
+                    source: cf.prev_source,
+                    depth: 0,
+                }
+            } else {
+                ResizeSnapshot {
+                    items: Vec::new(),
+                    source: screen,
+                    depth: 0,
+                }
+            };
+            if !next_snap.items.is_empty() {
+                self.resize_snapshots.insert(id, next_snap);
+            }
+        } else if let Some(start) = direct_start
+            && self.items.len() > start
+        {
+            let mut snap_items = self.items[start..].to_vec();
+            for item in &mut snap_items {
+                if let Item::Editor { caret, frame, .. } = item {
+                    *caret = None;
+                    frame.selection.clear();
+                }
+            }
+            self.resize_snapshots.insert(
+                id,
+                ResizeSnapshot {
+                    items: snap_items,
+                    source: screen,
+                    depth: 0,
+                },
+            );
+        }
         if let Some(start) = exit_start
             && self.items.len() > start
         {
@@ -6533,6 +7020,8 @@ impl<'a> Walker<'a> {
                     x: shown.x,
                     y: shown.y,
                     scale: shown.scale,
+                    scale_x: shown.scale_x,
+                    scale_y: shown.scale_y,
                     ctx_k: ctx.k,
                     center: [screen[0] + screen[2] / 2., screen[1] + screen[3] / 2.],
                     parent_clip: ctx.clip,
@@ -6560,13 +7049,15 @@ impl<'a> Walker<'a> {
             return;
         }
         let color = ctx.color(Value::color(color.unwrap_or(0x757575ff)).rgba());
+        let (zoom, stretch) = scale_zoom_stretch(ctx.k);
         self.items.push(Item::Text {
             rect: line,
             text: text.into(),
             spans: None,
             style: TextStyle::of(font, color),
             wrap: false,
-            zoom: ctx.k,
+            zoom,
+            stretch,
             clip,
             round_clip,
         });
@@ -10752,5 +11243,383 @@ mount(ResizeApp);
         }
         expected.extend(["s3", "fifo1", "sess2", "fifo2"].into_iter().map(String::from));
         assert_eq!(delivered, expected.join(","));
+    }
+
+    #[test]
+    fn scale_xy_doubles_child_width_only_and_hit_testing_matches_transformed_rect() {
+        let script = r#"
+            function jsnirMount() {
+                jsnir.batch(JSON.stringify({ ops: [
+                    { op: 'create', id: 1, node: { kind: 'box', style: { width: 400, height: 200 } } },
+                    { op: 'create', id: 2, parent: 1, node: {
+                        kind: 'box',
+                        style: { position: 'absolute', left: 100, top: 50, width: 100, height: 60 },
+                        paint: { background: 0x334455ff, scaleX: 2 }
+                    } },
+                    { op: 'create', id: 3, parent: 2, node: {
+                        kind: 'box',
+                        press: 1,
+                        style: { width: 50, height: 40 },
+                        paint: { background: 0xaa2244ff }
+                    } },
+                    { op: 'create', id: 4, parent: 3, node: {
+                        kind: 'text',
+                        text: 'Scaled',
+                        paint: { color: 0xffffffff }
+                    } }
+                ] }));
+            }
+            function jsnirEvent() {}
+        "#;
+        let mut host = Host::new(script.into(), "{}".into(), TextEngine::default());
+        settle(&mut host);
+        let t0 = host.now();
+        let (f, _) = host.render(400., 200., 1., 4096, t0);
+
+        // Parent rect [100, 50, 100, 60] centered at (150, 80) with scaleX=2, scaleY=1 => [50, 50, 200, 60].
+        let parent_rect = host.screen_rect(2).expect("parent screen rect");
+        assert!((parent_rect[0] - 50.).abs() < 0.01, "{parent_rect:?}");
+        assert!((parent_rect[1] - 50.).abs() < 0.01, "{parent_rect:?}");
+        assert!((parent_rect[2] - 200.).abs() < 0.01, "{parent_rect:?}");
+        assert!((parent_rect[3] - 60.).abs() < 0.01, "{parent_rect:?}");
+
+        // Child [100, 50, 50, 40] transformed around parent center (150, 80) => [50, 50, 100, 40]:
+        // width doubled (50 -> 100), height unchanged (40).
+        let child_rect = host.screen_rect(3).expect("child screen rect");
+        assert!((child_rect[0] - 50.).abs() < 0.01, "{child_rect:?}");
+        assert!((child_rect[1] - 50.).abs() < 0.01, "{child_rect:?}");
+        assert!((child_rect[2] - 100.).abs() < 0.01, "{child_rect:?}");
+        assert!((child_rect[3] - 40.).abs() < 0.01, "{child_rect:?}");
+
+        // Hit-testing uses the transformed rect [50..150, 50..90]:
+        // (60, 70) is outside unstretched [100..150] but inside stretched [50..150].
+        assert_eq!(host.hit([60., 70.]), Some(3));
+        assert_eq!(host.hit([140., 70.]), Some(3));
+        assert_eq!(host.hit([45., 70.]), None);
+        assert_eq!(host.hit([155., 70.]), None);
+        assert_eq!(host.hit([60., 95.]), None);
+
+        // Text under kx=2, ky=1 rasterizes at zoom=min(kx,ky)=1 and stretches by [2, 1].
+        let text_item = f
+            .items
+            .iter()
+            .find_map(|item| match item {
+                Item::Text {
+                    text,
+                    zoom,
+                    stretch,
+                    ..
+                } if text == "Scaled" => Some((*zoom, *stretch)),
+                _ => None,
+            })
+            .expect("scaled text item");
+        assert!((text_item.0 - 1.).abs() < 1e-4, "{text_item:?}");
+        assert!((text_item.1[0] - 2.).abs() < 1e-4, "{text_item:?}");
+        assert!((text_item.1[1] - 1.).abs() < 1e-4, "{text_item:?}");
+    }
+
+    #[test]
+    fn resize_crossfade_blends_two_surfaces_summing_to_one_and_cleans_up() {
+        let script = r#"
+            function jsnirMount() {
+                jsnir.batch(JSON.stringify({ ops: [
+                    { op: 'create', id: 1, node: { kind: 'box', style: { width: 800, height: 600 } } },
+                    { op: 'create', id: 2, parent: 1, node: {
+                        kind: 'box',
+                        style: { position: 'absolute', left: 0, top: 0, width: 200, height: 100 },
+                        paint: {
+                            background: 0x223344ff,
+                            radius: 8,
+                            resize: 'crossfade',
+                            transitions: [
+                                { property: 'width', duration: 200, easing: 'linear' },
+                                { property: 'height', duration: 200, easing: 'linear' },
+                                { property: 'radius', duration: 200, easing: 'linear' }
+                            ]
+                        }
+                    } },
+                    { op: 'create', id: 3, parent: 2, node: {
+                        kind: 'box',
+                        press: 1,
+                        style: { grow: 1 },
+                        paint: { background: 0x556677ff }
+                    } },
+                    { op: 'create', id: 4, parent: 3, node: {
+                        kind: 'text',
+                        text: 'Pane Body',
+                        paint: { color: 0xffffffff }
+                    } }
+                ] }));
+            }
+            function jsnirEvent(_cb, text) {
+                if (text === 'grow') {
+                    jsnir.batch(JSON.stringify({ ops: [
+                        { op: 'setstyle', id: 2, style: { position: 'absolute', left: 0, top: 0, width: 400, height: 200 } }
+                    ] }));
+                }
+            }
+        "#;
+        let mut host = Host::new(script.into(), "{}".into(), TextEngine::default());
+        settle(&mut host);
+
+        let t0 = host.now();
+        let (f0, _) = host.render(800., 600., 1., 4096, t0);
+        assert!(!f0.animating);
+        assert!(
+            !f0.items
+                .iter()
+                .any(|item| matches!(item, Item::PushSurface { .. })),
+            "steady state must draw directly without surfaces"
+        );
+
+        host.push("grow".into());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while host.busy() {
+            assert!(Instant::now() < deadline);
+            host.poll();
+        }
+
+        // First frame starts crossfade at t1 (p=0).
+        let t1 = host.now();
+        let (f_start, _) = host.render(800., 600., 1., 4096, t1);
+        assert!(f_start.animating);
+
+        // Midway at t1 + 100 ms (p=0.5): two PushSurface draws of the subtree, opacities sum to 1.
+        let (f_mid, _) = host.render(800., 600., 1., 4096, t1 + 100.);
+        assert!(f_mid.animating);
+        let surfaces: Vec<_> = f_mid
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::PushSurface {
+                    source,
+                    dest,
+                    opacity,
+                    additive,
+                    cache_key,
+                    ..
+                } => Some((*source, *dest, *opacity, *additive, *cache_key)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(surfaces.len(), 2, "expected prev + next surfaces: {surfaces:?}");
+        assert!((surfaces[0].2 + surfaces[1].2 - 1.).abs() < 1e-4, "{surfaces:?}");
+        assert!((surfaces[0].2 - 0.5).abs() < 0.02, "{surfaces:?}");
+        assert!((surfaces[1].2 - 0.5).abs() < 0.02, "{surfaces:?}");
+        assert!(!surfaces[0].3 && surfaces[0].4.is_some());
+        assert!(surfaces[1].3 && surfaces[1].4.is_none());
+        // Prev source is old size [200, 100], next source is final size [400, 200], both stretched to [300, 150].
+        assert_eq!(surfaces[0].0[2..4], [200., 100.]);
+        assert_eq!(surfaces[1].0[2..4], [400., 200.]);
+        assert!((surfaces[0].1[2] - 300.).abs() < 1., "{surfaces:?}");
+        assert!((surfaces[0].1[3] - 150.).abs() < 1., "{surfaces:?}");
+        assert_eq!(surfaces[0].1, surfaces[1].1);
+
+        // Both prev and next contain the subtree's text, and hit-testing uses final layout (400x200).
+        let text_count = f_mid
+            .items
+            .iter()
+            .filter(|item| matches!(item, Item::Text { text, .. } if text == "Pane Body"))
+            .count();
+        assert_eq!(text_count, 2);
+        assert_eq!(host.hit([350., 180.]), Some(3));
+
+        // After 200 ms: single direct draw, no PushSurface, crossfade state released.
+        let (f_done, _) = host.render(800., 600., 1., 4096, t1 + 220.);
+        assert!(!f_done.animating);
+        assert!(host.resize_crossfades.is_empty());
+        assert!(
+            !f_done
+                .items
+                .iter()
+                .any(|item| matches!(item, Item::PushSurface { .. }))
+        );
+        let text_count_done = f_done
+            .items
+            .iter()
+            .filter(|item| matches!(item, Item::Text { text, .. } if text == "Pane Body"))
+            .count();
+        assert_eq!(text_count_done, 1);
+    }
+
+    #[test]
+    fn resize_crossfade_midflight_change_does_not_jump() {
+        let script = r#"
+            function jsnirMount() {
+                jsnir.batch(JSON.stringify({ ops: [
+                    { op: 'create', id: 1, node: { kind: 'box', style: { width: 800, height: 600 } } },
+                    { op: 'create', id: 2, parent: 1, node: {
+                        kind: 'box',
+                        style: { position: 'absolute', left: 0, top: 0, width: 200, height: 100 },
+                        paint: {
+                            background: 0x334455ff,
+                            resize: 'crossfade',
+                            transitions: [
+                                { property: 'width', duration: 200, easing: 'linear' },
+                                { property: 'height', duration: 200, easing: 'linear' }
+                            ]
+                        }
+                    } }
+                ] }));
+            }
+            function jsnirEvent(_cb, text) {
+                if (text === 'step1') {
+                    jsnir.batch(JSON.stringify({ ops: [
+                        { op: 'setstyle', id: 2, style: { position: 'absolute', left: 0, top: 0, width: 400, height: 200 } }
+                    ] }));
+                } else if (text === 'step2') {
+                    jsnir.batch(JSON.stringify({ ops: [
+                        { op: 'setstyle', id: 2, style: { position: 'absolute', left: 0, top: 0, width: 600, height: 300 } }
+                    ] }));
+                }
+            }
+        "#;
+        let mut host = Host::new(script.into(), "{}".into(), TextEngine::default());
+        settle(&mut host);
+        let t0 = host.now();
+        host.render(800., 600., 1., 4096, t0);
+
+        let drain = |host: &mut Host| {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while host.busy() {
+                assert!(Instant::now() < deadline);
+                host.poll();
+            }
+        };
+
+        host.push("step1".into());
+        drain(&mut host);
+        let t1 = host.now();
+        host.render(800., 600., 1., 4096, t1);
+        // Midway through step1 at t1 + 100 ms: on-screen rect is [0, 0, 300, 150].
+        let (before, _) = host.render(800., 600., 1., 4096, t1 + 100.);
+        let before_dest = before
+            .items
+            .iter()
+            .find_map(|item| match item {
+                Item::PushSurface { dest, .. } => Some(*dest),
+                _ => None,
+            })
+            .expect("before surface");
+        assert!((before_dest[2] - 300.).abs() < 1., "{before_dest:?}");
+        assert!((before_dest[3] - 150.).abs() < 1., "{before_dest:?}");
+
+        // Interrupt mid-flight at the same timestamp t1 + 100 ms.
+        host.push("step2".into());
+        drain(&mut host);
+        let (after, _) = host.render(800., 600., 1., 4096, t1 + 100.);
+        // Collect top-level surfaces (depth 0 -> 1).
+        let mut depth = 0usize;
+        let mut top_surfaces = Vec::new();
+        for item in &after.items {
+            match item {
+                Item::PushSurface {
+                    source,
+                    dest,
+                    opacity,
+                    ..
+                } => {
+                    if depth == 0 {
+                        top_surfaces.push((*source, *dest, *opacity));
+                    }
+                    depth += 1;
+                }
+                Item::PopSurface => depth -= 1,
+                _ => {}
+            }
+        }
+        assert_eq!(top_surfaces.len(), 2, "{top_surfaces:?}");
+        // First frame after interruption keeps the exact on-screen rect [0, 0, 300, 150]
+        // and draws the previous blended frame at opacity 1.0 (next at opacity 0.0): no jump.
+        assert_eq!(top_surfaces[0].1, before_dest);
+        assert_eq!(top_surfaces[1].1, before_dest);
+        assert_eq!(top_surfaces[0].0, before_dest);
+        assert!((top_surfaces[0].2 - 1.).abs() < 1e-4, "{top_surfaces:?}");
+        assert!(top_surfaces[1].2.abs() < 1e-4, "{top_surfaces:?}");
+    }
+
+    #[test]
+    fn resize_crossfade_noop_without_transitions_and_respects_reduced_motion_and_max_side() {
+        let script = r#"
+            function jsnirMount() {
+                jsnir.batch(JSON.stringify({ ops: [
+                    { op: 'create', id: 1, node: { kind: 'box', style: { width: 800, height: 600 } } },
+                    { op: 'create', id: 2, parent: 1, node: {
+                        kind: 'box',
+                        style: { position: 'absolute', left: 0, top: 0, width: 100, height: 100 },
+                        paint: { background: 0x334455ff, resize: 'crossfade' }
+                    } },
+                    { op: 'create', id: 3, parent: 1, node: {
+                        kind: 'box',
+                        style: { position: 'absolute', left: 0, top: 200, width: 100, height: 100 },
+                        paint: {
+                            background: 0x554433ff,
+                            resize: 'crossfade',
+                            transitions: [{ property: 'width', duration: 200, easing: 'linear' }]
+                        }
+                    } }
+                ] }));
+            }
+            function jsnirEvent(_cb, text) {
+                if (text === 'resize') {
+                    jsnir.batch(JSON.stringify({ ops: [
+                        { op: 'setstyle', id: 2, style: { position: 'absolute', left: 0, top: 0, width: 300, height: 100 } },
+                        { op: 'setstyle', id: 3, style: { position: 'absolute', left: 0, top: 200, width: 300, height: 100 } }
+                    ] }));
+                }
+            }
+        "#;
+        let drain = |host: &mut Host| {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while host.busy() {
+                assert!(Instant::now() < deadline);
+                host.poll();
+            }
+        };
+
+        // 1. Node 2 has no width/height transitions -> never emits PushSurface.
+        //    Node 3 with max_side=200 (smaller than 300) falls back to clip -> no PushSurface.
+        let mut host = Host::new(script.into(), "{}".into(), TextEngine::default());
+        settle(&mut host);
+        let t0 = host.now();
+        host.render(800., 600., 1., 4096, t0);
+        host.push("resize".into());
+        drain(&mut host);
+        let t1 = host.now();
+        let (f_small_limit, _) = host.render(800., 600., 1., 200, t1 + 100.);
+        assert!(
+            !f_small_limit
+                .items
+                .iter()
+                .any(|item| matches!(item, Item::PushSurface { .. })),
+            "oversized surface must fall back to clip"
+        );
+        // With sufficient max_side, only node 3 crossfades (2 surfaces), never node 2.
+        let (f_ok, _) = host.render(800., 600., 1., 4096, t1 + 100.);
+        let count = f_ok
+            .items
+            .iter()
+            .filter(|item| matches!(item, Item::PushSurface { .. }))
+            .count();
+        assert_eq!(count, 2, "only the node with width/height transitions crossfades");
+
+        // 2. Reduced motion disables crossfade and applies the resize immediately.
+        let mut host_rm = Host::new(script.into(), "{}".into(), TextEngine::default());
+        host_rm.set_reduced_motion(true);
+        settle(&mut host_rm);
+        let t0 = host_rm.now();
+        host_rm.render(800., 600., 1., 4096, t0);
+        host_rm.push("resize".into());
+        drain(&mut host_rm);
+        let t1 = host_rm.now();
+        let (f_rm, _) = host_rm.render(800., 600., 1., 4096, t1);
+        assert!(!f_rm.animating);
+        assert!(
+            !f_rm
+                .items
+                .iter()
+                .any(|item| matches!(item, Item::PushSurface { .. }))
+        );
+        assert_eq!(host_rm.screen_rect(3).unwrap()[2], 300.);
     }
 }

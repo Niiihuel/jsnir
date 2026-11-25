@@ -1420,13 +1420,19 @@ mod tests {
                         edgeWidth: 1.5,
                         edgeSides: [1, 0, 1, 0],
                         mask: "fade-mask",
+                        scaleX: 1.25,
+                        scaleY: 0.75,
+                        resize: "crossfade",
+                        hover: { scaleX: 1.5, scaleY: 0.9 },
                         shadows: [
                             { y: 4, blur: 12, spread: -1, color: 0x00000080 },
                             { y: 1, blur: 3, spread: 0, color: 0x00000040 }
                         ],
                         transitions: [
                             { property: "opacity", duration: 180, delay: 20, hold: 10, easing: "bezier", bezier: [0.2, 0.8, 0.2, 1.0] },
-                            { property: "radius", duration: 240, easing: "spring" }
+                            { property: "radius", duration: 240, easing: "spring" },
+                            { property: "scaleX", duration: 150, easing: "easeOut" },
+                            { property: "scaleY", duration: 160, easing: "linear" }
                         ],
                         animations: [
                             {
@@ -1442,8 +1448,8 @@ mod tests {
                                 ]
                             }
                         ],
-                        starting: { opacity: 0, x: -4, y: 8, scale: 0.95, draw: 0.5 },
-                        exiting: { opacity: 0, x: -120, y: 12, scale: 0.92 },
+                        starting: { opacity: 0, x: -4, y: 8, scale: 0.95, scaleX: 0.8, scaleY: 1.1, draw: 0.5 },
+                        exiting: { opacity: 0, x: -120, y: 12, scale: 0.92, scaleX: 0.7, scaleY: 1.2 },
                         a11y: {
                             role: "dialog",
                             label: "Settings",
@@ -1567,10 +1573,16 @@ mod tests {
                 assert!(style.scroll && style.group);
                 assert_eq!(style.scroll_anchor, tree::ScrollAnchor::End);
                 assert_eq!(paint.mask.as_deref(), Some("fade-mask"));
+                assert_eq!(paint.scale_x, Some(1.25));
+                assert_eq!(paint.scale_y, Some(0.75));
+                assert_eq!(paint.resize, tree::Resize::Crossfade);
+                let hover = paint.hover.as_ref().expect("hover");
+                assert_eq!(hover.scale_x, Some(1.5));
+                assert_eq!(hover.scale_y, Some(0.9));
                 assert_eq!(paint.shadows.len(), 2);
                 assert_eq!(paint.shadows[0].blur, 12.);
                 assert_eq!(paint.shadows[0].spread, -1.);
-                assert_eq!(paint.transitions.len(), 2);
+                assert_eq!(paint.transitions.len(), 4);
                 assert_eq!(paint.transitions[0].property, tree::Property::Opacity);
                 assert_eq!(paint.transitions[0].easing, tree::Easing::Bezier);
                 assert_eq!(paint.transitions[0].bezier, Some([0.2, 0.8, 0.2, 1.0]));
@@ -1579,6 +1591,8 @@ mod tests {
                 assert_eq!(paint.transitions[1].property, tree::Property::Radius);
                 assert_eq!(paint.transitions[1].duration, 240.);
                 assert_eq!(paint.transitions[1].easing, tree::Easing::Spring);
+                assert_eq!(paint.transitions[2].property, tree::Property::ScaleX);
+                assert_eq!(paint.transitions[3].property, tree::Property::ScaleY);
                 let anims = paint.animations.as_ref().expect("animations");
                 assert_eq!(anims.len(), 1);
                 assert_eq!(anims[0].property, tree::Property::Scale);
@@ -1592,12 +1606,16 @@ mod tests {
                 assert_eq!(st.x, Some(-4.));
                 assert_eq!(st.y, Some(8.));
                 assert_eq!(st.scale, Some(0.95));
+                assert_eq!(st.scale_x, Some(0.8));
+                assert_eq!(st.scale_y, Some(1.1));
                 assert_eq!(st.draw, Some(0.5));
                 let ex = paint.exiting.as_ref().expect("exiting");
                 assert_eq!(ex.opacity, Some(0.));
                 assert_eq!(ex.x, Some(-120.));
                 assert_eq!(ex.y, Some(12.));
                 assert_eq!(ex.scale, Some(0.92));
+                assert_eq!(ex.scale_x, Some(0.7));
+                assert_eq!(ex.scale_y, Some(1.2));
                 let a11y = paint.a11y.as_deref().expect("a11y");
                 assert_eq!(a11y.role, Some(tree::A11yRole::Dialog));
                 assert_eq!(a11y.label.as_deref(), Some("Settings"));

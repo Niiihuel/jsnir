@@ -7,8 +7,8 @@
 use crate::tree::{
     A11y, A11yLive, A11yRole, Align, Anchor, AnchorAlign, Animation, Axis, Cursor, Easing, Edges,
     Exiting, Font, Icon, InlineImage, InputPurpose, Justify, Keyframe, Node, Op, Paint,
-    PlacementSubscription, Position, Property, Radius, ScrollAnchor, ScrollEdge, Scrollbar, Shadow,
-    Side, Span, Starting, Style, TextAlign, Transition, Tree, Variant,
+    PlacementSubscription, Position, Property, Radius, Resize, ScrollAnchor, ScrollEdge, Scrollbar,
+    Shadow, Side, Span, Starting, Style, TextAlign, Transition, Tree, Variant,
 };
 
 /// TypeScript type of a value that crosses the boundary.
@@ -380,6 +380,12 @@ fn decode_variant(words: &[u32], i: &mut usize) -> Result<Variant, String> {
     if mask & (1 << 12) != 0 {
         v.cursor = Some(decode_cursor(next_word(words, i)?)?);
     }
+    if mask & (1 << 13) != 0 {
+        v.scale_x = Some(next_f32(words, i)?);
+    }
+    if mask & (1 << 14) != 0 {
+        v.scale_y = Some(next_f32(words, i)?);
+    }
     Ok(v)
 }
 
@@ -533,6 +539,12 @@ fn decode_starting(words: &[u32], i: &mut usize) -> Result<Starting, String> {
         draw: (smask & (1 << 4) != 0)
             .then(|| next_f32(words, i))
             .transpose()?,
+        scale_x: (smask & (1 << 5) != 0)
+            .then(|| next_f32(words, i))
+            .transpose()?,
+        scale_y: (smask & (1 << 6) != 0)
+            .then(|| next_f32(words, i))
+            .transpose()?,
     })
 }
 
@@ -549,6 +561,12 @@ fn decode_exiting(words: &[u32], i: &mut usize) -> Result<Exiting, String> {
             .then(|| next_f32(words, i))
             .transpose()?,
         scale: (emask & (1 << 3) != 0)
+            .then(|| next_f32(words, i))
+            .transpose()?,
+        scale_x: (emask & (1 << 4) != 0)
+            .then(|| next_f32(words, i))
+            .transpose()?,
+        scale_y: (emask & (1 << 5) != 0)
             .then(|| next_f32(words, i))
             .transpose()?,
     })
@@ -689,7 +707,17 @@ fn decode_property(code: u32) -> Result<Property, String> {
         10 => Ok(Property::Width),
         11 => Ok(Property::Height),
         12 => Ok(Property::Radius),
+        13 => Ok(Property::ScaleX),
+        14 => Ok(Property::ScaleY),
         _ => Err(format!("invalid property code {code}")),
+    }
+}
+
+fn decode_resize(code: u32) -> Result<Resize, String> {
+    match code {
+        0 => Ok(Resize::Clip),
+        1 => Ok(Resize::Crossfade),
+        _ => Err(format!("invalid resize code {code}")),
     }
 }
 
@@ -887,6 +915,15 @@ fn decode_paint(words: &[u32], i: &mut usize, strings: &mut [String]) -> Result<
     }
     if mask & (1 << 25) != 0 {
         paint.a11y = Some(Box::new(decode_a11y(words, i, strings)?));
+    }
+    if mask & (1 << 26) != 0 {
+        paint.scale_x = Some(next_f32(words, i)?);
+    }
+    if mask & (1 << 27) != 0 {
+        paint.scale_y = Some(next_f32(words, i)?);
+    }
+    if mask & (1 << 28) != 0 {
+        paint.resize = decode_resize(next_word(words, i)?)?;
     }
     Ok(paint)
 }
