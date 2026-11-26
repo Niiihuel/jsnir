@@ -91,7 +91,7 @@ Whenever you add or modify any field/variant in `Style`, `Paint`, `Node`, `Op`, 
    - Validate all `f32` values with `.is_finite()` (and non-negative bounds where applicable) in `Style::valid()` / `Paint::valid()` / `Tree::apply`.
    - Export any new declaration in `ts_decls()` in dependency order.
 2. **Decode in [src/contract.rs](src/contract.rs):**
-   - Allocate the next unused bit in the binary mask (`Paint` currently uses bits `0..=25`; `Style` uses `0..=16`; `PROP_CODES` uses `0..=12`).
+   - Allocate the next unused bit in the binary mask (`Paint` currently uses bits `0..=30`; `Style` uses `0..=16`; `PROP_CODES` uses `0..=15`).
    - Add the binary decoder function and reject out-of-range enum codes with a descriptive `Err(...)`.
 3. **Encode in [app/sdk.ts](app/sdk.ts):**
    - Add matching code tables and binary writer logic (`tryWritePaint` / `tryWriteStyle` / etc.).

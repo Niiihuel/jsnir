@@ -87,6 +87,18 @@ pub enum Item {
         cache_key: Option<(u64, u64)>,
     },
     PopSurface,
+    /// Blurs what is already drawn below in the current target inside `rect` (cut to `radius`, `clip` and
+    /// `round_clip`) and draws that blurred image, faded by `opacity`, before the node's own paint
+    /// (CSS `backdrop-filter: blur() saturate()`). `blur` is the strength in logical pixels.
+    Backdrop {
+        rect: Rect,
+        radius: Corners,
+        blur: f32,
+        saturation: f32,
+        opacity: f32,
+        clip: Rect,
+        round_clip: Option<(Rect, Corners)>,
+    },
     /// Outer shadow of a rounded rectangle; it is not drawn under the rectangle itself. Not masked. Its blur uses
     /// the largest corner radius: a shadow of unequal corners is approximated.
     Shadow {
@@ -676,6 +688,9 @@ impl QueuedEvent {
 /// only when `paint.exiting.is_some()` (zero cost for all other nodes).
 struct ExitSnapshot {
     items: Vec<Item>,
+    // The node's own `Item::Backdrop`, kept out of `items`: it samples the target below the node's layer.
+    backdrop: Option<Item>,
+    backdrop_blur: f32,
     children_start: usize,
     self_clips: bool,
     self_has_round_clip: bool,
@@ -746,6 +761,7 @@ struct Leaving {
     scale: Option<LeavingChannel>,
     scale_x: Option<LeavingChannel>,
     scale_y: Option<LeavingChannel>,
+    backdrop_blur: Option<LeavingChannel>,
 }
 
 struct LeavingPlan {
@@ -756,9 +772,11 @@ struct LeavingPlan {
     scale: Option<(f32, Transition)>,
     scale_x: Option<(f32, Transition)>,
     scale_y: Option<(f32, Transition)>,
+    backdrop_blur: Option<(f32, Transition)>,
 }
 
-fn plan_leaving(id: u16, paint: &Paint) -> Option<LeavingPlan> {
+// Under reduced motion the backdrop blur keeps its strength while the rest of the node animates out.
+fn plan_leaving(id: u16, paint: &Paint, reduced_motion: bool) -> Option<LeavingPlan> {
     let exiting = paint.exiting.as_ref()?;
     let pick = |prop: Property, target: Option<f32>| -> Option<(f32, Transition)> {
         let to = target?;
@@ -774,12 +792,17 @@ fn plan_leaving(id: u16, paint: &Paint) -> Option<LeavingPlan> {
     let scale = pick(Property::Scale, exiting.scale);
     let scale_x = pick(Property::ScaleX, exiting.scale_x);
     let scale_y = pick(Property::ScaleY, exiting.scale_y);
+    let backdrop_blur = pick(
+        Property::BackdropBlur,
+        exiting.backdrop_blur.filter(|_| !reduced_motion),
+    );
     if opacity.is_none()
         && x.is_none()
         && y.is_none()
         && scale.is_none()
         && scale_x.is_none()
         && scale_y.is_none()
+        && backdrop_blur.is_none()
     {
         return None;
     }
@@ -791,6 +814,7 @@ fn plan_leaving(id: u16, paint: &Paint) -> Option<LeavingPlan> {
         scale,
         scale_x,
         scale_y,
+        backdrop_blur,
     })
 }
 
@@ -880,6 +904,30 @@ fn transform_leaving_item(
             cache_key: *cache_key,
         },
         Item::PopSurface => Item::PopSurface,
+        Item::Backdrop {
+            rect,
+            radius,
+            blur,
+            saturation,
+            opacity,
+            clip,
+            round_clip,
+        } => Item::Backdrop {
+            rect: xform_rect(*rect, center, delta, scale),
+            radius: radius.map(|r| r * s_min),
+            blur: blur * s_min,
+            saturation: *saturation,
+            opacity: *opacity,
+            clip: xform_clip(*clip, parent_clip, child_owned_clip, center, delta, scale),
+            round_clip: xform_round_clip(
+                *round_clip,
+                parent_round_clip,
+                child_owned_round,
+                center,
+                delta,
+                scale,
+            ),
+        },
         Item::Shadow {
             rect,
             radius,
@@ -1139,6 +1187,31 @@ fn emit_leaving(leaving: &Leaving, now: f64, items: &mut Vec<Item>) {
         || delta[1].abs() > 1e-4
         || (rel_sx - 1.).abs() > 1e-4
         || (rel_sy - 1.).abs() > 1e-4;
+    if let Some(backdrop) = &snap.backdrop {
+        let cur_blur = leaving
+            .backdrop_blur
+            .as_ref()
+            .map_or(snap.backdrop_blur, |ch| ch.at(leaving.start, now));
+        let mut backdrop = if needs_xform {
+            transform_leaving_item(
+                backdrop,
+                snap.center,
+                delta,
+                rel_scale,
+                snap.parent_clip,
+                snap.parent_round_clip,
+                false,
+                false,
+            )
+        } else {
+            backdrop.clone()
+        };
+        if let Item::Backdrop { blur, opacity, .. } = &mut backdrop {
+            *blur *= cur_blur.max(0.) / snap.backdrop_blur;
+            *opacity = eff_opacity;
+        }
+        items.push(backdrop);
+    }
     let layer = eff_opacity < 0.999;
     if layer {
         items.push(Item::PushLayer {
@@ -2535,7 +2608,8 @@ impl Host {
                                     .or_else(|| {
                                         self.tree.nodes.get(&node_id).and_then(Node::paint)
                                     })
-                                && let Some(plan) = plan_leaving(node_id, paint)
+                                && let Some(plan) =
+                                    plan_leaving(node_id, paint, self.reduced_motion)
                             {
                                 exit_plans.push(plan);
                             }
@@ -2657,7 +2731,8 @@ impl Host {
                     let scale = make(snap.scale, plan.scale);
                     let scale_x = make(snap.scale_x, plan.scale_x);
                     let scale_y = make(snap.scale_y, plan.scale_y);
-                    let max_ms = [&opacity, &x, &y, &scale, &scale_x, &scale_y]
+                    let backdrop_blur = make(snap.backdrop_blur, plan.backdrop_blur);
+                    let max_ms = [&opacity, &x, &y, &scale, &scale_x, &scale_y, &backdrop_blur]
                         .into_iter()
                         .flatten()
                         .map(LeavingChannel::end_offset_ms)
@@ -2672,6 +2747,7 @@ impl Host {
                         scale,
                         scale_x,
                         scale_y,
+                        backdrop_blur,
                     });
                 }
             }
@@ -5166,6 +5242,11 @@ fn seed_motion_from_paint(motion: &mut Motion, id: u16, paint: &Paint, v: &Varia
     motion.seed(id, Property::ScaleY, Value::Number(scale_y));
     motion.seed(id, Property::Brightness, Value::Number(brightness));
     motion.seed(id, Property::Draw, Value::Number(draw));
+    motion.seed(
+        id,
+        Property::BackdropBlur,
+        Value::Number(paint.backdrop_blur.unwrap_or(0.)),
+    );
     motion.seed(id, Property::Left, Value::Number(rect[0]));
     motion.seed(id, Property::Width, Value::Number(width));
     motion.seed(id, Property::Height, Value::Number(height));
@@ -5528,6 +5609,7 @@ struct Shown {
     radius: [f32; 4],
     underline: bool,
     looping: bool,
+    backdrop_blur: f32,
 }
 
 impl<'a> Walker<'a> {
@@ -5717,6 +5799,7 @@ impl<'a> Walker<'a> {
         let (x, y) = (v.x.unwrap_or(paint.x), v.y.unwrap_or(paint.y));
         let text_color = v.color.or(paint.color);
         let draw_base = paint.draw.unwrap_or(1.);
+        let backdrop_blur = paint.backdrop_blur.unwrap_or(0.);
         let width_base = v.width.unwrap_or(rect[2]);
         let is_crossfade = paint.resize == Resize::Crossfade;
         let height_base = if is_crossfade {
@@ -5753,6 +5836,7 @@ impl<'a> Walker<'a> {
                 radius: paint.radius.corners().map(|r| r.max(0.)),
                 underline: v.underline.unwrap_or(false),
                 looping: false,
+                backdrop_blur,
             };
         }
 
@@ -5771,8 +5855,17 @@ impl<'a> Walker<'a> {
                 (Property::ScaleX, starting.scale_x, scale_x),
                 (Property::ScaleY, starting.scale_y, scale_y),
                 (Property::Draw, starting.draw, draw_base),
+                (
+                    Property::BackdropBlur,
+                    starting.backdrop_blur,
+                    backdrop_blur,
+                ),
             ];
             for (property, start, target) in from {
+                // Reduced motion shows the final blur at once; the blur itself still renders.
+                if reduced && property == Property::BackdropBlur {
+                    continue;
+                }
                 if let (Some(start), Some(t)) = (start, transition(paint, property)) {
                     motion.start(
                         id,
@@ -5827,6 +5920,7 @@ impl<'a> Walker<'a> {
         let scale_y = number(Property::ScaleY, scale_y, false);
         let brightness = number(Property::Brightness, brightness, false);
         let draw = number(Property::Draw, draw_base, false);
+        let backdrop_blur = number(Property::BackdropBlur, backdrop_blur, reduced);
         let left = number(Property::Left, rect[0], false);
         // For `resize: "crossfade"`, reduced motion or an active ancestor crossfade snaps size
         // targets immediately so there is no crossfade under reduced motion and no double-resize
@@ -5894,6 +5988,7 @@ impl<'a> Walker<'a> {
             target_size: [width_base, height_base],
             radius,
             underline: v.underline.unwrap_or(false),
+            backdrop_blur,
         }
     }
 
@@ -6056,24 +6151,8 @@ impl<'a> Walker<'a> {
         }
         let prev_opacity = self.group_opacity;
         self.group_opacity = prev_opacity * shown.opacity;
-        let layer = shown.opacity < 0.999
-            && (visible || has_children || !paint.shadows.is_empty());
-        if layer {
-            self.items.push(Item::PushLayer {
-                opacity: shown.opacity,
-            });
-        }
-        let exit_start = paint.exiting.is_some().then(|| self.items.len());
         let clip = ctx.clip;
         let round_clip = ctx.round_clip;
-        // The root of a layer covers what is below it, even where it reacts to nothing.
-        if visible && self.layer_root == Some(id) {
-            self.hits.push(Hit {
-                rect: on_screen,
-                id,
-                layer: self.layer,
-            });
-        }
         // Under non-uniform scale (`kx != ky`), corner radii approximate ellipticity with `min(kx, ky)`.
         let k_min = inner.k_min();
         let radius = shown.radius.map(|r| r.max(0.) * k_min);
@@ -6085,6 +6164,37 @@ impl<'a> Walker<'a> {
             .map(|source| self.images.get(source).cloned());
         let hidden = matches!(mask_entry, Some(None));
         let mask_img = mask_entry.flatten();
+        // The backdrop goes before the node's own layer, so it blurs the target below the node and the
+        // node's opacity fades it like the rest of the node.
+        let backdrop =
+            (!hidden && visible && shown.backdrop_blur * k_min > 0.).then(|| Item::Backdrop {
+                rect: screen,
+                radius,
+                blur: shown.backdrop_blur * k_min,
+                saturation: paint.backdrop_saturation.unwrap_or(1.),
+                opacity: shown.opacity,
+                clip,
+                round_clip,
+            });
+        if let Some(item) = &backdrop {
+            self.items.push(item.clone());
+        }
+        let layer = shown.opacity < 0.999
+            && (visible || has_children || !paint.shadows.is_empty());
+        if layer {
+            self.items.push(Item::PushLayer {
+                opacity: shown.opacity,
+            });
+        }
+        let exit_start = paint.exiting.is_some().then(|| self.items.len());
+        // The root of a layer covers what is below it, even where it reacts to nothing.
+        if visible && self.layer_root == Some(id) {
+            self.hits.push(Hit {
+                rect: on_screen,
+                id,
+                layer: self.layer,
+            });
+        }
         if !hidden && !paint.shadows.is_empty() {
             for shadow in &paint.shadows {
                 let Shadow {
@@ -6999,7 +7109,7 @@ impl<'a> Walker<'a> {
             );
         }
         if let Some(start) = exit_start
-            && self.items.len() > start
+            && (self.items.len() > start || backdrop.is_some())
         {
             let mut snap_items = self.items[start..].to_vec();
             for item in &mut snap_items {
@@ -7012,6 +7122,8 @@ impl<'a> Walker<'a> {
                 id,
                 ExitSnapshot {
                     items: snap_items,
+                    backdrop,
+                    backdrop_blur: shown.backdrop_blur,
                     children_start: exit_children_start.unwrap_or(0),
                     self_clips,
                     self_has_round_clip,
@@ -11621,5 +11733,142 @@ mount(ResizeApp);
                 .any(|item| matches!(item, Item::PushSurface { .. }))
         );
         assert_eq!(host_rm.screen_rect(3).unwrap()[2], 300.);
+    }
+
+    fn backdrops(frame: &Frame) -> Vec<(Rect, Corners, f32, f32, f32)> {
+        frame
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Backdrop {
+                    rect,
+                    radius,
+                    blur,
+                    saturation,
+                    opacity,
+                    ..
+                } => Some((*rect, *radius, *blur, *saturation, *opacity)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn backdrop_blur_comes_before_the_node_layer_and_fill_with_the_transformed_rect() {
+        let script = r#"
+            function jsnirMount() {
+                jsnir.batch(JSON.stringify({ ops: [
+                    { op: 'create', id: 1, node: { kind: 'box', style: { width: 400, height: 200 } } },
+                    { op: 'create', id: 2, parent: 1, node: {
+                        kind: 'box',
+                        style: { position: 'absolute', left: 100, top: 50, width: 100, height: 60 },
+                        paint: {
+                            background: 0x33445580, radius: 8, scale: 2, opacity: 0.5,
+                            backdropBlur: 10, backdropSaturation: 1.5
+                        }
+                    } },
+                    { op: 'create', id: 3, parent: 1, node: {
+                        kind: 'box',
+                        style: { position: 'absolute', left: 0, top: 0, width: 50, height: 50 },
+                        paint: { background: 0x112233ff, backdropBlur: 0 }
+                    } }
+                ] }));
+            }
+            function jsnirEvent() {}
+        "#;
+        let mut host = Host::new(script.into(), "{}".into(), TextEngine::default());
+        settle(&mut host);
+        let t0 = host.now();
+        let (f, _) = host.render(400., 200., 1., 4096, t0);
+        // Only node 2 blurs: strength 0 emits nothing.
+        let found = backdrops(&f);
+        assert_eq!(found.len(), 1, "{found:?}");
+        let (rect, radius, blur, saturation, opacity) = found[0];
+        // [100, 50, 100, 60] scaled by 2 around its center (150, 80) => [50, 20, 200, 120].
+        assert_eq!(rect, [50., 20., 200., 120.]);
+        assert_eq!(radius, [16.; 4]);
+        assert_eq!(blur, 20.);
+        assert_eq!(saturation, 1.5);
+        assert_eq!(opacity, 0.5);
+        let at = |pred: &dyn Fn(&Item) -> bool| f.items.iter().position(pred).unwrap();
+        let backdrop = at(&|i| matches!(i, Item::Backdrop { .. }));
+        let layer = at(&|i| matches!(i, Item::PushLayer { .. }));
+        let fill = at(&|i| {
+            matches!(
+                i,
+                Item::Fill {
+                    top: [0x33, 0x44, 0x55, 0x80],
+                    ..
+                }
+            )
+        });
+        assert!(
+            backdrop < layer && layer < fill,
+            "{backdrop} {layer} {fill}"
+        );
+    }
+
+    #[test]
+    fn backdrop_blur_transitions_and_keeps_animating_while_exiting() {
+        let script = r#"
+            function jsnirMount() {
+                jsnir.batch(JSON.stringify({ ops: [
+                    { op: 'create', id: 1, node: { kind: 'box', style: { width: 400, height: 200 } } },
+                    { op: 'create', id: 2, parent: 1, node: {
+                        kind: 'box',
+                        style: { position: 'absolute', left: 0, top: 0, width: 100, height: 100 },
+                        paint: {
+                            background: 0x00000040, backdropBlur: 0,
+                            exiting: { backdropBlur: 0 },
+                            transitions: [{ property: 'backdropBlur', duration: 200, easing: 'linear' }]
+                        }
+                    } }
+                ] }));
+            }
+            function jsnirEvent(_cb, text) {
+                if (text === 'blur') {
+                    jsnir.batch(JSON.stringify({ ops: [{ op: 'setpaint', id: 2, paint: {
+                        background: 0x00000040, backdropBlur: 20,
+                        exiting: { backdropBlur: 0 },
+                        transitions: [{ property: 'backdropBlur', duration: 200, easing: 'linear' }]
+                    } }] }));
+                } else if (text === 'remove') {
+                    jsnir.batch(JSON.stringify({ ops: [{ op: 'remove', id: 2 }] }));
+                }
+            }
+        "#;
+        let mut host = Host::new(script.into(), "{}".into(), TextEngine::default());
+        settle(&mut host);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let send = |host: &mut Host, text: &str| {
+            host.push(text.into());
+            while host.busy() {
+                assert!(Instant::now() < deadline);
+                host.poll();
+            }
+        };
+        send(&mut host, "blur");
+        let t0 = host.now();
+        let (f, _) = host.render(400., 200., 1., 4096, t0);
+        assert!(backdrops(&f).is_empty(), "the blur starts from 0");
+        let (f, _) = host.render(400., 200., 1., 4096, t0 + 100.);
+        let mid = backdrops(&f);
+        assert_eq!(mid.len(), 1);
+        assert!((mid[0].2 - 10.).abs() < 0.5, "{mid:?}");
+        let (f, _) = host.render(400., 200., 1., 4096, t0 + 400.);
+        assert_eq!(backdrops(&f)[0].2, 20.);
+        assert!(host.exit_snapshots.contains_key(&2));
+
+        send(&mut host, "remove");
+        assert_eq!(host.leaving.len(), 1);
+        let start = host.leaving[0].start;
+        let (f, _) = host.render(400., 200., 1., 4096, start + 100.);
+        assert!(f.animating);
+        let leaving = backdrops(&f);
+        assert_eq!(leaving.len(), 1, "{leaving:?}");
+        assert!((leaving[0].2 - 10.).abs() < 0.5, "{leaving:?}");
+        assert_eq!(leaving[0].0, [0., 0., 100., 100.]);
+        let (f, _) = host.render(400., 200., 1., 4096, start + 400.);
+        assert!(backdrops(&f).is_empty());
     }
 }

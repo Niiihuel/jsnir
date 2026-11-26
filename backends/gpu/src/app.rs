@@ -965,6 +965,34 @@ mod tests {
         assert!(pixel.iter().all(|&c| c.abs_diff(64) <= 1), "{pixel:?}");
     }
 
+    // A box with `backdropBlur` over a red | blue split, captured at scale 2: the blur mixes the colors
+    // next to the split inside the box and leaves everything outside it as drawn.
+    #[test]
+    fn a_capture_blurs_the_backdrop_of_a_box() {
+        let script = r#"function jsnirMount() { jsnir.batch(JSON.stringify({ ops: [
+            { op: 'create', id: 1, node: { kind: 'box', style: { direction: 'row' } } },
+            { op: 'create', id: 2, parent: 1, node: { kind: 'box', style: { width: 20, height: 20 }, paint: { background: 0xff0000ff } } },
+            { op: 'create', id: 3, parent: 1, node: { kind: 'box', style: { width: 20, height: 20 }, paint: { background: 0x0000ffff } } },
+            { op: 'create', id: 4, parent: 1, node: { kind: 'box',
+                style: { position: 'absolute', left: 10, top: 5, width: 20, height: 10 }, paint: { backdropBlur: 3 } } },
+        ] })); }"#;
+        let host = Host::new(script.into(), "{}".into(), TextEngine::default());
+        let path = std::env::temp_dir().join(format!("jsnir-backdrop-{}.ppm", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        capture_at(host, [40, 20], 2., false, &path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let body = &bytes[bytes.len() - 80 * 40 * 3..];
+        let at = |x: usize, y: usize| &body[(y * 80 + x) * 3..][..3];
+        for x in [38, 41] {
+            let [r, _, b] = at(x, 20) else { unreachable!() };
+            assert!(*r > 40 && *b > 40, "{x}: {:?}", at(x, 20));
+        }
+        assert_eq!(at(38, 4), [255, 0, 0]);
+        assert_eq!(at(41, 35), [0, 0, 255]);
+        assert_eq!(at(10, 20), [255, 0, 0]);
+    }
+
     // A 40 by 40 device-pixel image at logical x 10.3 (device 20.6) is drawn at device 21, and its alpha mask, which
     // alternates columns, must move with it: each column of the image is red exactly where the mask is opaque.
     #[test]

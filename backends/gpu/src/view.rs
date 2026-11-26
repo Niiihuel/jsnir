@@ -275,6 +275,23 @@ impl View {
                     }
                 }
                 Item::PopSurface => draws.push(Draw::PopSurface),
+                Item::Backdrop {
+                    rect,
+                    radius,
+                    blur,
+                    saturation,
+                    opacity,
+                    clip,
+                    round_clip,
+                } => draws.push(Draw::Backdrop {
+                    rect,
+                    radius,
+                    blur,
+                    saturation,
+                    opacity,
+                    clip,
+                    round_clip,
+                }),
                 Item::Shadow {
                     rect,
                     radius,

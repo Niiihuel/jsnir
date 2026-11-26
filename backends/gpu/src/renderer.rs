@@ -1,6 +1,6 @@
-//! A small wgpu renderer: instanced rounded quads (fills, gradients, images, inner and outer shadows)
-//! and opacity layers. It renders in the target's encoded color space, as browsers blend, so
-//! semi-transparent colors look the same as in CSS.
+//! A small wgpu renderer: instanced rounded quads (fills, gradients, images, inner and outer shadows),
+//! opacity layers and backdrop blur. It renders in the target's encoded color space, as browsers
+//! blend, so semi-transparent colors look the same as in CSS.
 use bytemuck::{Pod, Zeroable};
 use jsnir::{host::Corners, text::TextBitmap};
 use std::{
@@ -21,6 +21,21 @@ const WHITE: Color = [255; 4];
 const WHITE_TEX_ID: u64 = 1;
 const ATLAS_TEX_ID: u64 = 2;
 const FIRST_DYNAMIC_TEX_ID: u64 = 3;
+// Layers, surfaces and blur levels: drawn into, sampled, and copied from and into by a backdrop blur.
+const TARGET_USAGE: wgpu::TextureUsages = wgpu::TextureUsages::RENDER_ATTACHMENT
+    .union(wgpu::TextureUsages::TEXTURE_BINDING)
+    .union(wgpu::TextureUsages::COPY_SRC)
+    .union(wgpu::TextureUsages::COPY_DST);
+// Dither added to the blurred backdrop against banding (fraction of full scale).
+const BACKDROP_NOISE: f32 = 0.02;
+// Blur textures are allocated in steps of this many pixels, so a rectangle that animates its size reuses them.
+const BLUR_STEP: u32 = 64;
+// Bytes of one blur pass's parameters (`Params` in blur.wgsl).
+const BLUR_PARAMS_SIZE: u64 = 48;
+// One blur pass's parameters, padded to 256 bytes: the largest uniform offset alignment a device can require.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct BlurParams([[f32; 4]; 16]);
 
 /// Per-frame GPU rendering telemetry recorded by [`Renderer::draw`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -96,7 +111,35 @@ pub enum Draw {
         cache_key: Option<(u64, u64)>,
     },
     PopSurface,
+    /// Blurs what is already drawn in the current target inside `rect` (dual Kawase, see [`kawase`]),
+    /// saturates it, and draws it back over `rect` cut to `radius`, `clip` and `round_clip`, faded by
+    /// `opacity`. `blur` is the strength in logical pixels. Skipped where the target cannot be copied.
+    Backdrop {
+        rect: Rect,
+        radius: Corners,
+        blur: f32,
+        saturation: f32,
+        opacity: f32,
+        clip: Rect,
+        round_clip: Option<(Rect, Corners)>,
+    },
 }
+
+/// Dual Kawase passes and diagonal tap offset (in source pixels) for a blur of `radius` device pixels.
+/// Each pass halves the resolution, so the blur grows as `offset * 2^passes`: measured on a sharp edge,
+/// the result spreads like a Gaussian of standard deviation `1.5 * offset * 2^passes` pixels. With
+/// `radius / 1.5 = offset * 2^passes`, passes go from 1 to 6 and the offset stays in [1, 2) (below 1 for
+/// radii under 3 px, growing up to 4 past 192 px), so the blur is monotonic in `radius` and its
+/// standard deviation is about `radius`, as CSS `blur()`.
+pub fn kawase(radius: f32) -> (u32, f32) {
+    let scaled = radius.max(0.) / KAWASE_SIGMA;
+    let passes = scaled.log2().floor().clamp(1., 6.) as u32;
+    let offset = (scaled / (1u32 << passes) as f32).clamp(0., 4.);
+    (passes, offset)
+}
+
+// Measured standard deviation of the blur per pixel of `offset * 2^passes`.
+const KAWASE_SIGMA: f32 = 1.5;
 
 impl Draw {
     pub fn fill(rect: Rect, clip: Rect, color: Color) -> Self {
@@ -243,7 +286,7 @@ struct Quad {
 
 // Offscreen texture for one nesting level of layers.
 struct Layer {
-    _texture: wgpu::Texture,
+    texture: wgpu::Texture,
     view: wgpu::TextureView,
     bindings: wgpu::BindGroup,
     texture_id: u64,
@@ -459,6 +502,18 @@ struct CachedSurface {
     last_used: u64,
 }
 
+// Textures of a backdrop blur: level 0 holds the copied backdrop and the result, level `i` is half of `i - 1`.
+// Kept between frames by size, as long as a frame uses them.
+struct BlurChain {
+    levels: Vec<Layer>,
+    last_used: u64,
+}
+
+// Size of level `level` of a blur of `size` pixels.
+fn blur_level([w, h]: [u32; 2], level: u32) -> [u32; 2] {
+    [w.div_ceil(1 << level).max(1), h.div_ceil(1 << level).max(1)]
+}
+
 enum BatchCmd {
     Draw {
         instances: Range<u32>,
@@ -484,6 +539,17 @@ enum BatchCmd {
         source: TargetRef,
         composite: Option<(u32, [u32; 4], bool)>,
     },
+    // Copies `region` (device pixels) of `target` into the blur chain `chain`, runs `passes` down and up
+    // passes with the parameters from `params`, then erases and refills the backdrop with quad `erase`.
+    Backdrop {
+        target: TargetRef,
+        region: [u32; 4],
+        chain: [u32; 2],
+        passes: u32,
+        params: u32,
+        erase: u32,
+        scissor: [u32; 4],
+    },
 }
 
 pub struct Renderer {
@@ -491,6 +557,14 @@ pub struct Renderer {
     pub queue: wgpu::Queue,
     pipeline: wgpu::RenderPipeline,
     additive_pipeline: wgpu::RenderPipeline,
+    // `dst * (1 - src.a)`: clears where a backdrop is drawn back, so it replaces the target, translucent or not.
+    erase_pipeline: wgpu::RenderPipeline,
+    blur_pipeline: wgpu::RenderPipeline,
+    blur_layout: wgpu::BindGroupLayout,
+    blur_uniforms: wgpu::Buffer,
+    blur_bindings: wgpu::BindGroup,
+    blur_chains: HashMap<[u32; 2], BlurChain>,
+    blur_params: Vec<BlurParams>,
     // Shared by the image (group 0) and the mask (group 1) of every quad.
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
@@ -602,6 +676,67 @@ impl Renderer {
                 },
             },
         );
+        let erase_pipeline = make_pipeline(
+            "Quads erase",
+            wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::Zero,
+                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                    operation: wgpu::BlendOperation::Add,
+                },
+                alpha: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::Zero,
+                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                    operation: wgpu::BlendOperation::Add,
+                },
+            },
+        );
+        let blur_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("JSNIR blur params"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: true,
+                    min_binding_size: wgpu::BufferSize::new(BLUR_PARAMS_SIZE),
+                },
+                count: None,
+            }],
+        });
+        let blur_shader = device.create_shader_module(wgpu::include_wgsl!("blur.wgsl"));
+        let blur_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Blur"),
+            layout: Some(
+                &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("Blur"),
+                    bind_group_layouts: &[Some(&layout), Some(&blur_layout)],
+                    immediate_size: 0,
+                }),
+            ),
+            vertex: wgpu::VertexState {
+                module: &blur_shader,
+                entry_point: Some("vertex"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &blur_shader,
+                entry_point: Some("fragment"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let (blur_uniforms, blur_bindings) = Self::blur_buffer(&device, &blur_layout, 16);
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
@@ -623,6 +758,13 @@ impl Renderer {
             queue,
             pipeline,
             additive_pipeline,
+            erase_pipeline,
+            blur_pipeline,
+            blur_layout,
+            blur_uniforms,
+            blur_bindings,
+            blur_chains: HashMap::new(),
+            blur_params: Vec::new(),
             layout,
             sampler,
             format,
@@ -657,6 +799,40 @@ impl Renderer {
     /// Packs a bitmap into the persistent texture atlas so it batches with fills, icons, and other text.
     pub fn atlas_image(&mut self, bitmap: &TextBitmap) -> AtlasAlloc {
         self.atlas.allocate(&self.queue, bitmap)
+    }
+
+    /// Whether a frame drawn into `target` can blur its backdrop: the texture must allow copies from it
+    /// (`COPY_SRC`). Layers and surfaces always do; a backdrop drawn straight into a target that does
+    /// not is skipped.
+    pub fn supports_backdrop(target: &wgpu::Texture) -> bool {
+        target.usage().contains(wgpu::TextureUsages::COPY_SRC)
+    }
+
+    // Uniforms for `count` blur passes, one per `BlurParams` slot.
+    fn blur_buffer(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        count: usize,
+    ) -> (wgpu::Buffer, wgpu::BindGroup) {
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Blur params"),
+            size: (size_of::<BlurParams>() * count) as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bindings = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Blur params"),
+            layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &buffer,
+                    offset: 0,
+                    size: wgpu::BufferSize::new(BLUR_PARAMS_SIZE),
+                }),
+            }],
+        });
+        (buffer, bindings)
     }
 
     fn buffer(device: &wgpu::Device, count: usize) -> wgpu::Buffer {
@@ -781,14 +957,14 @@ impl Renderer {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: self.format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: TARGET_USAGE,
             view_formats: &[],
         });
         let view = texture.create_view(&Default::default());
         let bindings = Self::bind(&self.device, &self.layout, &self.sampler, &view);
         let texture_id = self.next_texture_id.fetch_add(1, Ordering::Relaxed);
         Layer {
-            _texture: texture,
+            texture,
             view,
             bindings,
             texture_id,
@@ -930,6 +1106,8 @@ impl Renderer {
         self.quads.clear();
         self.batches.clear();
         self.opacities.clear();
+        self.blur_params.clear();
+        let root_copies = Self::supports_backdrop(target);
 
         let mut target_stack = vec![TargetFrame {
             target: TargetRef::Root,
@@ -1001,6 +1179,114 @@ impl Renderer {
                         }
                     }
                 }
+                Draw::Backdrop {
+                    rect,
+                    radius,
+                    blur,
+                    saturation,
+                    opacity,
+                    clip,
+                    round_clip,
+                } => {
+                    let cur = *target_stack.last().unwrap();
+                    let alpha = opacity.clamp(0., 1.);
+                    let strength = blur * scale;
+                    let copies = cur.target != TargetRef::Root || root_copies;
+                    if !(strength > 0. && alpha > 0.001 && copies) {
+                        continue;
+                    }
+                    // What shows of the rectangle, in device pixels of the target.
+                    let shown = intersect(*rect, *clip);
+                    let Some(sc) = scissor(shift_clip(shown, cur.origin), cur.size, scale) else {
+                        continue;
+                    };
+                    // The blur reads around what shows: the support of every tap of every pass.
+                    let (passes, offset) = kawase(strength);
+                    let reach = ((5. * offset + 3.) * ((1u32 << passes) - 1) as f32).ceil() as u32;
+                    let [w, h] = cur.size;
+                    let (x0, y0) = (sc[0].saturating_sub(reach), sc[1].saturating_sub(reach));
+                    let x1 = (sc[0] + sc[2]).saturating_add(reach).min(w);
+                    let y1 = (sc[1] + sc[3]).saturating_add(reach).min(h);
+                    let region = [x0, y0, x1 - x0, y1 - y0];
+                    let chain = [region[2], region[3]]
+                        .map(|side| side.next_multiple_of(BLUR_STEP).min(max_dim));
+                    let have = self
+                        .blur_chains
+                        .get(&chain)
+                        .map_or(0, |c| c.levels.len() as u32);
+                    let more: Vec<Layer> = (have..=passes)
+                        .map(|level| self.create_layer("JSNIR blur", blur_level(chain, level)))
+                        .collect();
+                    let entry = self.blur_chains.entry(chain).or_insert(BlurChain {
+                        levels: Vec::new(),
+                        last_used: frame_id,
+                    });
+                    entry.levels.extend(more);
+                    entry.last_used = frame_id;
+                    let params = self.blur_params.len() as u32;
+                    for step in 0..2 * passes {
+                        let down = step < passes;
+                        let src = if down { step } else { 2 * passes - step };
+                        let size = blur_level(chain, src).map(|side| side as f32);
+                        let used = blur_level([region[2], region[3]], src).map(|side| side as f32);
+                        let last = step + 1 == 2 * passes;
+                        let mut slot = BlurParams::zeroed();
+                        slot.0[0] = [1. / size[0], 1. / size[1], 0.5 / size[0], 0.5 / size[1]];
+                        slot.0[1] = [
+                            (used[0] - 0.5) / size[0],
+                            (used[1] - 0.5) / size[1],
+                            if down { 2. } else { 0.5 },
+                            offset,
+                        ];
+                        slot.0[2] = [
+                            x0 as f32,
+                            y0 as f32,
+                            if last { *saturation } else { 1. },
+                            if last { BACKDROP_NOISE } else { 0. },
+                        ];
+                        self.blur_params.push(slot);
+                    }
+                    // Erases the backdrop under the shape, then adds the blurred one: an exact replacement.
+                    let tint = [255, 255, 255, (alpha * 255.).round() as u8];
+                    let shape = Shape {
+                        rect: *rect,
+                        clip: *clip,
+                        round_clip: *round_clip,
+                        color: tint,
+                        end_color: tint,
+                        uv: [0., 0., 1., 1.],
+                        radius: *radius,
+                        image: None,
+                        mask: None,
+                        mode: Mode::Fill,
+                    };
+                    let [ox, oy] = [x0, y0].map(|v| v as f32);
+                    let [cw, ch] = chain.map(|side| side as f32);
+                    let [lx, ly] = [
+                        (rect[0] - cur.origin[0]) * scale,
+                        (rect[1] - cur.origin[1]) * scale,
+                    ];
+                    let uv = [
+                        (lx - ox) / cw,
+                        (ly - oy) / ch,
+                        (lx + rect[2] * scale - ox) / cw,
+                        (ly + rect[3] * scale - oy) / ch,
+                    ];
+                    let erase = self.quads.len() as u32;
+                    self.quads
+                        .push(build_quad(&shape, white_uv, cur.origin, cur.size));
+                    self.quads
+                        .push(build_quad(&shape, uv, cur.origin, cur.size));
+                    self.batches.push(BatchCmd::Backdrop {
+                        target: cur.target,
+                        region,
+                        chain,
+                        passes,
+                        params,
+                        erase,
+                        scissor: sc,
+                    });
+                }
                 Draw::PushLayer { opacity } => {
                     self.opacities.push(*opacity);
                     let cur = *target_stack.last().unwrap();
@@ -1022,15 +1308,14 @@ impl Renderer {
                                 sample_count: 1,
                                 dimension: wgpu::TextureDimension::D2,
                                 format,
-                                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                                usage: TARGET_USAGE,
                                 view_formats: &[],
                             });
                             let view = texture.create_view(&Default::default());
                             let bindings = Self::bind(device, layout, sampler, &view);
                             let texture_id = next_id.fetch_add(1, Ordering::Relaxed);
                             Layer {
-                                _texture: texture,
+                                texture,
                                 view,
                                 bindings,
                                 texture_id,
@@ -1182,15 +1467,14 @@ impl Renderer {
                                     sample_count: 1,
                                     dimension: wgpu::TextureDimension::D2,
                                     format,
-                                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                                        | wgpu::TextureUsages::TEXTURE_BINDING,
+                                    usage: TARGET_USAGE,
                                     view_formats: &[],
                                 });
                                 let view = texture.create_view(&Default::default());
                                 let bindings = Self::bind(device, layout, sampler, &view);
                                 let texture_id = next_id.fetch_add(1, Ordering::Relaxed);
                                 Layer {
-                                    _texture: texture,
+                                    texture,
                                     view,
                                     bindings,
                                     texture_id,
@@ -1279,6 +1563,17 @@ impl Renderer {
         if !bytes.is_empty() {
             self.queue.write_buffer(&self.instances, 0, bytes);
         }
+        if !self.blur_params.is_empty() {
+            let bytes = bytemuck::cast_slice(&self.blur_params);
+            if bytes.len() as u64 > self.blur_uniforms.size() {
+                (self.blur_uniforms, self.blur_bindings) = Self::blur_buffer(
+                    &self.device,
+                    &self.blur_layout,
+                    self.blur_params.len().next_power_of_two(),
+                );
+            }
+            self.queue.write_buffer(&self.blur_uniforms, 0, bytes);
+        }
         let target_view = target.create_view(&wgpu::TextureViewDescriptor {
             format: Some(self.format),
             ..Default::default()
@@ -1313,6 +1608,14 @@ impl Renderer {
                 TargetRef::Layer(i) => &layers[i].view,
                 TargetRef::TransientSurface(i) => &surfaces[i].view,
                 TargetRef::CachedSurface(k) => &surface_cache[&k].layer.view,
+            }
+        };
+        let texture_of = |t: TargetRef| -> &wgpu::Texture {
+            match t {
+                TargetRef::Root => target,
+                TargetRef::Layer(i) => &layers[i].texture,
+                TargetRef::TransientSurface(i) => &surfaces[i].texture,
+                TargetRef::CachedSurface(k) => &surface_cache[&k].layer.texture,
             }
         };
         let layer_of = |t: TargetRef| -> &Layer {
@@ -1421,6 +1724,72 @@ impl Renderer {
                     pass.draw(0..4, 0..1);
                     stats.draw_calls += 1;
                 }
+                BatchCmd::Backdrop {
+                    target: dst,
+                    region,
+                    chain,
+                    passes,
+                    params,
+                    erase,
+                    scissor: rect,
+                } => {
+                    drop(pass);
+                    let levels = &self.blur_chains[chain].levels;
+                    encoder.copy_texture_to_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: texture_of(*dst),
+                            mip_level: 0,
+                            origin: wgpu::Origin3d {
+                                x: region[0],
+                                y: region[1],
+                                z: 0,
+                            },
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        levels[0].texture.as_image_copy(),
+                        extent([region[2], region[3]]),
+                    );
+                    for step in 0..2 * passes {
+                        let (src, out) = if step < *passes {
+                            (step, step + 1)
+                        } else {
+                            (2 * passes - step, 2 * passes - step - 1)
+                        };
+                        let [w, h] = blur_level([region[2], region[3]], out);
+                        let mut blur = begin(
+                            &mut encoder,
+                            &levels[out as usize].view,
+                            Some(wgpu::Color::TRANSPARENT),
+                        );
+                        blur.set_pipeline(&self.blur_pipeline);
+                        blur.set_bind_group(0, &levels[src as usize].bindings, &[]);
+                        let at = (params + step) as u64 * size_of::<BlurParams>() as u64;
+                        blur.set_bind_group(1, &self.blur_bindings, &[at as u32]);
+                        blur.set_scissor_rect(0, 0, w, h);
+                        blur.draw(0..3, 0..1);
+                        stats.draw_calls += 1;
+                    }
+                    pass = begin(&mut encoder, view_of(*dst), None);
+                    pass.set_scissor_rect(rect[0], rect[1], rect[2], rect[3]);
+                    pass.set_bind_group(1, &self.white.bindings, &[]);
+                    for (pipeline, quad, image) in [
+                        (&self.erase_pipeline, *erase, &self.atlas.bindings),
+                        (&self.additive_pipeline, erase + 1, &levels[0].bindings),
+                    ] {
+                        let offset = u64::from(quad) * stride;
+                        pass.set_pipeline(pipeline);
+                        pass.set_vertex_buffer(0, self.instances.slice(offset..offset + stride));
+                        pass.set_bind_group(0, image, &[]);
+                        pass.draw(0..4, 0..1);
+                    }
+                    stats.draw_calls += 2;
+                    stats.scissor_switches += 1;
+                    stats.bind_group_switches += 3;
+                    cur_scissor = Some(*rect);
+                    cur_img = Some(levels[0].texture_id);
+                    cur_mask = Some(WHITE_TEX_ID);
+                    cur_additive = true;
+                }
                 BatchCmd::PushTarget { target } => {
                     drop(pass);
                     pass = begin(&mut encoder, view_of(*target), Some(wgpu::Color::TRANSPARENT));
@@ -1476,6 +1845,10 @@ impl Renderer {
         }
         if !used_transient_surface && !self.surfaces.is_empty() {
             self.surfaces.clear();
+        }
+        if !self.blur_chains.is_empty() {
+            self.blur_chains
+                .retain(|_, chain| chain.last_used == frame_id);
         }
     }
 
@@ -1567,6 +1940,14 @@ fn extent([width, height]: [u32; 2]) -> wgpu::Extent3d {
         height,
         depth_or_array_layers: 1,
     }
+}
+
+fn intersect(a: Rect, b: Rect) -> Rect {
+    let x = a[0].max(b[0]);
+    let y = a[1].max(b[1]);
+    let right = (a[0] + a[2]).min(b[0] + b[2]);
+    let bottom = (a[1] + a[3]).min(b[1] + b[3]);
+    [x, y, (right - x).max(0.), (bottom - y).max(0.)]
 }
 
 fn scissor([x, y, w, h]: Rect, [width, height]: [u32; 2], scale: f32) -> Option<[u32; 4]> {
@@ -1853,5 +2234,125 @@ mod tests {
             .read([60, 60], 1., &[Draw::fill(screen, screen, green)])
             .unwrap();
         assert_eq!(renderer.cached_surface_count(), 0);
+    }
+
+    #[test]
+    fn a_backdrop_blurs_only_inside_its_rounded_rectangle() {
+        let mut renderer = renderer();
+        let blue = [0, 0, 255, 255];
+        let screen = [0., 0., 60., 40.];
+        let split = [
+            Draw::fill([0., 0., 30., 40.], screen, RED),
+            Draw::fill([30., 0., 30., 40.], screen, blue),
+        ];
+        let backdrop = |blur: f32| Draw::Backdrop {
+            rect: [10., 5., 40., 30.],
+            radius: [10.; 4],
+            blur,
+            saturation: 1.,
+            opacity: 1.,
+            clip: screen,
+            round_clip: None,
+        };
+        let sharp = renderer.read([60, 40], 1., &split).unwrap();
+        let mut draws = split.to_vec();
+        draws.push(backdrop(4.));
+        let frame = renderer.read([60, 40], 1., &draws).unwrap();
+        // Next to the boundary inside the rectangle, red and blue mix.
+        for x in [28, 31] {
+            let [r, _, b, a] = pixel(&frame, x, 20);
+            assert!(r > 40 && b > 40 && a == 255, "{x}: {:?}", [r, b, a]);
+        }
+        // Outside the rectangle and outside its rounded corner, nothing changes.
+        for (x, y) in [
+            (5, 20),
+            (55, 20),
+            (29, 2),
+            (31, 37),
+            (10, 5),
+            (11, 6),
+            (49, 34),
+        ] {
+            assert_eq!(pixel(&frame, x, y), pixel(&sharp, x, y), "({x}, {y})");
+        }
+        // Strength 0 draws nothing.
+        draws.pop();
+        draws.push(backdrop(0.));
+        assert_eq!(renderer.read([60, 40], 1., &draws).unwrap(), sharp);
+
+        // A target that cannot be copied skips the blur instead of failing.
+        let target = renderer.device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: extent([60, 40]),
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        assert!(!Renderer::supports_backdrop(&target));
+        draws.pop();
+        draws.push(backdrop(4.));
+        renderer.draw(&target, [60, 40], 1., &draws);
+        renderer
+            .device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
+    }
+
+    #[test]
+    fn a_backdrop_in_a_layer_replaces_what_is_below_it_and_fades_with_its_opacity() {
+        let mut renderer = renderer();
+        let rect = [0., 0., 40., 40.];
+        let backdrop = |opacity: f32, saturation: f32| Draw::Backdrop {
+            rect,
+            radius: [0.; 4],
+            blur: 2.,
+            saturation,
+            opacity,
+            clip: rect,
+            round_clip: None,
+        };
+        // The dither moves a channel by up to 0.01 of full scale.
+        let near = |actual: Color, expected: Color| {
+            assert!(
+                actual.iter().zip(expected).all(|(a, e)| a.abs_diff(e) <= 4),
+                "{actual:?} is not {expected:?}"
+            );
+        };
+        // A uniform backdrop blurs to itself: inside a half-transparent layer it stays the same red.
+        let draws = [
+            Draw::PushLayer { opacity: 1. },
+            Draw::fill(rect, rect, [255, 0, 0, 128]),
+            backdrop(1., 1.),
+            Draw::PopLayer,
+        ];
+        let frame = renderer.read([40, 40], 1., &draws).unwrap();
+        near(pixel(&frame, 20, 20), [128, 0, 0, 255]);
+        // Saturation 0 turns red grey; at opacity 0.5 half of it shows.
+        let draws = [Draw::fill(rect, rect, RED), backdrop(0.5, 0.)];
+        let frame = renderer.read([40, 40], 1., &draws).unwrap();
+        let luma = 0.2126f32 * 255.;
+        let mixed = ((255. + luma) / 2.).round() as u8;
+        let grey = (luma / 2.).round() as u8;
+        near(pixel(&frame, 20, 20), [mixed, grey, grey, 255]);
+    }
+
+    #[test]
+    fn kawase_grows_with_the_radius() {
+        let reach = |r: f32| {
+            let (passes, offset) = kawase(r);
+            assert!((1..=6).contains(&passes), "{r}: {passes}");
+            offset * (1u32 << passes) as f32
+        };
+        let mut last = 0.;
+        for r in (1..2000).map(|i| i as f32 * 0.25) {
+            let now = reach(r);
+            assert!(now >= last, "{r}: {now} < {last}");
+            last = now;
+        }
+        assert_eq!(kawase(24.), (4, 1.));
+        assert_eq!(kawase(1000.), (6, 4.));
     }
 }
