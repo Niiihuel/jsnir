@@ -531,6 +531,7 @@ var PROP_CODES: { [k: string]: number | undefined } = {
     radius: 12,
     scaleX: 13,
     scaleY: 14,
+    backdropBlur: 15,
 };
 var RESIZE_CODES: { [k: string]: number | undefined } = {
     clip: 0,
@@ -1010,7 +1011,7 @@ function tryWritePaint(start: number, paint: Paint): number {
     }
     v = paint.starting;
     if (v !== undefined) {
-        if (p + 9 > cmdCap) return -2;
+        if (p + 10 > cmdCap) return -2;
         var st = v as Starting;
         mask |= 1 << 22;
         var stStart = p++;
@@ -1022,6 +1023,7 @@ function tryWritePaint(start: number, paint: Paint): number {
         if (st.draw !== undefined) { smask |= 1 << 4; f[p++] = st.draw; }
         if (st.scaleX !== undefined) { smask |= 1 << 5; f[p++] = st.scaleX; }
         if (st.scaleY !== undefined) { smask |= 1 << 6; f[p++] = st.scaleY; }
+        if (st.backdropBlur !== undefined) { smask |= 1 << 7; f[p++] = st.backdropBlur; }
         u[stStart] = smask;
     }
     v = paint.scrollbar;
@@ -1039,7 +1041,7 @@ function tryWritePaint(start: number, paint: Paint): number {
     }
     v = paint.exiting;
     if (v !== undefined) {
-        if (p + 8 > cmdCap) return -2;
+        if (p + 9 > cmdCap) return -2;
         var ex = v as Exiting;
         mask |= 1 << 24;
         var exStart = p++;
@@ -1050,6 +1052,7 @@ function tryWritePaint(start: number, paint: Paint): number {
         if (ex.scale !== undefined) { emask |= 1 << 3; f[p++] = ex.scale; }
         if (ex.scaleX !== undefined) { emask |= 1 << 4; f[p++] = ex.scaleX; }
         if (ex.scaleY !== undefined) { emask |= 1 << 5; f[p++] = ex.scaleY; }
+        if (ex.backdropBlur !== undefined) { emask |= 1 << 6; f[p++] = ex.backdropBlur; }
         u[exStart] = emask;
     }
     v = paint.a11y;
@@ -1093,10 +1096,12 @@ function tryWritePaint(start: number, paint: Paint): number {
         resizeCode = RESIZE_CODES[paint.resize];
         if (resizeCode === undefined) return -1;
     }
-    if (p + 3 > cmdCap) return -2;
+    if (p + 5 > cmdCap) return -2;
     v = paint.scaleX; if (v !== undefined) { mask |= 1 << 26; f[p++] = v; }
     v = paint.scaleY; if (v !== undefined) { mask |= 1 << 27; f[p++] = v; }
     if (resizeCode !== undefined) { mask |= 1 << 28; u[p++] = resizeCode; }
+    v = paint.backdropBlur; if (v !== undefined) { mask |= 1 << 29; f[p++] = v; }
+    v = paint.backdropSaturation; if (v !== undefined) { mask |= 1 << 30; f[p++] = v; }
     u[start] = mask;
     return p;
 }

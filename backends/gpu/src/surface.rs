@@ -49,6 +49,14 @@ impl Surface {
         // Render through a view without the sRGB suffix: colors arrive encoded and blend as in browsers.
         let format = config.format.remove_srgb_suffix();
         config.view_formats = vec![format];
+        // A backdrop blur copies what is drawn; without copies from the swapchain it is skipped.
+        if target
+            .get_capabilities(&adapter)
+            .usages
+            .contains(wgpu::TextureUsages::COPY_SRC)
+        {
+            config.usage |= wgpu::TextureUsages::COPY_SRC;
+        }
         let renderer = Renderer::new(&adapter, format)?;
         target.configure(&renderer.device, &config);
         Ok(Self {

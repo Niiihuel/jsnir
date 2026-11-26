@@ -545,6 +545,9 @@ fn decode_starting(words: &[u32], i: &mut usize) -> Result<Starting, String> {
         scale_y: (smask & (1 << 6) != 0)
             .then(|| next_f32(words, i))
             .transpose()?,
+        backdrop_blur: (smask & (1 << 7) != 0)
+            .then(|| next_f32(words, i))
+            .transpose()?,
     })
 }
 
@@ -567,6 +570,9 @@ fn decode_exiting(words: &[u32], i: &mut usize) -> Result<Exiting, String> {
             .then(|| next_f32(words, i))
             .transpose()?,
         scale_y: (emask & (1 << 5) != 0)
+            .then(|| next_f32(words, i))
+            .transpose()?,
+        backdrop_blur: (emask & (1 << 6) != 0)
             .then(|| next_f32(words, i))
             .transpose()?,
     })
@@ -709,6 +715,7 @@ fn decode_property(code: u32) -> Result<Property, String> {
         12 => Ok(Property::Radius),
         13 => Ok(Property::ScaleX),
         14 => Ok(Property::ScaleY),
+        15 => Ok(Property::BackdropBlur),
         _ => Err(format!("invalid property code {code}")),
     }
 }
@@ -924,6 +931,12 @@ fn decode_paint(words: &[u32], i: &mut usize, strings: &mut [String]) -> Result<
     }
     if mask & (1 << 28) != 0 {
         paint.resize = decode_resize(next_word(words, i)?)?;
+    }
+    if mask & (1 << 29) != 0 {
+        paint.backdrop_blur = Some(next_f32(words, i)?);
+    }
+    if mask & (1 << 30) != 0 {
+        paint.backdrop_saturation = Some(next_f32(words, i)?);
     }
     Ok(paint)
 }

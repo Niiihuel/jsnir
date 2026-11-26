@@ -176,9 +176,10 @@ contract_strings! {
     /// `left` and `width` move the node on screen only, `height` also moves what follows it.
     /// `radius` animates all four corner radii independently.
     /// `scaleX` and `scaleY` multiply with `scale` along their respective axes.
+    /// `backdropBlur` animates the strength of `Paint.backdropBlur`.
     pub enum Property as "Property" {
         Opacity, X, Y, Scale, Brightness, Background, Edge, Color, Draw, Left, Width, Height, Radius,
-        ScaleX, ScaleY
+        ScaleX, ScaleY, BackdropBlur
     }
 }
 impl Property {
@@ -330,6 +331,7 @@ contract_struct! {
         scale_x: Option<f32>,
         scale_y: Option<f32>,
         draw: Option<f32>,
+        backdrop_blur: Option<f32>,
     }
 }
 contract_struct! {
@@ -342,6 +344,7 @@ contract_struct! {
         scale: Option<f32>,
         scale_x: Option<f32>,
         scale_y: Option<f32>,
+        backdrop_blur: Option<f32>,
     }
 }
 contract_strings! {
@@ -504,6 +507,15 @@ contract_struct! {
         resize: Resize,
         /// Multiplies the node's colors, as CSS `filter: brightness()`.
         brightness: Option<f32>,
+        /// Blurs what is already drawn below the node inside its on-screen rectangle (after `x`, `y` and
+        /// scales), cut to its `radius` and clips, before its own background, edges and children: a
+        /// translucent `background` tints the blur, as CSS `backdrop-filter`. Strength in logical pixels,
+        /// about the CSS `blur()` radius; 0 or unset is off. The node's `opacity` fades the blurred image too.
+        /// It blurs the target it is drawn into: inside an ancestor with `opacity` < 1 that is the ancestor's
+        /// own group (the CSS backdrop root). Animatable with a `backdropBlur` transition, `starting` and `exiting`.
+        backdrop_blur: Option<f32>,
+        /// Saturation of the blurred backdrop (1 by default; 1.5 gives a "glass" look). Ignored without `backdropBlur`.
+        backdrop_saturation: Option<f32>,
         /// Text and icon color.
         color: Option<u32>,
         /// Drawn fraction of an icon's strokes (1 by default).
@@ -567,16 +579,39 @@ impl Paint {
             .chain(self.scale_y)
             .chain(self.brightness)
             .chain(self.draw)
+            .chain(self.backdrop_blur)
+            .chain(self.backdrop_saturation)
             .chain(
                 self.starting
                     .iter()
-                    .flat_map(|s| [s.opacity, s.x, s.y, s.scale, s.scale_x, s.scale_y, s.draw])
+                    .flat_map(|s| {
+                        [
+                            s.opacity,
+                            s.x,
+                            s.y,
+                            s.scale,
+                            s.scale_x,
+                            s.scale_y,
+                            s.draw,
+                            s.backdrop_blur,
+                        ]
+                    })
                     .flatten(),
             )
             .chain(
                 self.exiting
                     .iter()
-                    .flat_map(|e| [e.opacity, e.x, e.y, e.scale, e.scale_x, e.scale_y])
+                    .flat_map(|e| {
+                        [
+                            e.opacity,
+                            e.x,
+                            e.y,
+                            e.scale,
+                            e.scale_x,
+                            e.scale_y,
+                            e.backdrop_blur,
+                        ]
+                    })
                     .flatten(),
             )
             .chain(
