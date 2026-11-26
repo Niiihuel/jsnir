@@ -529,6 +529,12 @@ var PROP_CODES: { [k: string]: number | undefined } = {
     width: 10,
     height: 11,
     radius: 12,
+    scaleX: 13,
+    scaleY: 14,
+};
+var RESIZE_CODES: { [k: string]: number | undefined } = {
+    clip: 0,
+    crossfade: 1,
 };
 var EASING_CODES: { [k: string]: number | undefined } = {
     linear: 0,
@@ -836,7 +842,7 @@ function tryWriteStyle(start: number, s: Style | undefined, forcedDir: number): 
     return p;
 }
 function tryWriteVariant(start: number, val: Variant): number {
-    if (start + 16 > cmdCap) return -2;
+    if (start + 18 > cmdCap) return -2;
     var u = cmdU32;
     var f = cmdF32;
     var p = start + 1;
@@ -864,6 +870,8 @@ function tryWriteVariant(start: number, val: Variant): number {
         if (cc === undefined) return -1;
         mask |= 1 << 12; u[p++] = cc;
     }
+    v = val.scaleX; if (v !== undefined) { mask |= 1 << 13; f[p++] = v; }
+    v = val.scaleY; if (v !== undefined) { mask |= 1 << 14; f[p++] = v; }
     u[start] = mask;
     return p;
 }
@@ -1002,7 +1010,7 @@ function tryWritePaint(start: number, paint: Paint): number {
     }
     v = paint.starting;
     if (v !== undefined) {
-        if (p + 7 > cmdCap) return -2;
+        if (p + 9 > cmdCap) return -2;
         var st = v as Starting;
         mask |= 1 << 22;
         var stStart = p++;
@@ -1012,6 +1020,8 @@ function tryWritePaint(start: number, paint: Paint): number {
         if (st.y !== undefined) { smask |= 1 << 2; f[p++] = st.y; }
         if (st.scale !== undefined) { smask |= 1 << 3; f[p++] = st.scale; }
         if (st.draw !== undefined) { smask |= 1 << 4; f[p++] = st.draw; }
+        if (st.scaleX !== undefined) { smask |= 1 << 5; f[p++] = st.scaleX; }
+        if (st.scaleY !== undefined) { smask |= 1 << 6; f[p++] = st.scaleY; }
         u[stStart] = smask;
     }
     v = paint.scrollbar;
@@ -1029,7 +1039,7 @@ function tryWritePaint(start: number, paint: Paint): number {
     }
     v = paint.exiting;
     if (v !== undefined) {
-        if (p + 6 > cmdCap) return -2;
+        if (p + 8 > cmdCap) return -2;
         var ex = v as Exiting;
         mask |= 1 << 24;
         var exStart = p++;
@@ -1038,6 +1048,8 @@ function tryWritePaint(start: number, paint: Paint): number {
         if (ex.x !== undefined) { emask |= 1 << 1; f[p++] = ex.x; }
         if (ex.y !== undefined) { emask |= 1 << 2; f[p++] = ex.y; }
         if (ex.scale !== undefined) { emask |= 1 << 3; f[p++] = ex.scale; }
+        if (ex.scaleX !== undefined) { emask |= 1 << 4; f[p++] = ex.scaleX; }
+        if (ex.scaleY !== undefined) { emask |= 1 << 5; f[p++] = ex.scaleY; }
         u[exStart] = emask;
     }
     v = paint.a11y;
@@ -1076,6 +1088,15 @@ function tryWritePaint(start: number, paint: Paint): number {
         if (a11y.maxValue !== undefined) { amask |= 1 << 14; f[p++] = a11y.maxValue; }
         u[aStart] = amask;
     }
+    var resizeCode: number | undefined = undefined;
+    if (paint.resize !== undefined) {
+        resizeCode = RESIZE_CODES[paint.resize];
+        if (resizeCode === undefined) return -1;
+    }
+    if (p + 3 > cmdCap) return -2;
+    v = paint.scaleX; if (v !== undefined) { mask |= 1 << 26; f[p++] = v; }
+    v = paint.scaleY; if (v !== undefined) { mask |= 1 << 27; f[p++] = v; }
+    if (resizeCode !== undefined) { mask |= 1 << 28; u[p++] = resizeCode; }
     u[start] = mask;
     return p;
 }

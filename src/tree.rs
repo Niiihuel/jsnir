@@ -175,8 +175,10 @@ contract_strings! {
     /// Properties that a transition can animate. `left`, `width` and `height` animate layout changes:
     /// `left` and `width` move the node on screen only, `height` also moves what follows it.
     /// `radius` animates all four corner radii independently.
+    /// `scaleX` and `scaleY` multiply with `scale` along their respective axes.
     pub enum Property as "Property" {
-        Opacity, X, Y, Scale, Brightness, Background, Edge, Color, Draw, Left, Width, Height, Radius
+        Opacity, X, Y, Scale, Brightness, Background, Edge, Color, Draw, Left, Width, Height, Radius,
+        ScaleX, ScaleY
     }
 }
 impl Property {
@@ -301,6 +303,8 @@ contract_struct! {
         gradient: Option<[u32; 2]>,
         brightness: Option<f32>,
         scale: Option<f32>,
+        scale_x: Option<f32>,
+        scale_y: Option<f32>,
         opacity: Option<f32>,
         x: Option<f32>,
         y: Option<f32>,
@@ -323,6 +327,8 @@ contract_struct! {
         x: Option<f32>,
         y: Option<f32>,
         scale: Option<f32>,
+        scale_x: Option<f32>,
+        scale_y: Option<f32>,
         draw: Option<f32>,
     }
 }
@@ -334,7 +340,15 @@ contract_struct! {
         x: Option<f32>,
         y: Option<f32>,
         scale: Option<f32>,
+        scale_x: Option<f32>,
+        scale_y: Option<f32>,
     }
+}
+contract_strings! {
+    /// How a box renders its subtree while its layout size animates (`width`/`height` transitions).
+    /// `clip` (default) clips children at the animated box; `crossfade` blends a frozen capture of the
+    /// previous size with the live final-layout subtree stretched to the animated rectangle.
+    pub enum Resize as "Resize" { Clip, Crossfade }
 }
 contract_strings! {
     /// Accessibility role override (ARIA / AccessKit). When omitted, inferred from the node kind and callbacks.
@@ -482,6 +496,12 @@ contract_struct! {
         x: f32,
         y: f32,
         scale: Option<f32>,
+        /// Non-uniform horizontal scale multiplier (multiplied with `scale`, origin at box center).
+        scale_x: Option<f32>,
+        /// Non-uniform vertical scale multiplier (multiplied with `scale`, origin at box center).
+        scale_y: Option<f32>,
+        /// How layout size transitions (`width`/`height`) composite the subtree (`"clip"` or `"crossfade"`).
+        resize: Resize,
         /// Multiplies the node's colors, as CSS `filter: brightness()`.
         brightness: Option<f32>,
         /// Text and icon color.
@@ -532,6 +552,8 @@ impl Paint {
                             v.x,
                             v.y,
                             v.scale,
+                            v.scale_x,
+                            v.scale_y,
                             v.brightness,
                             v.height,
                             v.width,
@@ -541,18 +563,20 @@ impl Paint {
             )
             .chain(self.opacity)
             .chain(self.scale)
+            .chain(self.scale_x)
+            .chain(self.scale_y)
             .chain(self.brightness)
             .chain(self.draw)
             .chain(
                 self.starting
                     .iter()
-                    .flat_map(|s| [s.opacity, s.x, s.y, s.scale, s.draw])
+                    .flat_map(|s| [s.opacity, s.x, s.y, s.scale, s.scale_x, s.scale_y, s.draw])
                     .flatten(),
             )
             .chain(
                 self.exiting
                     .iter()
-                    .flat_map(|e| [e.opacity, e.x, e.y, e.scale])
+                    .flat_map(|e| [e.opacity, e.x, e.y, e.scale, e.scale_x, e.scale_y])
                     .flatten(),
             )
             .chain(
@@ -790,6 +814,7 @@ pub(crate) fn ts_decls() -> String {
         Variant::ts_decl(),
         Starting::ts_decl(),
         Exiting::ts_decl(),
+        Resize::ts_decl(),
         A11yRole::ts_decl(),
         A11yLive::ts_decl(),
         A11y::ts_decl(),

@@ -4,6 +4,7 @@
 use bytemuck::{Pod, Zeroable};
 use jsnir::{host::Corners, text::TextBitmap};
 use std::{
+    collections::HashMap,
     io::Write,
     ops::Range,
     path::Path,
@@ -80,8 +81,21 @@ enum Mode {
 #[derive(Clone)]
 pub enum Draw {
     Shape(Shape),
-    PushLayer { opacity: f32 },
+    PushLayer {
+        opacity: f32,
+    },
     PopLayer,
+    PushSurface {
+        source: Rect,
+        dest: Rect,
+        radius: Corners,
+        opacity: f32,
+        clip: Rect,
+        round_clip: Option<(Rect, Corners)>,
+        additive: bool,
+        cache_key: Option<(u64, u64)>,
+    },
+    PopSurface,
 }
 
 impl Draw {
@@ -432,6 +446,19 @@ impl Atlas {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TargetRef {
+    Root,
+    Layer(usize),
+    TransientSurface(usize),
+    CachedSurface((u64, u64)),
+}
+
+struct CachedSurface {
+    layer: Layer,
+    last_used: u64,
+}
+
 enum BatchCmd {
     Draw {
         instances: Range<u32>,
@@ -443,9 +470,19 @@ enum BatchCmd {
         // `u32::MAX` => `&self.white.bindings`; otherwise index into `draws` whose shape holds `mask`.
         mask_draw: u32,
     },
-    Push,
-    Pop {
+    Composite {
+        source: TargetRef,
         instance: u32,
+        scissor: [u32; 4],
+        additive: bool,
+    },
+    PushTarget {
+        target: TargetRef,
+    },
+    PopTo {
+        target: TargetRef,
+        source: TargetRef,
+        composite: Option<(u32, [u32; 4], bool)>,
     },
 }
 
@@ -453,6 +490,7 @@ pub struct Renderer {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pipeline: wgpu::RenderPipeline,
+    additive_pipeline: wgpu::RenderPipeline,
     // Shared by the image (group 0) and the mask (group 1) of every quad.
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
@@ -462,6 +500,9 @@ pub struct Renderer {
     next_texture_id: AtomicU64,
     instances: wgpu::Buffer,
     layers: Vec<Layer>,
+    surfaces: Vec<Layer>,
+    surface_cache: HashMap<(u64, u64), CachedSurface>,
+    surface_frame_id: u64,
     // Reusable per-frame scratch buffers to avoid heap allocations during `draw`.
     quads: Vec<Quad>,
     batches: Vec<BatchCmd>,
@@ -507,42 +548,60 @@ impl Renderer {
             bind_group_layouts: &[Some(&layout), Some(&layout)],
             immediate_size: 0,
         });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Quads"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vertex"),
-                buffers: &[Some(wgpu::VertexBufferLayout {
-                    array_stride: size_of::<Quad>() as u64,
-                    step_mode: wgpu::VertexStepMode::Instance,
-                    attributes: &wgpu::vertex_attr_array![
-                        0 => Float32x4, 1 => Float32x4, 2 => Float32x4, 3 => Float32x4,
-                        4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 7 => Float32x4,
-                        8 => Float32x4, 9 => Float32x4, 10 => Float32x4
-                    ],
-                })],
-                compilation_options: Default::default(),
+        let make_pipeline = |label: &str, blend: wgpu::BlendState| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vertex"),
+                    buffers: &[Some(wgpu::VertexBufferLayout {
+                        array_stride: size_of::<Quad>() as u64,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &wgpu::vertex_attr_array![
+                            0 => Float32x4, 1 => Float32x4, 2 => Float32x4, 3 => Float32x4,
+                            4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 7 => Float32x4,
+                            8 => Float32x4, 9 => Float32x4, 10 => Float32x4
+                        ],
+                    })],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fragment"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(blend),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleStrip,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: Default::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let pipeline = make_pipeline("Quads", wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING);
+        let additive_pipeline = make_pipeline(
+            "Quads additive",
+            wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::One,
+                    dst_factor: wgpu::BlendFactor::One,
+                    operation: wgpu::BlendOperation::Add,
+                },
+                alpha: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::One,
+                    dst_factor: wgpu::BlendFactor::One,
+                    operation: wgpu::BlendOperation::Add,
+                },
             },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fragment"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleStrip,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: Default::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        );
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
@@ -563,6 +622,7 @@ impl Renderer {
             device,
             queue,
             pipeline,
+            additive_pipeline,
             layout,
             sampler,
             format,
@@ -571,6 +631,9 @@ impl Renderer {
             next_texture_id: AtomicU64::new(FIRST_DYNAMIC_TEX_ID),
             instances,
             layers: Vec::new(),
+            surfaces: Vec::new(),
+            surface_cache: HashMap::new(),
+            surface_frame_id: 0,
             quads: Vec::new(),
             batches: Vec::new(),
             opacities: Vec::new(),
@@ -700,17 +763,19 @@ impl Renderer {
         }
     }
 
-    // The layer texture for nesting `depth`, recreated when the target size changes.
-    fn layer(&mut self, depth: usize, size: [u32; 2]) {
-        if self
-            .layers
-            .get(depth)
-            .is_some_and(|layer| layer.size == size)
-        {
-            return;
-        }
+    pub fn has_cached_surface(&self, key: (u64, u64), size: [u32; 2]) -> bool {
+        self.surface_cache
+            .get(&key)
+            .is_some_and(|entry| entry.layer.size == size)
+    }
+
+    pub fn cached_surface_count(&self) -> usize {
+        self.surface_cache.len() + self.surfaces.len()
+    }
+
+    fn create_layer(&self, label: &str, size: [u32; 2]) -> Layer {
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("JSNIR layer"),
+            label: Some(label),
             size: extent(size),
             mip_level_count: 1,
             sample_count: 1,
@@ -722,28 +787,59 @@ impl Renderer {
         let view = texture.create_view(&Default::default());
         let bindings = Self::bind(&self.device, &self.layout, &self.sampler, &view);
         let texture_id = self.next_texture_id.fetch_add(1, Ordering::Relaxed);
-        let layer = Layer {
+        Layer {
             _texture: texture,
             view,
             bindings,
             texture_id,
             size,
-        };
-        if depth < self.layers.len() {
-            self.layers[depth] = layer;
-        } else {
-            self.layers.push(layer);
         }
+    }
+
+    fn acquire_pool_layer(
+        pool: &mut Vec<Layer>,
+        active: &[bool],
+        touched: &mut Vec<bool>,
+        size: [u32; 2],
+        create: impl FnOnce([u32; 2]) -> Layer,
+    ) -> usize {
+        if touched.len() < pool.len() {
+            touched.resize(pool.len(), false);
+        }
+        // Prefer an inactive slot that already has the exact size (reusable even within one frame).
+        for (i, layer) in pool.iter().enumerate() {
+            if !active.get(i).copied().unwrap_or(false) && layer.size == size {
+                touched[i] = true;
+                return i;
+            }
+        }
+        // Otherwise repurpose a slot not yet used in this frame's command buffer.
+        for i in 0..pool.len() {
+            if !touched[i] && !active.get(i).copied().unwrap_or(false) {
+                pool[i] = create(size);
+                touched[i] = true;
+                return i;
+            }
+        }
+        let idx = pool.len();
+        pool.push(create(size));
+        touched.push(true);
+        idx
     }
 
     /// Draws into `target`, viewed in the renderer's format.
     pub fn draw(&mut self, target: &wgpu::Texture, size: [u32; 2], scale: f32, draws: &[Draw]) {
-        let [px, py] = size.map(|side| side as f32 / scale);
-        let inv_px = 2. / px;
-        let inv_py = 2. / py;
+        self.surface_frame_id = self.surface_frame_id.wrapping_add(1).max(1);
+        let frame_id = self.surface_frame_id;
+        let max_dim = self.device.limits().max_texture_dimension_2d;
         let white_uv = self.atlas.white_uv;
-        let build_quad = |shape: &Shape, uv: [f32; 4]| -> Quad {
-            let [x, y, w, h] = shape.rect;
+        let build_quad = |shape: &Shape, uv: [f32; 4], origin: [f32; 2], tsize: [u32; 2]| -> Quad {
+            let [px, py] = tsize.map(|side| side as f32 / scale);
+            let inv_px = 2. / px;
+            let inv_py = 2. / py;
+            let [sx, sy, w, h] = shape.rect;
+            let x = sx - origin[0];
+            let y = sy - origin[1];
             let premultiply = |rgba: Color| {
                 let a = f32::from(rgba[3]) * (1. / 255.);
                 let s = a * (1. / 255.);
@@ -781,7 +877,7 @@ impl Renderer {
             // The mask rectangle relative to the quad; the whole quad without a mask (white texture).
             let mask = match &shape.mask {
                 Some((_, [mx, my, mw, mh])) => {
-                    [(mx - x) * scale, (my - y) * scale, mw * scale, mh * scale]
+                    [(mx - sx) * scale, (my - sy) * scale, mw * scale, mh * scale]
                 }
                 None => [0., 0., w * scale, h * scale],
             };
@@ -798,9 +894,14 @@ impl Renderer {
                 shape: [w * scale, h * scale, 0., mode],
                 params,
                 params2,
-                round_clip: shape
-                    .round_clip
-                    .map_or([0.; 4], |(rect, _)| rect.map(|v| v * scale)),
+                round_clip: shape.round_clip.map_or([0.; 4], |(rect, _)| {
+                    [
+                        (rect[0] - origin[0]) * scale,
+                        (rect[1] - origin[1]) * scale,
+                        rect[2] * scale,
+                        rect[3] * scale,
+                    ]
+                }),
                 mask,
                 clip_radii: shape
                     .round_clip
@@ -809,20 +910,61 @@ impl Renderer {
             }
         };
 
-        let full = [0., 0., px, py];
+        #[derive(Clone, Copy)]
+        struct TargetFrame {
+            target: TargetRef,
+            origin: [f32; 2],
+            size: [u32; 2],
+        }
+        struct PendingSurface {
+            source: TargetRef,
+            dest: Rect,
+            radius: Corners,
+            opacity: f32,
+            clip: Rect,
+            round_clip: Option<(Rect, Corners)>,
+            additive: bool,
+            uv_max: [f32; 2],
+        }
+
         self.quads.clear();
         self.batches.clear();
         self.opacities.clear();
-        let mut depth = 0usize;
-        let mut max_depth = 0usize;
+
+        let mut target_stack = vec![TargetFrame {
+            target: TargetRef::Root,
+            origin: [0., 0.],
+            size,
+        }];
+        let mut layer_active = vec![false; self.layers.len()];
+        let mut layer_touched = vec![false; self.layers.len()];
+        let mut surface_active = vec![false; self.surfaces.len()];
+        let mut surface_touched = vec![false; self.surfaces.len()];
+        let mut surface_pending: Vec<PendingSurface> = Vec::new();
+        let mut skip_surface_depth = 0usize;
+        let mut used_transient_surface = false;
+
+        let shift_clip = |clip: Rect, origin: [f32; 2]| -> Rect {
+            [clip[0] - origin[0], clip[1] - origin[1], clip[2], clip[3]]
+        };
 
         for (draw_idx, draw) in draws.iter().enumerate() {
+            if skip_surface_depth > 0 {
+                match draw {
+                    Draw::PushSurface { .. } => skip_surface_depth += 1,
+                    Draw::PopSurface => skip_surface_depth -= 1,
+                    _ => {}
+                }
+                continue;
+            }
             match draw {
                 Draw::Shape(shape) => {
                     if shape.rect[2] <= 0. || shape.rect[3] <= 0. {
                         continue;
                     }
-                    if let Some(scissor) = scissor(shape.clip, size, scale) {
+                    let cur = *target_stack.last().unwrap();
+                    if let Some(scissor) = scissor(shift_clip(shape.clip, cur.origin), cur.size, scale)
+                    {
                         let quad_idx = self.quads.len() as u32;
                         let (image_id, image_draw, uv) = match &shape.image {
                             Some(img) => (img.texture_id, draw_idx as u32, shape.uv),
@@ -832,7 +974,8 @@ impl Renderer {
                             Some((img, _)) => (img.texture_id, draw_idx as u32),
                             None => (WHITE_TEX_ID, u32::MAX),
                         };
-                        self.quads.push(build_quad(shape, uv));
+                        self.quads
+                            .push(build_quad(shape, uv, cur.origin, cur.size));
                         if let Some(BatchCmd::Draw {
                             instances,
                             scissor: prev_scissor,
@@ -860,16 +1003,68 @@ impl Renderer {
                 }
                 Draw::PushLayer { opacity } => {
                     self.opacities.push(*opacity);
-                    depth += 1;
-                    max_depth = max_depth.max(depth);
-                    self.batches.push(BatchCmd::Push);
+                    let cur = *target_stack.last().unwrap();
+                    let device = &self.device;
+                    let layout = &self.layout;
+                    let sampler = &self.sampler;
+                    let format = self.format;
+                    let next_id = &self.next_texture_id;
+                    let slot = Self::acquire_pool_layer(
+                        &mut self.layers,
+                        &layer_active,
+                        &mut layer_touched,
+                        cur.size,
+                        |s| {
+                            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                                label: Some("JSNIR layer"),
+                                size: extent(s),
+                                mip_level_count: 1,
+                                sample_count: 1,
+                                dimension: wgpu::TextureDimension::D2,
+                                format,
+                                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                                view_formats: &[],
+                            });
+                            let view = texture.create_view(&Default::default());
+                            let bindings = Self::bind(device, layout, sampler, &view);
+                            let texture_id = next_id.fetch_add(1, Ordering::Relaxed);
+                            Layer {
+                                _texture: texture,
+                                view,
+                                bindings,
+                                texture_id,
+                                size: s,
+                            }
+                        },
+                    );
+                    if layer_active.len() <= slot {
+                        layer_active.resize(slot + 1, false);
+                    }
+                    layer_active[slot] = true;
+                    let target_ref = TargetRef::Layer(slot);
+                    target_stack.push(TargetFrame {
+                        target: target_ref,
+                        origin: cur.origin,
+                        size: cur.size,
+                    });
+                    self.batches.push(BatchCmd::PushTarget { target: target_ref });
                 }
                 Draw::PopLayer => {
                     let opacity = self.opacities.pop().unwrap_or(1.).clamp(0., 1.);
+                    let popped = target_stack.pop().unwrap_or(TargetFrame {
+                        target: TargetRef::Root,
+                        origin: [0., 0.],
+                        size,
+                    });
+                    if let TargetRef::Layer(slot) = popped.target {
+                        layer_active[slot] = false;
+                    }
+                    let parent = *target_stack.last().unwrap();
+                    let [px, py] = parent.size.map(|side| side as f32 / scale);
+                    let full = [parent.origin[0], parent.origin[1], px, py];
                     let tint = [255, 255, 255, (opacity * 255.).round() as u8];
-                    depth = depth.saturating_sub(1);
                     let instance = self.quads.len() as u32;
-                    self.batches.push(BatchCmd::Pop { instance });
                     self.quads.push(build_quad(
                         &Shape {
                             rect: full,
@@ -884,12 +1079,198 @@ impl Renderer {
                             mode: Mode::Fill,
                         },
                         [0., 0., 1., 1.],
+                        parent.origin,
+                        parent.size,
                     ));
+                    self.batches.push(BatchCmd::PopTo {
+                        target: parent.target,
+                        source: popped.target,
+                        composite: Some((instance, [0, 0, parent.size[0], parent.size[1]], false)),
+                    });
+                }
+                Draw::PushSurface {
+                    source,
+                    dest,
+                    radius,
+                    opacity,
+                    clip,
+                    round_clip,
+                    additive,
+                    cache_key,
+                } => {
+                    let surf_px = [
+                        (source[2] * scale).ceil().max(1.) as u32,
+                        (source[3] * scale).ceil().max(1.) as u32,
+                    ];
+                    if surf_px[0] > max_dim || surf_px[1] > max_dim {
+                        skip_surface_depth = 1;
+                        continue;
+                    }
+                    let uv_max = [
+                        ((source[2] * scale) / surf_px[0] as f32).min(1.),
+                        ((source[3] * scale) / surf_px[1] as f32).min(1.),
+                    ];
+                    let cur = *target_stack.last().unwrap();
+                    if let Some(key) = cache_key
+                        && let Some(entry) = self.surface_cache.get_mut(key)
+                        && entry.layer.size == surf_px
+                    {
+                        entry.last_used = frame_id;
+                        let alpha = opacity.clamp(0., 1.);
+                        if alpha > 0.001
+                            && dest[2] > 0.
+                            && dest[3] > 0.
+                            && let Some(sc) =
+                                scissor(shift_clip(*clip, cur.origin), cur.size, scale)
+                        {
+                            let tint = [255, 255, 255, (alpha * 255.).round() as u8];
+                            let instance = self.quads.len() as u32;
+                            self.quads.push(build_quad(
+                                &Shape {
+                                    rect: *dest,
+                                    clip: *clip,
+                                    round_clip: *round_clip,
+                                    color: tint,
+                                    end_color: tint,
+                                    uv: [0., 0., uv_max[0], uv_max[1]],
+                                    radius: *radius,
+                                    image: None,
+                                    mask: None,
+                                    mode: Mode::Fill,
+                                },
+                                [0., 0., uv_max[0], uv_max[1]],
+                                cur.origin,
+                                cur.size,
+                            ));
+                            self.batches.push(BatchCmd::Composite {
+                                source: TargetRef::CachedSurface(*key),
+                                instance,
+                                scissor: sc,
+                                additive: *additive,
+                            });
+                        }
+                        skip_surface_depth = 1;
+                        continue;
+                    }
+                    let surf_ref = if let Some(key) = *cache_key {
+                        let layer = self.create_layer("JSNIR cached surface", surf_px);
+                        self.surface_cache.insert(
+                            key,
+                            CachedSurface {
+                                layer,
+                                last_used: frame_id,
+                            },
+                        );
+                        TargetRef::CachedSurface(key)
+                    } else {
+                        used_transient_surface = true;
+                        let device = &self.device;
+                        let layout = &self.layout;
+                        let sampler = &self.sampler;
+                        let format = self.format;
+                        let next_id = &self.next_texture_id;
+                        let slot = Self::acquire_pool_layer(
+                            &mut self.surfaces,
+                            &surface_active,
+                            &mut surface_touched,
+                            surf_px,
+                            |s| {
+                                let texture = device.create_texture(&wgpu::TextureDescriptor {
+                                    label: Some("JSNIR surface"),
+                                    size: extent(s),
+                                    mip_level_count: 1,
+                                    sample_count: 1,
+                                    dimension: wgpu::TextureDimension::D2,
+                                    format,
+                                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                                        | wgpu::TextureUsages::TEXTURE_BINDING,
+                                    view_formats: &[],
+                                });
+                                let view = texture.create_view(&Default::default());
+                                let bindings = Self::bind(device, layout, sampler, &view);
+                                let texture_id = next_id.fetch_add(1, Ordering::Relaxed);
+                                Layer {
+                                    _texture: texture,
+                                    view,
+                                    bindings,
+                                    texture_id,
+                                    size: s,
+                                }
+                            },
+                        );
+                        if surface_active.len() <= slot {
+                            surface_active.resize(slot + 1, false);
+                        }
+                        surface_active[slot] = true;
+                        TargetRef::TransientSurface(slot)
+                    };
+                    target_stack.push(TargetFrame {
+                        target: surf_ref,
+                        origin: [source[0], source[1]],
+                        size: surf_px,
+                    });
+                    surface_pending.push(PendingSurface {
+                        source: surf_ref,
+                        dest: *dest,
+                        radius: *radius,
+                        opacity: *opacity,
+                        clip: *clip,
+                        round_clip: *round_clip,
+                        additive: *additive,
+                        uv_max,
+                    });
+                    self.batches.push(BatchCmd::PushTarget { target: surf_ref });
+                }
+                Draw::PopSurface => {
+                    let Some(pending) = surface_pending.pop() else {
+                        continue;
+                    };
+                    let popped = target_stack.pop().unwrap_or(TargetFrame {
+                        target: TargetRef::Root,
+                        origin: [0., 0.],
+                        size,
+                    });
+                    if let TargetRef::TransientSurface(slot) = popped.target {
+                        surface_active[slot] = false;
+                    }
+                    let parent = *target_stack.last().unwrap();
+                    let alpha = pending.opacity.clamp(0., 1.);
+                    let composite = if alpha > 0.001
+                        && pending.dest[2] > 0.
+                        && pending.dest[3] > 0.
+                        && let Some(sc) =
+                            scissor(shift_clip(pending.clip, parent.origin), parent.size, scale)
+                    {
+                        let tint = [255, 255, 255, (alpha * 255.).round() as u8];
+                        let instance = self.quads.len() as u32;
+                        self.quads.push(build_quad(
+                            &Shape {
+                                rect: pending.dest,
+                                clip: pending.clip,
+                                round_clip: pending.round_clip,
+                                color: tint,
+                                end_color: tint,
+                                uv: [0., 0., pending.uv_max[0], pending.uv_max[1]],
+                                radius: pending.radius,
+                                image: None,
+                                mask: None,
+                                mode: Mode::Fill,
+                            },
+                            [0., 0., pending.uv_max[0], pending.uv_max[1]],
+                            parent.origin,
+                            parent.size,
+                        ));
+                        Some((instance, sc, pending.additive))
+                    } else {
+                        None
+                    };
+                    self.batches.push(BatchCmd::PopTo {
+                        target: parent.target,
+                        source: pending.source,
+                        composite,
+                    });
                 }
             }
-        }
-        for level in 0..max_depth {
-            self.layer(level, size);
         }
         let bytes = bytemuck::cast_slice(&self.quads);
         if bytes.len() as u64 > self.instances.size() {
@@ -903,7 +1284,7 @@ impl Renderer {
             ..Default::default()
         });
         let mut encoder = self.device.create_command_encoder(&Default::default());
-        // Each layer level renders in its own pass; popping a layer composites it into the level below.
+        // Each layer/surface renders in its own pass; popping composites it into the target below.
         let begin = |encoder: &mut wgpu::CommandEncoder,
                      view: &wgpu::TextureView,
                      clear: Option<wgpu::Color>| {
@@ -923,13 +1304,23 @@ impl Renderer {
                 })
                 .forget_lifetime()
         };
-        let mut level = 0usize;
         let layers = &self.layers;
-        let view_at = |level: usize| {
-            if level == 0 {
-                &target_view
-            } else {
-                &layers[level - 1].view
+        let surfaces = &self.surfaces;
+        let surface_cache = &self.surface_cache;
+        let view_of = |t: TargetRef| -> &wgpu::TextureView {
+            match t {
+                TargetRef::Root => &target_view,
+                TargetRef::Layer(i) => &layers[i].view,
+                TargetRef::TransientSurface(i) => &surfaces[i].view,
+                TargetRef::CachedSurface(k) => &surface_cache[&k].layer.view,
+            }
+        };
+        let layer_of = |t: TargetRef| -> &Layer {
+            match t {
+                TargetRef::Layer(i) => &layers[i],
+                TargetRef::TransientSurface(i) => &surfaces[i],
+                TargetRef::CachedSurface(k) => &surface_cache[&k].layer,
+                TargetRef::Root => unreachable!("cannot sample root target"),
             }
         };
         let mut pass = begin(&mut encoder, &target_view, Some(wgpu::Color::BLACK));
@@ -938,6 +1329,7 @@ impl Renderer {
         let mut cur_scissor: Option<[u32; 4]> = None;
         let mut cur_img: Option<u64> = None;
         let mut cur_mask: Option<u64> = None;
+        let mut cur_additive = false;
         let mut stats = RenderStats {
             quads: self.quads.len(),
             ..Default::default()
@@ -952,6 +1344,10 @@ impl Renderer {
                     mask_id,
                     mask_draw,
                 } => {
+                    if cur_additive {
+                        pass.set_pipeline(&self.pipeline);
+                        cur_additive = false;
+                    }
                     let start = u64::from(instances.start) * stride;
                     let end = u64::from(instances.end) * stride;
                     let count = instances.end - instances.start;
@@ -990,43 +1386,97 @@ impl Renderer {
                     pass.draw(0..4, 0..count);
                     stats.draw_calls += 1;
                 }
-                BatchCmd::Push => {
+                BatchCmd::Composite {
+                    source,
+                    instance,
+                    scissor: rect,
+                    additive,
+                } => {
+                    if cur_additive != *additive {
+                        pass.set_pipeline(if *additive {
+                            &self.additive_pipeline
+                        } else {
+                            &self.pipeline
+                        });
+                        cur_additive = *additive;
+                    }
+                    let src = layer_of(*source);
+                    let offset = u64::from(*instance) * stride;
+                    pass.set_vertex_buffer(0, self.instances.slice(offset..offset + stride));
+                    if cur_scissor != Some(*rect) {
+                        pass.set_scissor_rect(rect[0], rect[1], rect[2], rect[3]);
+                        cur_scissor = Some(*rect);
+                        stats.scissor_switches += 1;
+                    }
+                    if cur_img != Some(src.texture_id) {
+                        pass.set_bind_group(0, &src.bindings, &[]);
+                        cur_img = Some(src.texture_id);
+                        stats.bind_group_switches += 1;
+                    }
+                    if cur_mask != Some(WHITE_TEX_ID) {
+                        pass.set_bind_group(1, &self.white.bindings, &[]);
+                        cur_mask = Some(WHITE_TEX_ID);
+                        stats.bind_group_switches += 1;
+                    }
+                    pass.draw(0..4, 0..1);
+                    stats.draw_calls += 1;
+                }
+                BatchCmd::PushTarget { target } => {
                     drop(pass);
-                    level += 1;
-                    pass = begin(
-                        &mut encoder,
-                        view_at(level),
-                        Some(wgpu::Color::TRANSPARENT),
-                    );
+                    pass = begin(&mut encoder, view_of(*target), Some(wgpu::Color::TRANSPARENT));
                     pass.set_pipeline(&self.pipeline);
                     cur_scissor = None;
                     cur_img = None;
                     cur_mask = None;
+                    cur_additive = false;
                 }
-                BatchCmd::Pop { instance } => {
+                BatchCmd::PopTo {
+                    target,
+                    source,
+                    composite,
+                } => {
                     drop(pass);
-                    level -= 1;
-                    pass = begin(&mut encoder, view_at(level), None);
-                    pass.set_pipeline(&self.pipeline);
-                    let offset = u64::from(*instance) * stride;
-                    pass.set_vertex_buffer(0, self.instances.slice(offset..offset + stride));
-                    let full_scissor = [0, 0, size[0], size[1]];
-                    pass.set_scissor_rect(0, 0, size[0], size[1]);
-                    pass.set_bind_group(0, &self.layers[level].bindings, &[]);
-                    pass.set_bind_group(1, &self.white.bindings, &[]);
-                    pass.draw(0..4, 0..1);
-                    cur_scissor = Some(full_scissor);
-                    cur_img = Some(self.layers[level].texture_id);
-                    cur_mask = Some(WHITE_TEX_ID);
-                    stats.draw_calls += 1;
-                    stats.scissor_switches += 1;
-                    stats.bind_group_switches += 2;
+                    pass = begin(&mut encoder, view_of(*target), None);
+                    if let Some((instance, rect, additive)) = *composite {
+                        pass.set_pipeline(if additive {
+                            &self.additive_pipeline
+                        } else {
+                            &self.pipeline
+                        });
+                        cur_additive = additive;
+                        let src = layer_of(*source);
+                        let offset = u64::from(instance) * stride;
+                        pass.set_vertex_buffer(0, self.instances.slice(offset..offset + stride));
+                        pass.set_scissor_rect(rect[0], rect[1], rect[2], rect[3]);
+                        pass.set_bind_group(0, &src.bindings, &[]);
+                        pass.set_bind_group(1, &self.white.bindings, &[]);
+                        pass.draw(0..4, 0..1);
+                        cur_scissor = Some(rect);
+                        cur_img = Some(src.texture_id);
+                        cur_mask = Some(WHITE_TEX_ID);
+                        stats.draw_calls += 1;
+                        stats.scissor_switches += 1;
+                        stats.bind_group_switches += 2;
+                    } else {
+                        pass.set_pipeline(&self.pipeline);
+                        cur_scissor = None;
+                        cur_img = None;
+                        cur_mask = None;
+                        cur_additive = false;
+                    }
                 }
             }
         }
         drop(pass);
         self.last_stats = stats;
         self.queue.submit([encoder.finish()]);
+        // Free cached resize textures no longer referenced in this frame and transient surfaces when idle.
+        if !self.surface_cache.is_empty() {
+            self.surface_cache.retain(|_, entry| entry.last_used == frame_id);
+        }
+        if !used_transient_surface && !self.surfaces.is_empty() {
+            self.surfaces.clear();
+        }
     }
 
     /// Draws offscreen and returns the pixels row by row, `stride` bytes apart, in the renderer's format.
@@ -1317,5 +1767,91 @@ mod tests {
         assert_close(pixel(&frame, 5, 5), RED);
         assert_close(pixel(&frame, 26, 5), blue);
         assert_close(pixel(&frame, 45, 5), [0, 128, 0, 255]);
+    }
+
+    #[test]
+    fn crossfade_surfaces_mix_without_background_bleed_and_free_textures_when_done() {
+        let mut renderer = renderer();
+        let green = [0, 255, 0, 255];
+        let blue = [0, 0, 255, 255];
+        let screen = [0., 0., 60., 60.];
+        let prev_src = [10., 10., 20., 20.];
+        let next_src = [10., 10., 40., 40.];
+        let dest = [10., 10., 30., 30.];
+        let draws = [
+            Draw::fill(screen, screen, green),
+            Draw::PushLayer { opacity: 1. },
+            Draw::PushSurface {
+                source: prev_src,
+                dest,
+                radius: [10.; 4],
+                opacity: 0.5,
+                clip: screen,
+                round_clip: None,
+                additive: false,
+                cache_key: Some((1, 1)),
+            },
+            Draw::fill(prev_src, prev_src, RED),
+            Draw::PopSurface,
+            Draw::PushSurface {
+                source: next_src,
+                dest,
+                radius: [10.; 4],
+                opacity: 0.5,
+                clip: screen,
+                round_clip: None,
+                additive: true,
+                cache_key: None,
+            },
+            Draw::fill(next_src, next_src, blue),
+            Draw::PopSurface,
+            Draw::PopLayer,
+        ];
+        let frame = renderer.read([60, 60], 1., &draws).unwrap();
+        // Exact mix(RED, BLUE, 0.5) = [128, 0, 128, 255] with zero green background bleed.
+        assert_close(pixel(&frame, 25, 25), [128, 0, 128, 255]);
+        // Rounded corner outside radius=10 shows green background.
+        assert_close(pixel(&frame, 11, 11), green);
+        assert!(renderer.has_cached_surface((1, 1), [20, 20]));
+        assert!(renderer.cached_surface_count() >= 1);
+
+        // Second frame reuses the cached prev surface even with empty inner draws, and applies group opacity on top.
+        let draws_cached = [
+            Draw::fill(screen, screen, green),
+            Draw::PushLayer { opacity: 0.5 },
+            Draw::PushSurface {
+                source: prev_src,
+                dest,
+                radius: [0.; 4],
+                opacity: 0.5,
+                clip: screen,
+                round_clip: None,
+                additive: false,
+                cache_key: Some((1, 1)),
+            },
+            Draw::PopSurface,
+            Draw::PushSurface {
+                source: next_src,
+                dest,
+                radius: [0.; 4],
+                opacity: 0.5,
+                clip: screen,
+                round_clip: None,
+                additive: true,
+                cache_key: None,
+            },
+            Draw::fill(next_src, next_src, blue),
+            Draw::PopSurface,
+            Draw::PopLayer,
+        ];
+        let frame2 = renderer.read([60, 60], 1., &draws_cached).unwrap();
+        // Group opacity 0.5 over green: 0.5 * [128, 0, 128] + 0.5 * [0, 255, 0] = [64, 128, 64].
+        assert_close(pixel(&frame2, 25, 25), [64, 128, 64, 255]);
+
+        // Frame without surfaces frees both cached and transient surface textures.
+        let _ = renderer
+            .read([60, 60], 1., &[Draw::fill(screen, screen, green)])
+            .unwrap();
+        assert_eq!(renderer.cached_surface_count(), 0);
     }
 }

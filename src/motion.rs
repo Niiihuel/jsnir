@@ -261,6 +261,20 @@ impl Motion {
     pub fn target(&self, id: u16, channel: impl Into<Channel>) -> Option<Value> {
         self.targets.get(&(id, channel.into())).copied()
     }
+    /// Eased progress of a running transition at `now` (unclamped, matching `ease()`), or `None` if idle/finished.
+    pub fn progress(&self, id: u16, channel: impl Into<Channel>, now: f64) -> Option<f32> {
+        let anim = self.running.get(&(id, channel.into()))?;
+        let elapsed = (now - anim.start) as f32 - anim.transition.delay;
+        if elapsed >= anim.transition.duration {
+            return None;
+        }
+        let t = if anim.transition.duration > 0. {
+            elapsed.max(0.) / anim.transition.duration
+        } else {
+            1.
+        };
+        Some(ease(&anim.transition, t))
+    }
     /// Forgets a channel's target and animation: its value is set by the host again.
     pub fn release(&mut self, id: u16, channel: impl Into<Channel>) {
         let key = (id, channel.into());
